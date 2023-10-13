@@ -5,6 +5,7 @@ from PIL import Image
 
 import clip
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from datasets import dataset_market
@@ -132,6 +133,8 @@ def inference(model, zeroshot_weights, loader):
             image_features = model.encode_image(images)
             image_features /= image_features.norm(dim=-1, keepdim=True)
             logits = 100. * image_features @ zeroshot_weights.T
+            logits = logits.softmax(dim=-1)
+            logits = F.normalize(logits, dim=-1)
 
             embeddings.append(logits)
             targets.append(target)
