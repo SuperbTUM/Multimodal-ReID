@@ -42,7 +42,7 @@ def get_loader(preprocess):
 def get_prompts(file_name):
     mat = io.loadmat(file_name)["market_attribute"][0][0]
     mat = mat[0][0][0]
-    identity_list = mat[-1][0]
+    identity_list = list(map(lambda x: x.item(), mat[-1][0]))
     templates = []
     attributes = []
     for i in range(10):
@@ -65,7 +65,7 @@ def get_prompts(file_name):
         sleeve = "long sleeve" if sleeve == 1 else "short sleeve"
         length_lower_body = "long" if length_lower_body == 1 else "short"
         lower_body_clothing = "dress" if lower_body_clothing == 1 else "pants"
-        hat = "no hat" if hat == 1 else "hat"
+        # hat = "no hat" if hat == 1 else "hat"
         # backpack = "no backpack" if backpack == 1 else "backpack"
         # bag = "no bag" if bag == 1 else "bag"
         # handbag = "no handbag" if handbag == 1 else "handbag"
@@ -77,15 +77,15 @@ def get_prompts(file_name):
             age = "adult"
         else:
             age = "old"
-        template_basic = "A photo of {age} {gender} with {hair_length}, {sleeve}, {length_lower_body} {lower_body_clothing}, and {hat}, ".format(
+        template_basic = "A photo of {age} {gender} with {hair_length}, {sleeve}, {length_lower_body} {lower_body_clothing}, ".format(
                        age=age,
                        gender=gender,
                        hair_length=hair_length,
                        sleeve=sleeve,
                        length_lower_body=length_lower_body,
                        lower_body_clothing=lower_body_clothing,
-                       hat=hat
                    )
+        template_hat = "" if hat == 1 else "wearing a hat, "
         template_advanced = "carrying "
         if backpack != 1:
             template_advanced += "a backpack, "
@@ -94,7 +94,7 @@ def get_prompts(file_name):
         if handbag != 1:
             template_advanced += "a handbag, "
         template_advanced = template_advanced.rstrip(", ")
-        return template_basic + template_advanced
+        return template_basic + template_hat + template_advanced + "."
 
     for gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age in zip(*attributes):
         template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age)
@@ -126,7 +126,7 @@ def inference(model, zeroshot_weights, loader):
     with torch.no_grad():
         for i, (images, target, cams, seqs) in enumerate(tqdm(loader)):
             images = images.cuda()
-            target = target.cuda()
+            # target = target.cuda()
 
             # predict
             image_features = model.encode_image(images)
@@ -140,6 +140,8 @@ def inference(model, zeroshot_weights, loader):
 
     embeddings = torch.cat(embeddings, dim=0)
     targets = torch.cat(targets, dim=0)
+    camera_ids = torch.cat(camera_ids, dim=0)
+    sequence_ids = torch.cat(sequence_ids, dim=0)
     return embeddings, targets, camera_ids, sequence_ids
 
 
