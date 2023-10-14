@@ -20,7 +20,7 @@ class PromptLearner(nn.Module):
             n_ctx = len(ctx_init.split(" "))
             prompt = clip.tokenize(ctx_init)
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
+                embedding = clip_model.token_embedding(prompt)
             ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
             prompt_prefix = ctx_init
 
