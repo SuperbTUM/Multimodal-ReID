@@ -27,11 +27,13 @@ class reidDataset(Dataset):
 
 def get_loader(preprocess, root):
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    reid_dataset_train = reidDataset(dataset.train, preprocess)
     reid_dataset_gallery = reidDataset(dataset.gallery, preprocess)
     reid_dataset_query = reidDataset(dataset.query, preprocess)
+    loader_train = DataLoader(reid_dataset_train, batch_size=64, num_workers=4, shuffle=True, pin_memory=True)
     loader_gallery = DataLoader(reid_dataset_gallery, batch_size=64, num_workers=4, shuffle=False, pin_memory=True)
     loader_query = DataLoader(reid_dataset_query, batch_size=64, num_workers=4, shuffle=False, pin_memory=True)
-    return loader_gallery, loader_query
+    return loader_gallery, loader_query, loader_train
 
 
 def get_prompts(file_name):

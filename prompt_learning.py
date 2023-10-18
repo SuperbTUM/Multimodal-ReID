@@ -1,6 +1,13 @@
+import argparse
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import clip
+from tqdm import tqdm
+
+from utils import load_pretrained_weights
+from data_prepare import get_loader
 
 
 class PromptLearner(nn.Module):
@@ -21,7 +28,7 @@ class PromptLearner(nn.Module):
             prompt = clip.tokenize(ctx_init)
             with torch.no_grad():
                 embedding = clip_model.token_embedding(prompt)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
+            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
             prompt_prefix = ctx_init
 
         else:
@@ -47,7 +54,7 @@ class PromptLearner(nn.Module):
         # but they should be ignored in load_model() as we want to use
         # those computed using the current class names
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
@@ -64,7 +71,7 @@ class PromptLearner(nn.Module):
         prompts = torch.cat(
             [
                 prefix,  # (n_cls, 1, dim)
-                ctx,     # (n_cls, n_ctx, dim)
+                ctx,  # (n_cls, n_ctx, dim)
                 suffix,  # (n_cls, *, dim)
             ],
             dim=1,
@@ -120,3 +127,63 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * image_features @ text_features.t()
 
         return logits
+
+
+def train_batch(model, batch):
+    image, label = batch
+    image = image.cuda()
+    label = label.cuda()
+    output = model(image)
+    loss = F.cross_entropy(output, label)
+    return loss
+
+
+def train_prompter(classnames,
+                   clip_model,
+                   dataloader,
+                   epochs,
+                   pretrained=None):
+    print("Building custom CLIP")
+    model = CustomCLIP(classnames, clip_model)
+
+    if pretrained is not None:
+        load_pretrained_weights(model.prompt_learner, pretrained)
+
+    print("Turning off gradients in both the image and the text encoder")
+    for name, param in model.named_parameters():
+        if "prompt_learner" not in name:
+            param.requires_grad_(False)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.002)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+
+    for epoch in range(epochs):
+        for i, (images, target, cams, seqs) in enumerate(tqdm(dataloader)):
+            batch = images, target
+            loss = train_batch(model, batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+    return clip_model
+
+
+def params_parser():
+    args = argparse.ArgumentParser()
+    args.add_argument("--epochs", default=50, type=int)
+    args.add_argument("--root", default="", type=str)
+    args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
+    return args.parse_args()
+
+
+if __name__ == "__main__":
+    params = params_parser()
+    model, transforms = clip.load(params.model)
+    loader_train = get_loader(transforms, params.root)[-1]
+    classnames = ["person " + str(i) for i in range(751)]
+
+    trained_model = train_prompter(classnames,
+                                   model,
+                                   loader_train,
+                                   params.epochs)

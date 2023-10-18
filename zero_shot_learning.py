@@ -83,7 +83,7 @@ def get_cmc_map(
 
 def params_parser():
     args = argparse.ArgumentParser()
-    args.add_argument("--root", default="")
+    args.add_argument("--root", default="", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     return args.parse_args()
 
@@ -93,7 +93,7 @@ if __name__ == "__main__":
     model_name = params.model
     identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
     zeroshot_weights, transforms, model = load_model(model_name, identity_list, template_dict)
-    loader_gallery, loader_query = get_loader(transforms, params.root)
+    loader_gallery, loader_query = get_loader(transforms, params.root)[:2]
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, zeroshot_weights, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = inference(model, zeroshot_weights, loader_query)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
