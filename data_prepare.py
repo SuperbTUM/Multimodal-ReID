@@ -55,7 +55,8 @@ def get_prompts(file_name):
             backpack,
             bag,
             handbag,
-            age
+            age,
+            index
     ):
         gender = "male" if gender == 1 else "female"
         hair_length = "short hair" if hair_length == 1 else "long hair"
@@ -74,13 +75,14 @@ def get_prompts(file_name):
             age = "adult"
         else:
             age = "old"
-        template_basic = "a photo of {age} {gender} with {hair_length}, {sleeve}, {length_lower_body} {lower_body_clothing}, ".format(
+        template_basic = "{age} {gender} person {index} with {hair_length}, {sleeve}, {length_lower_body} {lower_body_clothing}, ".format(
                        age=age,
                        gender=gender,
                        hair_length=hair_length,
                        sleeve=sleeve,
                        length_lower_body=length_lower_body,
                        lower_body_clothing=lower_body_clothing,
+                       index=index,
                    )
         template_hat = "" if hat == 1 else "wearing a hat, "
         template_advanced = "carrying "
@@ -93,7 +95,9 @@ def get_prompts(file_name):
         template_advanced = template_advanced.rstrip(", ")
         return template_basic + template_hat + template_advanced + "."
 
+    index = 0
     for gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age in zip(*attributes):
-        template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age)
+        template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age, index)
+        index += 1
         templates.append(template)
     return identity_list, {identity: template for identity, template in zip(identity_list, templates)}
