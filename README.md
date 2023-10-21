@@ -10,6 +10,6 @@ pip install git+https://github.com/openai/CLIP.git
 
 Quick Start
 
-```python
+```bash
 python3 zero_shot_learning.py --model ViT-B/32
 ```
