@@ -1,3 +1,4 @@
+import numpy as np
 from scipy import io
 from PIL import Image
 import torch
@@ -42,8 +43,19 @@ def get_prompts(file_name):
     identity_list = list(map(lambda x: x.item(), mat[-1][0]))
     templates = []
     attributes = []
+    upper_colors = []
+    lower_colors = []
     for i in range(10):
         attributes.append(mat[i][0])
+    for i in range(10, 18):
+        upper_colors.append(mat[i][0])
+    for i in range(18, 27):
+        lower_colors.append(mat[i][0])
+    upper_colors = np.array(upper_colors)
+    lower_colors = np.array(lower_colors)
+
+    color_mapping_upper = {0: "black", 1: "white", 2: "red", 3: "purple", 4: "yellow", 5: "gray", 6: "blue", 7: "green"}
+    color_mapping_lower = {0: "black", 1: "white", 2: "pink", 3: "purple", 4: "yellow", 5: "gray", 6: "blue", 7: "green", 8: "brown"}
 
     def get_prompt(
             gender,
@@ -63,10 +75,19 @@ def get_prompts(file_name):
         sleeve = "long sleeve" if sleeve == 1 else "short sleeve"
         length_lower_body = "long" if length_lower_body == 1 else "short"
         lower_body_clothing = "dress" if lower_body_clothing == 1 else "pants"
-        # hat = "no hat" if hat == 1 else "hat"
-        # backpack = "no backpack" if backpack == 1 else "backpack"
-        # bag = "no bag" if bag == 1 else "bag"
-        # handbag = "no handbag" if handbag == 1 else "handbag"
+        color1_identity, color2_identity = upper_colors[:, index], lower_colors[:, index]
+        color1, color2 = "other", "other"
+
+        for i in range(len(color1_identity)):
+            if color1_identity[i] != 1:
+                color1 = color_mapping_upper[i]
+                break
+
+        for i in range(len(color2_identity)):
+            if color2_identity[i] != 1:
+                color2 = color_mapping_lower[i]
+                break
+
         if age == 1:
             age = "young"
         elif age == 2:
@@ -75,11 +96,13 @@ def get_prompts(file_name):
             age = "adult"
         else:
             age = "old"
-        template_basic = "{age} {gender} person {index} with {hair_length}, {sleeve}, {length_lower_body} {lower_body_clothing}, ".format(
+        template_basic = "a {age} {gender} person {index} with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
                        age=age,
                        gender=gender,
                        hair_length=hair_length,
+                       color1=color1,
                        sleeve=sleeve,
+                       color2=color2,
                        length_lower_body=length_lower_body,
                        lower_body_clothing=lower_body_clothing,
                        index=index,
