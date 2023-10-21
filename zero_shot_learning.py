@@ -6,18 +6,30 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from evaluate import evaluate
-from data_prepare import get_prompts, get_loader
+from data_prepare import get_prompts, get_loader, get_prompts_augmented
 
 
 def load_model(model_name, classnames, templates):
     model, preprocess = clip.load(model_name)
 
-    def zeroshot_classifier(classnames, templates):
+    def zeroshot_classifier(classnames, templates: dict):
         with torch.no_grad():
-            texts = [templates[classname] for classname in classnames]
-            texts = clip.tokenize(texts).cuda()  # tokenize
-            class_embeddings = model.encode_text(texts)  # embed with text encoder
-            class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
+            if params.augmented_template:
+                class_embeddings = []
+                for classname in classnames:
+                    texts = templates[classname]
+                    texts = clip.tokenize(texts).cuda()
+                    class_embedding = model.encode_text(texts)  # embed with text encoder
+                    class_embedding /= class_embedding.norm(dim=-1, keepdim=True)
+                    class_embedding = class_embedding.mean(dim=0)
+                    class_embedding /= class_embedding.norm()
+                    class_embeddings.append(class_embedding)
+                class_embeddings = torch.stack(class_embeddings, dim=0).cuda()
+            else:
+                texts = [templates[classname] for classname in classnames]
+                texts = clip.tokenize(texts).cuda()  # tokenize
+                class_embeddings = model.encode_text(texts)  # embed with text encoder
+                class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
         return class_embeddings
 
     zeroshot_weights = zeroshot_classifier(classnames, templates)
@@ -85,13 +97,17 @@ def params_parser():
     args = argparse.ArgumentParser()
     args.add_argument("--root", default="", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
+    args.add_argument("--augmented_template", action="store_true")
     return args.parse_args()
 
 
 if __name__ == "__main__":
     params = params_parser()
     model_name = params.model
-    identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
+    if params.augmented_template:
+        identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
+    else:
+        identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
     zeroshot_weights, transforms, model = load_model(model_name, identity_list, template_dict)
     loader_gallery, loader_query = get_loader(transforms, params.root)[:2]
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, zeroshot_weights, loader_gallery)
