@@ -7,6 +7,20 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import dataset_market
 
 
+def expand2square(pil_img, background_color):
+    width, height = pil_img.size
+    if width == height:
+        return pil_img
+    elif width > height:
+        result = Image.new(pil_img.mode, (width, width), background_color)
+        result.paste(pil_img, (0, (width - height) // 2))
+        return result
+    else:
+        result = Image.new(pil_img.mode, (height, height), background_color)
+        result.paste(pil_img, ((height - width) // 2, 0))
+        return result
+
+
 class reidDataset(Dataset):
     def __init__(self, images, transform=None):
         self.images = images
@@ -18,6 +32,7 @@ class reidDataset(Dataset):
     def __getitem__(self, item):
         detailed_info = list(self.images[item])
         detailed_info[0] = Image.open(detailed_info[0]).convert("RGB")
+        detailed_info[0] = expand2square(detailed_info[0], (255, 255, 255))
         if self.transform:
             detailed_info[0] = self.transform(detailed_info[0])
         detailed_info[1] = torch.tensor(detailed_info[1])
