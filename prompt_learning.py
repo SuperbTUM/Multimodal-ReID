@@ -16,6 +16,7 @@ class PromptLearner(nn.Module):
         n_cls = len(classnames)
         n_ctx = 8
         ctx_init = "a photo of a"
+        dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = 224
@@ -25,16 +26,16 @@ class PromptLearner(nn.Module):
             # use given words to initialize context vectors
             ctx_init = ctx_init.replace("_", " ")
             n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init)
+            prompt = clip.tokenize(ctx_init).cuda()
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt)
+                embedding = clip_model.token_embedding(prompt).type(dtype)
             ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
             prompt_prefix = ctx_init
 
         else:
             # random initialization
             print("Initializing class-specific contexts")
-            ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim)
+            ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
 
@@ -46,9 +47,9 @@ class PromptLearner(nn.Module):
         classnames = [name.replace("_", " ") for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).cuda()
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts)
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
@@ -174,13 +175,15 @@ def params_parser():
     args.add_argument("--epochs", default=50, type=int)
     args.add_argument("--root", default="", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
+    args.add_argument("--bs", default=64, type=int)
     return args.parse_args()
 
 
 if __name__ == "__main__":
+    torch.cuda.empty_cache()
     params = params_parser()
     model, transforms = clip.load(params.model)
-    loader_train = get_loader(transforms, params.root)[-1]
+    loader_train = get_loader(transforms, params.root, params.bs)[-1]
     classnames = ["person " + str(i) for i in range(751)]
 
     trained_model = train_prompter(classnames,
