@@ -239,7 +239,7 @@ def get_prompts_augmented(file_name):
             age = "adult"
         else:
             age = "old"
-        template_basic1 = "a {age} {gender} person {index} on my left or right side with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
+        template_basic1 = "a {age} {gender} person {index} on my left or right side with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
                        age=age,
                        gender=gender,
                        hair_length=hair_length,
@@ -250,7 +250,7 @@ def get_prompts_augmented(file_name):
                        lower_body_clothing=lower_body_clothing,
                        index=index,
                    )
-        template_basic2 = "a {age} {gender} person {index} walking with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
+        template_basic2 = "a {age} {gender} person {index} walking with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -261,7 +261,7 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_basic3 = "a {age} {gender} person {index} rushing with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
+        template_basic3 = "a {age} {gender} person {index} rushing with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -272,7 +272,7 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_basic4 = "a {age} {gender} person {index} in the distance with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
+        template_basic4 = "a {age} {gender} person {index} in the distance with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -283,33 +283,31 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_hat = "wearing nothing, " if hat == 1 else "wearing a hat, "
+        template_hat = "wearing nothing on head" if hat == 1 else "wearing a hat"
         template_advanced = "carrying "
         items = []
         if backpack != 1:
-            items.append("a backpack, ")
+            items.append("a backpack")
         if bag != 1:
-            items.append("a bag, ")
+            items.append("a bag")
         if handbag != 1:
-            items.append("a handbag, ")
+            items.append("a handbag")
         if items:
             if len(items) > 1:
-                items = "and ".join(["".join(items[:-1]), items[-1]])
+                items = "and ".join([", ".join(items[:-1]), items[-1]])
             else:
                 items = items[0]
             template_advanced += items
-            template_advanced = template_advanced.rstrip(", ")
         else:
-            template_advanced += "nothing, "
-            template_hat = template_hat.rstrip(", ")
-        return [template_basic1 + template_hat + template_advanced + ".",
-                template_basic2 + template_hat + template_advanced + ".",
-                template_basic3 + template_hat + template_advanced + ".",
-                template_basic4 + template_hat + template_advanced + ".",
-                template_basic1 + template_advanced + template_hat + ".",
-                template_basic2 + template_advanced + template_hat + ".",
-                template_basic3 + template_advanced + template_hat + ".",
-                template_basic4 + template_advanced + template_hat + "."
+            template_advanced += "nothing"
+        return [", ".join((template_basic1, template_hat, template_advanced)) + ".",
+                ", ".join((template_basic2, template_hat, template_advanced)) + ".",
+                ", ".join((template_basic3, template_hat, template_advanced)) + ".",
+                ", ".join((template_basic4, template_hat, template_advanced)) + ".",
+                ", ".join((template_basic1, template_advanced, template_hat)) + ".",
+                ", ".join((template_basic2, template_advanced, template_hat)) + ".",
+                ", ".join((template_basic3, template_advanced, template_hat)) + ".",
+                ", ".join((template_basic4, template_advanced, template_hat)) + "."
                 ]
 
     index = 0
