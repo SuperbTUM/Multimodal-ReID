@@ -283,7 +283,7 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_hat = "" if hat == 1 else "wearing a hat, "
+        template_hat = "wearing nothing, " if hat == 1 else "wearing a hat, "
         template_advanced = "carrying "
         items = []
         if backpack != 1:
@@ -300,12 +300,17 @@ def get_prompts_augmented(file_name):
             template_advanced += items
             template_advanced = template_advanced.rstrip(", ")
         else:
-            template_advanced = ""
+            template_advanced += "nothing, "
             template_hat = template_hat.rstrip(", ")
         return [template_basic1 + template_hat + template_advanced + ".",
                 template_basic2 + template_hat + template_advanced + ".",
                 template_basic3 + template_hat + template_advanced + ".",
-                template_basic4 + template_hat + template_advanced + "."]
+                template_basic4 + template_hat + template_advanced + ".",
+                template_basic1 + template_advanced + template_hat + ".",
+                template_basic2 + template_advanced + template_hat + ".",
+                template_basic3 + template_advanced + template_hat + ".",
+                template_basic4 + template_advanced + template_hat + "."
+                ]
 
     index = 0
     for gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age in zip(*attributes):
