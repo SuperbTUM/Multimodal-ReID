@@ -1,3 +1,4 @@
+import os
 import argparse
 
 import torch
@@ -7,7 +8,7 @@ import clip
 from tqdm import tqdm
 
 from utils import load_pretrained_weights
-from data_prepare import get_loader
+from data_prepare import get_loader_train
 
 
 class PromptLearner(nn.Module):
@@ -155,7 +156,7 @@ def train_prompter(classnames,
         if "prompt_learner" not in name:
             param.requires_grad_(False)
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.002)
+    optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.002)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
 
     for epoch in range(epochs):
@@ -167,15 +168,17 @@ def train_prompter(classnames,
             optimizer.step()
         scheduler.step()
 
+    torch.save(clip_model.prompt_learner, params.save_path if os.path.exists(params.save_path) else "clip_model_prompter.pt")
     return clip_model
 
 
 def params_parser():
     args = argparse.ArgumentParser()
-    args.add_argument("--epochs", default=50, type=int)
+    args.add_argument("--epochs", default=32, type=int)
     args.add_argument("--root", default="", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=64, type=int)
+    args.add_argument("--save_path", default="clip_model_prompter.pt")
     return args.parse_args()
 
 
@@ -183,7 +186,7 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     params = params_parser()
     model, transforms = clip.load(params.model)
-    loader_train = get_loader(transforms, params.root, params.bs)[-1]
+    loader_train = get_loader_train(transforms, params.root, params.bs)
     classnames = ["person " + str(i) for i in range(751)]
 
     trained_model = train_prompter(classnames,

@@ -36,7 +36,7 @@ def load_model(model_name, classnames, templates):
     return zeroshot_weights, preprocess, model
 
 
-def inference(model, zeroshot_weights, loader):
+def inference(model, zeroshot_weights, loader, loader_augment):
     embeddings = []
     targets = []
     camera_ids = []
@@ -49,15 +49,26 @@ def inference(model, zeroshot_weights, loader):
 
             # predict
             image_features = model.encode_image(images)
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-            logits = 100. * image_features @ zeroshot_weights.T
-            logits = logits.softmax(dim=-1)
-            logits = F.normalize(logits, dim=-1)
+            logits = image_features
 
             embeddings.append(logits)
             targets.append(target)
             camera_ids.append(cams)
             sequence_ids.append(seqs)
+
+        for i, (images, target, cams, seqs) in enumerate(tqdm(loader_augment)):
+            images = images.cuda()
+            # target = target.cuda()
+
+            # predict
+            image_features = model.encode_image(images)
+            image_features = (embeddings[i] + image_features) / 2.
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            logits = 100. * image_features @ zeroshot_weights.T
+            logits = logits.softmax(dim=-1)
+            logits = F.normalize(logits, dim=-1)
+
+            embeddings[i] = logits
 
     embeddings = torch.cat(embeddings, dim=0)
     targets = torch.cat(targets, dim=0)
@@ -108,8 +119,8 @@ if __name__ == "__main__":
         identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
     else:
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
-    zeroshot_weights, transforms, model = load_model(model_name, identity_list, template_dict)
-    loader_gallery, loader_query = get_loader(transforms, params.root)[:2]
-    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, zeroshot_weights, loader_gallery)
-    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, zeroshot_weights, loader_query)
+    zeroshot_weights, transforms_, model = load_model(model_name, identity_list, template_dict)
+    loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(transforms_, params.root)[:2]
+    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, zeroshot_weights, loader_gallery, loader_gallery_augmented)
+    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, zeroshot_weights, loader_query, loader_query_augmented)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

@@ -3,6 +3,7 @@ from scipy import io
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 
 from datasets import dataset_market
 
@@ -41,15 +42,50 @@ class reidDataset(Dataset):
         return detailed_info
 
 
-def get_loader(preprocess, root, batch_size=64):
+def get_loader_train(preprocess, root, batch_size=64):
+    transform_train = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.Pad(10),
+        transforms.RandomCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.RandomErasing()
+    ])
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
-    reid_dataset_train = reidDataset(dataset.train, preprocess)
+    reid_dataset_train = reidDataset(dataset.train, transform_train)
+    loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
+    return loader_train
+
+
+def get_loader(preprocess, root, batch_size=64):
+    transform_test = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.Pad(10),
+        transforms.RandomCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+    preprocess = transform_test
+    transform_test_augmented = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(1.0),
+        transforms.Pad(10),
+        transforms.RandomCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+    preprocess_augmented = transform_test_augmented
+    dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
     reid_dataset_gallery = reidDataset(dataset.gallery, preprocess)
     reid_dataset_query = reidDataset(dataset.query, preprocess)
-    loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
     loader_gallery = DataLoader(reid_dataset_gallery, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
     loader_query = DataLoader(reid_dataset_query, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
-    return loader_gallery, loader_query, loader_train
+    reid_dataset_gallery_augmented = reidDataset(dataset.gallery, preprocess_augmented)
+    reid_dataset_query_augmented = reidDataset(dataset.query, preprocess_augmented)
+    loader_gallery_augmented = DataLoader(reid_dataset_gallery_augmented, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
+    loader_query_augmented = DataLoader(reid_dataset_query_augmented, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
+    return loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented
 
 
 def get_prompts(file_name):
