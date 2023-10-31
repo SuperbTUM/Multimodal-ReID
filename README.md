@@ -13,3 +13,8 @@ Quick Start
 ```bash
 python3 zero_shot_learning.py --model ViT-B/32 --augmented_template
 ```
+
+Train with Prompt Engineering
+```bash
+python3 prompt_learning.py
+```
