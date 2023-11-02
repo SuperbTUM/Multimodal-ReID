@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from utils import model_adaptor
 from evaluate import evaluate
 from data_prepare import get_prompts, get_loader, get_prompts_augmented
 
@@ -107,8 +108,11 @@ def get_cmc_map(
 def params_parser():
     args = argparse.ArgumentParser()
     args.add_argument("--root", default="", type=str)
+    args.add_argument("--bs", default=64, type=int)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--augmented_template", action="store_true")
+    args.add_argument("--height", default=224, type=int)
+    args.add_argument("--ratio", default=0.5, type=float)
     return args.parse_args()
 
 
@@ -120,7 +124,11 @@ if __name__ == "__main__":
     else:
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
     zeroshot_weights, transforms_, model = load_model(model_name, identity_list, template_dict)
-    loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(transforms_, params.root)[:2]
+    image_height, image_width = params.height, int(params.height * params.ratio)
+    model = model_adaptor(model, image_height, image_width)
+
+    loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(transforms_, params.root, params.bs, image_height, image_width)
+
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, zeroshot_weights, loader_gallery, loader_gallery_augmented)
     embeddings_query, targets_query, cameras_query, sequences_query = inference(model, zeroshot_weights, loader_query, loader_query_augmented)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

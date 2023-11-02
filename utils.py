@@ -1,3 +1,4 @@
+import math
 import pickle
 import warnings
 from functools import partial
@@ -5,6 +6,10 @@ import os.path as osp
 from collections import OrderedDict
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from clip import model as clip_model
 
 
 def load_checkpoint(fpath):
@@ -96,3 +101,30 @@ def load_pretrained_weights(model, weight_path):
             print(
                 f"Layers discarded due to unmatched keys or size: {discarded_layers}"
             )
+
+
+def resize_pos_embed(posemb, posemb_new, height, width):
+    # Rescale the grid of position embeddings when loading from state_dict. Adapted from
+    # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
+    ntok_new = posemb_new.shape[1]
+
+    posemb_token, posemb_grid = posemb[:1], posemb[1:]
+    ntok_new -= 1
+
+    gs_old = int(math.sqrt(len(posemb_grid)))
+    print('Resized position embedding from size:{} to size: {} with height:{} width: {}'.format(posemb.shape, posemb_new.shape, height, width))
+    posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
+    posemb_grid = F.interpolate(posemb_grid, size=(height, width), mode='bicubic')
+    posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, height * width, -1)
+    posemb = torch.cat([posemb_token, posemb_grid.squeeze(0)], dim=0)
+    return posemb
+
+
+def model_adaptor(model, height, width):
+    if (height, width) != (224, 224):
+        if isinstance(model.visual, clip_model.VisionTransformer):
+            patch_size = model.visual.conv1.kernel_size
+            pretrained_weight = model.visual.positional_embedding.data
+            posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, height // patch_size[0], width // patch_size[1])
+            model.visual.positional_embedding = nn.Parameter(posemb)
+    return model.cuda()
