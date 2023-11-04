@@ -127,4 +127,8 @@ def model_adaptor(model, height, width):
             pretrained_weight = model.visual.positional_embedding.data
             posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, height // patch_size[0], width // patch_size[1])
             model.visual.positional_embedding = nn.Parameter(posemb)
+        else:
+            pretrained_weight = model.attnpool.positional_embedding.data
+            posemb = resize_pos_embed(pretrained_weight, model.attnpool.positional_embedding, height // 32, width // 32)
+            model.attnpool.positional_embedding = nn.Parameter(posemb)
     return model.cuda()
