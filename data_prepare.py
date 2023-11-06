@@ -160,7 +160,7 @@ def get_prompts(file_name):
             age = "adult"
         else:
             age = "old"
-        template_basic = "a {age} {gender} person {index} with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
+        template_basic = "a {age} {gender} person no.{index} with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
                        age=age,
                        gender=gender,
                        hair_length=hair_length,
@@ -186,7 +186,7 @@ def get_prompts(file_name):
         return template_basic + template_hat + template_advanced + "."
 
     index = 0
-    for gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age in zip(*attributes):
+    for age, backpack, bag, handbag, lower_body_clothing, length_lower_body, sleeve, hair_length, hat, gender in zip(*attributes):
         template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age, index)
         index += 1
         templates.append(template)
@@ -252,7 +252,7 @@ def get_prompts_augmented(file_name):
             age = "adult"
         else:
             age = "old"
-        template_basic1 = "a {age} {gender} person {index} on my left or right side with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+        template_basic1 = "a {age} {gender} person no.{index} on my left or right side with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
                        age=age,
                        gender=gender,
                        hair_length=hair_length,
@@ -263,7 +263,7 @@ def get_prompts_augmented(file_name):
                        lower_body_clothing=lower_body_clothing,
                        index=index,
                    )
-        template_basic2 = "a {age} {gender} person {index} walking with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+        template_basic2 = "a {age} {gender} person no.{index} walking with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -274,7 +274,7 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_basic3 = "a {age} {gender} person {index} rushing with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+        template_basic3 = "a {age} {gender} person no.{index} rushing with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -285,7 +285,7 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_basic4 = "a {age} {gender} person {index} in the distance with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+        template_basic4 = "a {age} {gender} person no.{index} in the distance with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -307,7 +307,7 @@ def get_prompts_augmented(file_name):
             items.append("a handbag")
         if items:
             if len(items) > 1:
-                items = "and ".join([", ".join(items[:-1]), items[-1]])
+                items = " and ".join([", ".join(items[:-1]), items[-1]])
             else:
                 items = items[0]
             template_advanced += items
@@ -324,7 +324,7 @@ def get_prompts_augmented(file_name):
                 ]
 
     index = 0
-    for gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age in zip(*attributes):
+    for age, backpack, bag, handbag, lower_body_clothing, length_lower_body, sleeve, hair_length, hat, gender in zip(*attributes):
         template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age, index)
         index += 1
         templates.append(template)
