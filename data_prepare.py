@@ -51,13 +51,13 @@ class reidDataset(Dataset):
         return detailed_info
 
 
-def get_loader_train(preprocess, root, batch_size=64):
+def get_loader_train(preprocess, root, batch_size, image_height, image_width):
     transform_train = transforms.Compose([
-        transforms.Resize((224, 112)),
+        transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(),
         transforms.Pad((10, 5)),
-        transforms.RandomCrop((224, 112)),
-        ToSquare(),
+        transforms.RandomCrop((image_height, image_width)),
+        # ToSquare(),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         transforms.RandomErasing()
@@ -92,12 +92,15 @@ def get_loader(preprocess, root, batch_size=64, image_height=224, image_width=11
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
     reid_dataset_gallery = reidDataset(dataset.gallery, preprocess)
     reid_dataset_query = reidDataset(dataset.query, preprocess)
-    loader_gallery = DataLoader(reid_dataset_gallery, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
+    loader_gallery = DataLoader(reid_dataset_gallery, batch_size=batch_size, num_workers=4, shuffle=False,
+                                pin_memory=True)
     loader_query = DataLoader(reid_dataset_query, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
     reid_dataset_gallery_augmented = reidDataset(dataset.gallery, preprocess_augmented)
     reid_dataset_query_augmented = reidDataset(dataset.query, preprocess_augmented)
-    loader_gallery_augmented = DataLoader(reid_dataset_gallery_augmented, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
-    loader_query_augmented = DataLoader(reid_dataset_query_augmented, batch_size=batch_size, num_workers=4, shuffle=False, pin_memory=True)
+    loader_gallery_augmented = DataLoader(reid_dataset_gallery_augmented, batch_size=batch_size, num_workers=4,
+                                          shuffle=False, pin_memory=True)
+    loader_query_augmented = DataLoader(reid_dataset_query_augmented, batch_size=batch_size, num_workers=4,
+                                        shuffle=False, pin_memory=True)
     return loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented
 
 
@@ -119,7 +122,8 @@ def get_prompts(file_name):
     lower_colors = np.array(lower_colors)
 
     color_mapping_upper = {0: "black", 1: "white", 2: "red", 3: "purple", 4: "yellow", 5: "gray", 6: "blue", 7: "green"}
-    color_mapping_lower = {0: "black", 1: "white", 2: "pink", 3: "purple", 4: "yellow", 5: "gray", 6: "blue", 7: "green", 8: "brown"}
+    color_mapping_lower = {0: "black", 1: "white", 2: "pink", 3: "purple", 4: "yellow", 5: "gray", 6: "blue",
+                           7: "green", 8: "brown"}
 
     def get_prompt(
             gender,
@@ -161,16 +165,16 @@ def get_prompts(file_name):
         else:
             age = "old"
         template_basic = "a {age} {gender} person no.{index} with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}, ".format(
-                       age=age,
-                       gender=gender,
-                       hair_length=hair_length,
-                       color1=color1,
-                       sleeve=sleeve,
-                       color2=color2,
-                       length_lower_body=length_lower_body,
-                       lower_body_clothing=lower_body_clothing,
-                       index=index,
-                   )
+            age=age,
+            gender=gender,
+            hair_length=hair_length,
+            color1=color1,
+            sleeve=sleeve,
+            color2=color2,
+            length_lower_body=length_lower_body,
+            lower_body_clothing=lower_body_clothing,
+            index=index,
+        )
         template_hat = "" if hat == 1 else "wearing a hat, "
         template_advanced = "carrying "
         if backpack != 1:
@@ -186,14 +190,18 @@ def get_prompts(file_name):
         return template_basic + template_hat + template_advanced + "."
 
     index = 0
-    for age, backpack, bag, handbag, lower_body_clothing, length_lower_body, sleeve, hair_length, hat, gender in zip(*attributes):
-        template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age, index)
+    for age, backpack, bag, handbag, lower_body_clothing, length_lower_body, sleeve, hair_length, hat, gender in zip(
+            *attributes):
+        template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag,
+                              handbag, age, index)
         index += 1
         templates.append(template)
     return identity_list, {identity: template for identity, template in zip(identity_list, templates)}
 
 
 def get_prompts_augmented(file_name):
+    sentence_templates = ["itap of a {}", "a bad photo of the {}", "a origami {}", "a photo of the large {}",
+                          "a {} in a video game", "art of the {}", "a photo of the small {}"]
     mat = io.loadmat(file_name)["market_attribute"][0][0]
     mat = mat[0][0][0]
     identity_list = list(map(lambda x: x.item(), mat[-1][0]))
@@ -211,7 +219,8 @@ def get_prompts_augmented(file_name):
     lower_colors = np.array(lower_colors)
 
     color_mapping_upper = {0: "black", 1: "white", 2: "red", 3: "purple", 4: "yellow", 5: "gray", 6: "blue", 7: "green"}
-    color_mapping_lower = {0: "black", 1: "white", 2: "pink", 3: "purple", 4: "yellow", 5: "gray", 6: "blue", 7: "green", 8: "brown"}
+    color_mapping_lower = {0: "black", 1: "white", 2: "pink", 3: "purple", 4: "yellow", 5: "gray", 6: "blue",
+                           7: "green", 8: "brown"}
 
     def get_prompt(
             gender,
@@ -252,18 +261,7 @@ def get_prompts_augmented(file_name):
             age = "adult"
         else:
             age = "old"
-        template_basic1 = "a {age} {gender} person no.{index} on my left or right side with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
-                       age=age,
-                       gender=gender,
-                       hair_length=hair_length,
-                       color1=color1,
-                       sleeve=sleeve,
-                       color2=color2,
-                       length_lower_body=length_lower_body,
-                       lower_body_clothing=lower_body_clothing,
-                       index=index,
-                   )
-        template_basic2 = "a {age} {gender} person no.{index} walking with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+        template_basic1 = "{age} {gender} person no.{index} on my left or right side with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -274,7 +272,7 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_basic3 = "a {age} {gender} person no.{index} rushing with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+        template_basic2 = "{age} {gender} person no.{index} walking with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -285,7 +283,18 @@ def get_prompts_augmented(file_name):
             lower_body_clothing=lower_body_clothing,
             index=index,
         )
-        template_basic4 = "a {age} {gender} person no.{index} in the distance with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+        template_basic3 = "{age} {gender} person no.{index} rushing with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
+            age=age,
+            gender=gender,
+            hair_length=hair_length,
+            color1=color1,
+            sleeve=sleeve,
+            color2=color2,
+            length_lower_body=length_lower_body,
+            lower_body_clothing=lower_body_clothing,
+            index=index,
+        )
+        template_basic4 = "{age} {gender} person no.{index} in the distance with {hair_length}, {color1} {sleeve}, {color2} {length_lower_body} {lower_body_clothing}".format(
             age=age,
             gender=gender,
             hair_length=hair_length,
@@ -313,19 +322,26 @@ def get_prompts_augmented(file_name):
             template_advanced += items
         else:
             template_advanced += "nothing"
-        return [", ".join((template_basic1, template_hat, template_advanced)) + ".",
-                ", ".join((template_basic2, template_hat, template_advanced)) + ".",
-                ", ".join((template_basic3, template_hat, template_advanced)) + ".",
-                ", ".join((template_basic4, template_hat, template_advanced)) + ".",
-                ", ".join((template_basic1, template_advanced, template_hat)) + ".",
-                ", ".join((template_basic2, template_advanced, template_hat)) + ".",
-                ", ".join((template_basic3, template_advanced, template_hat)) + ".",
-                ", ".join((template_basic4, template_advanced, template_hat)) + "."
-                ]
+        templates = [", ".join((template_basic1, template_hat, template_advanced)) + ".",
+                     ", ".join((template_basic2, template_hat, template_advanced)) + ".",
+                     ", ".join((template_basic3, template_hat, template_advanced)) + ".",
+                     ", ".join((template_basic4, template_hat, template_advanced)) + ".",
+                     ", ".join((template_basic1, template_advanced, template_hat)) + ".",
+                     ", ".join((template_basic2, template_advanced, template_hat)) + ".",
+                     ", ".join((template_basic3, template_advanced, template_hat)) + ".",
+                     ", ".join((template_basic4, template_advanced, template_hat)) + "."
+                     ]
+        ensembled_templates = []
+        for sentence_template in sentence_templates:
+            for tlt in templates:
+                ensembled_templates.append(sentence_template.format(tlt))
+        return ensembled_templates
 
     index = 0
-    for age, backpack, bag, handbag, lower_body_clothing, length_lower_body, sleeve, hair_length, hat, gender in zip(*attributes):
-        template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag, handbag, age, index)
+    for age, backpack, bag, handbag, lower_body_clothing, length_lower_body, sleeve, hair_length, hat, gender in zip(
+            *attributes):
+        template = get_prompt(gender, hair_length, sleeve, length_lower_body, lower_body_clothing, hat, backpack, bag,
+                              handbag, age, index)
         index += 1
         templates.append(template)
     return identity_list, {identity: template for identity, template in zip(identity_list, templates)}

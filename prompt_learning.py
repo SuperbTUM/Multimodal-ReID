@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import clip
 from tqdm import tqdm
 
-from utils import load_pretrained_weights
+from utils import load_pretrained_weights, model_adaptor
 from data_prepare import get_loader_train
 
 
@@ -179,6 +179,8 @@ def params_parser():
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=64, type=int)
     args.add_argument("--save_path", default="clip_model_prompter.pt")
+    args.add_argument("--height", default=224, type=int)
+    args.add_argument("--ratio", default=0.5, type=float)
     return args.parse_args()
 
 
@@ -186,7 +188,9 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     params = params_parser()
     model, transforms = clip.load(params.model)
-    loader_train = get_loader_train(transforms, params.root, params.bs)
+    image_height, image_width = params.height, int(params.height * params.ratio)
+    model = model_adaptor(model, image_height, image_width)
+    loader_train = get_loader_train(transforms, params.root, params.bs, image_height, image_width)
     classnames = ["person " + str(i) for i in range(751)]
 
     trained_model = train_prompter(classnames,
