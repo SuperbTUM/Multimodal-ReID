@@ -1,4 +1,5 @@
 import argparse
+from collections import OrderedDict
 
 import clip
 import torch
@@ -37,7 +38,10 @@ def load_model(model_name, classnames, templates):
     return zeroshot_weights, preprocess, model
 
 
-def inference(model, zeroshot_weights, loader, loader_augment):
+def inference(model, bottleneck, zeroshot_weights, loader, loader_augment):
+    model.eval()
+    bottleneck.eval()
+
     embeddings = []
     targets = []
     camera_ids = []
@@ -50,6 +54,7 @@ def inference(model, zeroshot_weights, loader, loader_augment):
 
             # predict
             image_features = model.encode_image(images)
+            image_features = bottleneck(image_features)
             logits = image_features
 
             embeddings.append(logits)
@@ -63,6 +68,7 @@ def inference(model, zeroshot_weights, loader, loader_augment):
 
             # predict
             image_features = model.encode_image(images)
+            image_features = bottleneck(image_features)
             image_features = (embeddings[i] + image_features) / 2.
             image_features /= image_features.norm(dim=-1, keepdim=True)
             logits = 100. * image_features @ zeroshot_weights.T
@@ -125,10 +131,10 @@ if __name__ == "__main__":
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
     zeroshot_weights, transforms_, model = load_model(model_name, identity_list, template_dict)
     image_height, image_width = params.height, int(params.height * params.ratio)
-    model = model_adaptor(model, image_height, image_width)
+    model, bottleneck = model_adaptor(model, image_height, image_width, "Market1501_baseline_ViT-B-16_60.pth")
 
     loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(transforms_, params.root, params.bs, image_height, image_width)
 
-    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, zeroshot_weights, loader_gallery, loader_gallery_augmented)
-    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, zeroshot_weights, loader_query, loader_query_augmented)
+    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck, zeroshot_weights, loader_gallery, loader_gallery_augmented)
+    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, bottleneck, zeroshot_weights, loader_query, loader_query_augmented)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

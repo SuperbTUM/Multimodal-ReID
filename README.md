@@ -10,8 +10,10 @@ pip install git+https://github.com/openai/CLIP.git
 
 Quick Start
 
+Market1501-pretrained ViT/16 model, thanks for the contribution of CLIP-ReID: [Weight](https://drive.google.com/file/d/1XKUcP4LEpWr4Ah6sVdXNveUo4bAsVyjt/view)
+
 ```bash
-python3 zero_shot_learning.py --model ViT-B/32 --augmented_template
+python3 zero_shot_learning.py --model ViT-B/16 --augmented_template --height 256
 ```
 
 Train with Prompt Engineering

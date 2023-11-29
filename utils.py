@@ -120,15 +120,41 @@ def resize_pos_embed(posemb, posemb_new, height, width):
     return posemb
 
 
-def model_adaptor(model, height, width):
-    if (height, width) != (224, 224):
-        if isinstance(model.visual, clip_model.VisionTransformer):
-            patch_size = model.visual.conv1.kernel_size
-            pretrained_weight = model.visual.positional_embedding.data
-            posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, height // patch_size[0], width // patch_size[1])
-            model.visual.positional_embedding = nn.Parameter(posemb)
-        else:
-            pretrained_weight = model.attnpool.positional_embedding.data
-            posemb = resize_pos_embed(pretrained_weight, model.attnpool.positional_embedding, height // 32, width // 32)
-            model.attnpool.positional_embedding = nn.Parameter(posemb)
-    return model.cuda()
+class BNNeck(nn.Module):
+    def __init__(self, width):
+        super(BNNeck, self).__init__()
+        self.bottleneck_proj = nn.BatchNorm1d(width)
+        self.bottleneck_proj.bias.requires_grad_(False)
+
+    def forward(self, x):
+        return self.bottleneck_proj(x)
+
+
+def model_adaptor(model, height, width, weights=None):
+    # if (height, width) != (224, 224):
+    if isinstance(model.visual, clip_model.VisionTransformer):
+        patch_size = model.visual.conv1.kernel_size
+        pretrained_weight = model.visual.positional_embedding.data
+        posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, height // patch_size[0], width // patch_size[1])
+        model.visual.positional_embedding = nn.Parameter(posemb)
+
+        bottleneck = BNNeck(model.visual.proj.size(1))
+
+        if weights is not None:
+            weights = torch.load(weights)
+            matched_weights = OrderedDict()
+            for key in weights:
+                if key.startswith("image_encoder"):
+                    matched_key = ".".join(key.split(".")[1:])
+                else:
+                    matched_key = key
+                matched_weights[matched_key] = weights[key]
+            model.visual.load_state_dict(matched_weights, strict=False)
+            bottleneck.load_state_dict(matched_weights, strict=False)
+    else:
+        pretrained_weight = model.attnpool.positional_embedding.data
+        posemb = resize_pos_embed(pretrained_weight, model.attnpool.positional_embedding, height // 32, width // 32)
+        model.attnpool.positional_embedding = nn.Parameter(posemb)
+        bottleneck = BNNeck(model.attnpool.k_proj.in_features)
+
+    return model.cuda(), bottleneck.cuda()
