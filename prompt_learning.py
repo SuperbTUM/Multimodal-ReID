@@ -189,7 +189,7 @@ if __name__ == "__main__":
     params = params_parser()
     model, transforms = clip.load(params.model)
     image_height, image_width = params.height, int(params.height * params.ratio)
-    model = model_adaptor(model, image_height, image_width)
+    model = model_adaptor(model, image_height, image_width)[0]
     loader_train = get_loader_train(transforms, params.root, params.bs, image_height, image_width)
     classnames = ["person " + str(i) for i in range(751)]
 

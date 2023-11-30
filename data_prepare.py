@@ -69,11 +69,11 @@ def get_loader_train(preprocess, root, batch_size, image_height, image_width):
 
 
 def get_loader(preprocess, root, batch_size=64, image_height=224, image_width=112):
-    ratio = image_height / image_width
+    # ratio = image_height / image_width
     transform_test = transforms.Compose([
         transforms.Resize((image_height, image_width)),
-        transforms.Pad((int(5 * ratio), 5)),
-        transforms.RandomCrop((image_height, image_width)),
+        # transforms.Pad((int(5 * ratio), 5)),
+        # transforms.RandomCrop((image_height, image_width)),
         # ToSquare(),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -82,8 +82,8 @@ def get_loader(preprocess, root, batch_size=64, image_height=224, image_width=11
     transform_test_augmented = transforms.Compose([
         transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(1.0),
-        transforms.Pad((int(5 * ratio), 5)),
-        transforms.RandomCrop((image_height, image_width)),
+        # transforms.Pad((int(5 * ratio), 5)),
+        # transforms.RandomCrop((image_height, image_width)),
         # ToSquare(),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),

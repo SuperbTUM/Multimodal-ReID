@@ -72,8 +72,8 @@ def inference(model,
             image_features_last, image_features, image_features_proj = model.encode_image(images)
             image_features = image_features[:, 0]
             image_features_proj = image_features_proj[:, 0]
-            image_features = bottleneck(image_features)
-            image_features_proj = bottleneck_proj(image_features_proj)
+            # image_features = bottleneck(image_features)
+            # image_features_proj = bottleneck_proj(image_features_proj)
             if multimodal:
                 logits = image_features_proj
             else:
@@ -92,8 +92,8 @@ def inference(model,
             image_features_last, image_features, image_features_proj = model.encode_image(images)
             image_features = image_features[:, 0]
             image_features_proj = image_features_proj[:, 0]
-            image_features = bottleneck(image_features)
-            image_features_proj = bottleneck_proj(image_features_proj)
+            # image_features = bottleneck(image_features)
+            # image_features_proj = bottleneck_proj(image_features_proj)
             if multimodal:
                 image_features = image_features_proj
             else:
