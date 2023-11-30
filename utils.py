@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from clip import model as clip_model
+import custom_clip_model
 
 
 def load_checkpoint(fpath):
@@ -121,40 +122,60 @@ def resize_pos_embed(posemb, posemb_new, height, width):
 
 
 class BNNeck(nn.Module):
-    def __init__(self, width):
+    def __init__(self, width, proj):
         super(BNNeck, self).__init__()
-        self.bottleneck_proj = nn.BatchNorm1d(width)
-        self.bottleneck_proj.bias.requires_grad_(False)
+        if proj:
+            self.bottleneck_proj = nn.BatchNorm1d(width)
+            self.bottleneck_proj.bias.requires_grad_(False)
+        else:
+            self.bottleneck = nn.BatchNorm1d(width)
+            self.bottleneck.bias.requires_grad_(False)
+        self.proj = proj
 
     def forward(self, x):
-        return self.bottleneck_proj(x)
+        if self.proj:
+            return self.bottleneck_proj(x)
+        return self.bottleneck(x)
 
 
 def model_adaptor(model, height, width, weights=None):
     # if (height, width) != (224, 224):
-    if isinstance(model.visual, clip_model.VisionTransformer):
-        patch_size = model.visual.conv1.kernel_size
+    if weights is not None:
+        weights = torch.load(weights)
+    vision_width = weights["image_encoder.conv1.weight"].shape[0]
+    vision_layers = len(
+        [k for k in weights.keys() if k.startswith("image_encoder.") and k.endswith(".attn.in_proj_weight")])
+    vision_patch_size = weights["image_encoder.conv1.weight"].shape[-1]
+    embed_dim = weights["text_encoder.text_projection"].shape[1]
+    h_resolution = height // vision_patch_size
+    w_resolution = width // vision_patch_size
+    model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, 16, vision_width, vision_layers, vision_width // 64, embed_dim)
+    if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer)):
         pretrained_weight = model.visual.positional_embedding.data
-        posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, height // patch_size[0], width // patch_size[1])
-        model.visual.positional_embedding = nn.Parameter(posemb)
+        if pretrained_weight.size() != model.visual.positional_embedding.size():
+            posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, h_resolution, w_resolution)
+            model.visual.positional_embedding = nn.Parameter(posemb)
 
-        bottleneck = BNNeck(model.visual.proj.size(1))
+        bottleneck_proj = BNNeck(model.visual.proj.size(1), True)
+        bottleneck = BNNeck(pretrained_weight.size(1), False)
 
         if weights is not None:
-            weights = torch.load(weights)
             matched_weights = OrderedDict()
             for key in weights:
                 if key.startswith("image_encoder"):
-                    matched_key = ".".join(key.split(".")[1:])
+                    matched_key = "visual." + ".".join(key.split(".")[1:])
                 else:
                     matched_key = key
                 matched_weights[matched_key] = weights[key]
-            model.visual.load_state_dict(matched_weights, strict=False)
+            model.load_state_dict(matched_weights, strict=False)
             bottleneck.load_state_dict(matched_weights, strict=False)
+            bottleneck_proj.load_state_dict(matched_weights, strict=False)
     else:
         pretrained_weight = model.attnpool.positional_embedding.data
-        posemb = resize_pos_embed(pretrained_weight, model.attnpool.positional_embedding, height // 32, width // 32)
-        model.attnpool.positional_embedding = nn.Parameter(posemb)
-        bottleneck = BNNeck(model.attnpool.k_proj.in_features)
+        if model.attnpool.positional_embedding.size() != pretrained_weight.size():
+            posemb = resize_pos_embed(pretrained_weight, model.attnpool.positional_embedding, height // 32, width // 32)
+            model.attnpool.positional_embedding = nn.Parameter(posemb)
+        bottleneck_proj = BNNeck(model.attnpool.k_proj.in_features, True)
+        bottleneck = BNNeck(model.attnpool.c_proj.out_features, False)
 
-    return model.cuda(), bottleneck.cuda()
+    return model.cuda(), bottleneck.cuda(), bottleneck_proj.cuda()

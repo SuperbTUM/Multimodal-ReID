@@ -11,8 +11,17 @@ from evaluate import evaluate
 from data_prepare import get_prompts, get_loader, get_prompts_augmented
 
 
-def load_model(model_name, classnames, templates):
+def load_model(model_name, classnames, templates, weights=None):
     model, preprocess = clip.load(model_name)
+    model.eval()
+    if weights is not None:
+        weights = torch.load(weights)
+        matched_weights = OrderedDict()
+        for key in weights:
+            if key.startswith("text_encoder"):
+                matched_key = ".".join(key.split(".")[1:])
+                matched_weights[matched_key] = weights[key]
+        model.load_state_dict(matched_weights, strict=False)
 
     def zeroshot_classifier(classnames, templates: dict):
         with torch.no_grad():
@@ -38,9 +47,16 @@ def load_model(model_name, classnames, templates):
     return zeroshot_weights, preprocess, model
 
 
-def inference(model, bottleneck, zeroshot_weights, loader, loader_augment):
+def inference(model,
+              bottleneck,
+              bottleneck_proj,
+              zeroshot_weights,
+              loader,
+              loader_augment,
+              multimodal):
     model.eval()
     bottleneck.eval()
+    bottleneck_proj.eval()
 
     embeddings = []
     targets = []
@@ -53,9 +69,15 @@ def inference(model, bottleneck, zeroshot_weights, loader, loader_augment):
             # target = target.cuda()
 
             # predict
-            image_features = model.encode_image(images)
+            image_features_last, image_features, image_features_proj = model.encode_image(images)
+            image_features = image_features[:, 0]
+            image_features_proj = image_features_proj[:, 0]
             image_features = bottleneck(image_features)
-            logits = image_features
+            image_features_proj = bottleneck_proj(image_features_proj)
+            if multimodal:
+                logits = image_features_proj
+            else:
+                logits = torch.cat((image_features, image_features_proj), dim=1)
 
             embeddings.append(logits)
             targets.append(target)
@@ -67,12 +89,23 @@ def inference(model, bottleneck, zeroshot_weights, loader, loader_augment):
             # target = target.cuda()
 
             # predict
-            image_features = model.encode_image(images)
+            image_features_last, image_features, image_features_proj = model.encode_image(images)
+            image_features = image_features[:, 0]
+            image_features_proj = image_features_proj[:, 0]
             image_features = bottleneck(image_features)
+            image_features_proj = bottleneck_proj(image_features_proj)
+            if multimodal:
+                image_features = image_features_proj
+            else:
+                image_features = torch.cat((image_features, image_features_proj), dim=1)
+
             image_features = (embeddings[i] + image_features) / 2.
             image_features /= image_features.norm(dim=-1, keepdim=True)
-            logits = 100. * image_features @ zeroshot_weights.T
-            logits = logits.softmax(dim=-1)
+            if multimodal:
+                logits = 100. * image_features @ zeroshot_weights.T.float()
+            else:
+                logits = image_features
+            # logits = logits.softmax(dim=-1)
             logits = F.normalize(logits, dim=-1)
 
             embeddings[i] = logits
@@ -119,6 +152,7 @@ def params_parser():
     args.add_argument("--augmented_template", action="store_true")
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
+    args.add_argument("--mm", action="store_true")
     return args.parse_args()
 
 
@@ -129,12 +163,12 @@ if __name__ == "__main__":
         identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
     else:
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
-    zeroshot_weights, transforms_, model = load_model(model_name, identity_list, template_dict)
+    zeroshot_weights, transforms_, model = load_model(model_name, identity_list, template_dict, "Market1501_clipreid_ViT-B-16_60.pth")
     image_height, image_width = params.height, int(params.height * params.ratio)
-    model, bottleneck = model_adaptor(model, image_height, image_width, "Market1501_baseline_ViT-B-16_60.pth")
+    model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, "Market1501_clipreid_ViT-B-16_60.pth")
 
     loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(transforms_, params.root, params.bs, image_height, image_width)
 
-    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck, zeroshot_weights, loader_gallery, loader_gallery_augmented)
-    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, bottleneck, zeroshot_weights, loader_query, loader_query_augmented)
+    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck, bottleneck_proj, zeroshot_weights, loader_gallery, loader_gallery_augmented, params.mm)
+    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, bottleneck, bottleneck_proj, zeroshot_weights, loader_query, loader_query_augmented, params.mm)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
