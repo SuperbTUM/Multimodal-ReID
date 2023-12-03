@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from utils import model_adaptor
-from evaluate import evaluate
+from evaluate import R1_mAP_eval
 from data_prepare import get_prompts, get_loader, get_prompts_augmented
 
 
@@ -100,13 +100,13 @@ def inference(model,
                 image_features = torch.cat((image_features, image_features_proj), dim=1)
 
             image_features = (embeddings[i] + image_features) / 2.
-            image_features /= image_features.norm(dim=-1, keepdim=True)
             if multimodal:
-                logits = 100. * image_features @ zeroshot_weights.T.float()
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                logits = 1./0.07 * image_features @ zeroshot_weights.T.float()
+                logits = logits.softmax(dim=-1)
             else:
                 logits = image_features
-            # logits = logits.softmax(dim=-1)
-            logits = F.normalize(logits, dim=-1)
+            # logits = F.normalize(logits, dim=-1)
 
             embeddings[i] = logits
 
@@ -125,23 +125,13 @@ def get_cmc_map(
         gallery_cams,
         query_cams
 ):
-    CMC = torch.IntTensor(gallery_embeddings.size(0)).zero_()
-    ap = 0.0
-    for i in range(query_embeddings.size(0)):
-        ap_tmp, CMC_tmp = evaluate(query_embeddings[i],
-                                   query_labels[i],
-                                   query_cams[i],
-                                   gallery_embeddings,
-                                   gallery_labels,
-                                   gallery_cams)
-        if CMC_tmp[0] == -1:
-            continue
-        CMC = CMC + CMC_tmp
-        ap += ap_tmp
-
-    CMC = CMC.float()
-    CMC = CMC / query_embeddings.size(0)  # average CMC
-    print('Rank@1:%f Rank@5:%f Rank@10:%f mAP:%f' % (CMC[0], CMC[4], CMC[9], ap / query_embeddings.size(0)))
+    evaluator = R1_mAP_eval(len(query_labels), max_rank=50, feat_norm=True)
+    evaluator.reset()
+    evaluator.update((torch.cat((query_embeddings, gallery_embeddings), dim=0),
+                      torch.cat((query_labels, gallery_labels), dim=0),
+                      torch.cat((query_cams, gallery_cams), dim=0)))
+    cmc, mAP = evaluator.compute()
+    return cmc, mAP
 
 
 def params_parser():

@@ -59,7 +59,7 @@ def get_loader_train(preprocess, root, batch_size, image_height, image_width):
         transforms.RandomCrop((image_height, image_width)),
         # ToSquare(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),#(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         transforms.RandomErasing()
     ])
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
@@ -76,7 +76,7 @@ def get_loader(preprocess, root, batch_size=64, image_height=224, image_width=11
         # transforms.RandomCrop((image_height, image_width)),
         # ToSquare(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),#(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
     preprocess = transform_test
     transform_test_augmented = transforms.Compose([
@@ -86,7 +86,7 @@ def get_loader(preprocess, root, batch_size=64, image_height=224, image_width=11
         # transforms.RandomCrop((image_height, image_width)),
         # ToSquare(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),#(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
     preprocess_augmented = transform_test_augmented
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
