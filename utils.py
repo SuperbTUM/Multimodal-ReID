@@ -166,7 +166,8 @@ def model_adaptor(model, height, width, weights=None):
                     matched_key = "visual." + ".".join(key.split(".")[1:])
                 else:
                     matched_key = key
-                matched_weights[matched_key] = weights[key]
+                if matched_key in model.state_dict():
+                    matched_weights[matched_key] = weights[key].to(model.state_dict()[matched_key].dtype)
             model.load_state_dict(matched_weights, strict=False)
             bottleneck.load_state_dict(matched_weights, strict=False)
             bottleneck_proj.load_state_dict(matched_weights, strict=False)

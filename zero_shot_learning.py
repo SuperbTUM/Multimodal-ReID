@@ -14,14 +14,17 @@ from data_prepare import get_prompts, get_loader, get_prompts_augmented
 def load_model(model_name, classnames, templates, weights=None):
     model, preprocess = clip.load(model_name)
     model.eval()
+    '''
+    # text encoder not trained
     if weights is not None:
-        weights = torch.load(weights)
-        matched_weights = OrderedDict()
-        for key in weights:
-            if key.startswith("text_encoder"):
-                matched_key = ".".join(key.split(".")[1:])
-                matched_weights[matched_key] = weights[key]
-        model.load_state_dict(matched_weights, strict=False)
+    weights = torch.load(weights)
+    matched_weights = OrderedDict()
+    for key in weights:
+        if key.startswith("text_encoder"):
+            matched_key = ".".join(key.split(".")[1:])
+            matched_weights[matched_key] = weights[key].to(model.state_dict()[matched_key].dtype)
+    model.load_state_dict(matched_weights, strict=False)
+    '''
 
     def zeroshot_classifier(classnames, templates: dict):
         with torch.no_grad():
@@ -102,7 +105,7 @@ def inference(model,
             image_features = (embeddings[i] + image_features) / 2.
             if multimodal:
                 image_features /= image_features.norm(dim=-1, keepdim=True)
-                logits = 1./0.07 * image_features @ zeroshot_weights.T.float()
+                logits = 1./0.07 * image_features.float() @ zeroshot_weights.T.float()
                 logits = logits.softmax(dim=-1)
             else:
                 logits = image_features

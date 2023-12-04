@@ -131,5 +131,5 @@ class R1_mAP_eval():
             distmat = euclidean_distance(qf, gf)
         cmc, mAP = eval_func(distmat, q_pids, g_pids, q_camids, g_camids)
 
-        print("Rank@{:d}:{:.1%}, Rank@{:<3}:{:.1%}, Rank@{:<3}:{:.1%}, mAP:{:.1%}".format(1, cmc[0], 5, cmc[4], 10, cmc[9], mAP))
+        print("Rank@{:d}:{:.1%}, Rank@{:d}:{:.1%}, Rank@{:d}:{:.1%}, mAP:{:.1%}".format(1, cmc[0], 5, cmc[4], 10, cmc[9], mAP))
         return cmc, mAP
