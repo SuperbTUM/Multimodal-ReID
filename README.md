@@ -18,5 +18,5 @@ python3 zero_shot_learning.py --model ViT-B/16 --augmented_template --height 256
 
 Train with Prompt Engineering
 ```bash
-python3 prompt_learning.py
+python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 16
 ```

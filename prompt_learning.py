@@ -5,6 +5,8 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.backends import cudnn
+from torch.cuda.amp import GradScaler, autocast
 import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
@@ -14,6 +16,8 @@ from tqdm import tqdm
 from utils import load_pretrained_weights, model_adaptor
 from data_prepare import get_loader_train
 
+cudnn.enabled = True
+cudnn.deterministic = True
 
 class PromptLearner(nn.Module):
     def __init__(self, classnames, clip_model):
@@ -55,7 +59,7 @@ class PromptLearner(nn.Module):
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).cuda()  # (n_cls, n_tkn)
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
@@ -145,23 +149,28 @@ class CustomCLIP(nn.Module):
         self.dtype = clip_model.dtype
 
     def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype))
+        image_features = self.image_encoder(image.type(self.dtype))[2]
+        image_features = image_features[:, 0]
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         prompts = self.prompt_learner(image_features)
         tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
+        logits = []
+
+        for pts_i, imf_i in zip(prompts, image_features):
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            l_i = logit_scale * imf_i @ text_features.t()
+            logits.append(l_i)
+
+        logits = torch.stack(logits)
 
         return logits
 
 
 def train_batch(model, batch):
-    image, label = batch
+    image, label = batch[:2]
     image = image.cuda()
     label = label.cuda()
     output = model(image)
@@ -175,7 +184,8 @@ def train_prompter(classnames,
                    epochs,
                    pretrained=None):
     print("Building custom CLIP")
-    model = CustomCLIP(classnames, clip_model)
+    clip_model.float()
+    model = CustomCLIP(classnames, clip_model).cuda()
 
     if pretrained is not None:
         load_pretrained_weights(model.prompt_learner, pretrained)
@@ -187,14 +197,20 @@ def train_prompter(classnames,
 
     optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.002)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+    scaler = GradScaler()
 
     for epoch in range(epochs):
-        for i, (images, target, cams, seqs) in enumerate(tqdm(dataloader)):
+        iterator = tqdm(dataloader)
+        for images, target, cams, seqs in iterator:
             batch = images, target
-            loss = train_batch(model, batch)
+            with autocast():
+                loss = train_batch(model, batch)
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+
         scheduler.step()
 
     torch.save(clip_model.prompt_learner, params.save_path if os.path.exists(params.save_path) else "clip_model_prompter.pt")
@@ -214,11 +230,11 @@ def params_parser():
 
 
 if __name__ == "__main__":
-    torch.cuda.empty_cache()
     params = params_parser()
     model, transforms = clip.load(params.model)
+    model.eval()
     image_height, image_width = params.height, int(params.height * params.ratio)
-    model = model_adaptor(model, image_height, image_width)[0]
+    model = model_adaptor(model, image_height, image_width, "Market1501_clipreid_ViT-B-16_60.pth")[0]
     loader_train = get_loader_train(transforms, params.root, params.bs, image_height, image_width)
     classnames = ["person " + str(i) for i in range(751)]
 
