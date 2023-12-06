@@ -55,6 +55,9 @@ class PromptLearner(nn.Module):
             ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
         ]))
 
+        if not params.amp:
+            self.meta_net.half()
+
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
@@ -184,7 +187,8 @@ def train_prompter(classnames,
                    epochs,
                    pretrained=None):
     print("Building custom CLIP")
-    clip_model.float()
+    if params.amp:
+        clip_model.float()
     model = CustomCLIP(classnames, clip_model).cuda()
 
     if pretrained is not None:
@@ -201,15 +205,24 @@ def train_prompter(classnames,
 
     for epoch in range(epochs):
         iterator = tqdm(dataloader)
-        for images, target, cams, seqs in iterator:
-            batch = images, target
-            with autocast():
+        if params.amp:
+            for images, target, cams, seqs in iterator:
+                batch = images, target
+                with autocast():
+                    loss = train_batch(model, batch)
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+        else:
+            for images, target, cams, seqs in iterator:
+                batch = images, target
                 loss = train_batch(model, batch)
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
         scheduler.step()
 
@@ -226,6 +239,7 @@ def params_parser():
     args.add_argument("--save_path", default="clip_model_prompter.pt")
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
+    args.add_argument("--amp", action="store_true")
     return args.parse_args()
 
 
