@@ -138,39 +138,73 @@ class BNNeck(nn.Module):
         return self.bottleneck(x)
 
 
+def convert_weights(model: nn.Module):
+    """Convert applicable model parameters to fp16"""
+
+    def _convert_weights_to_fp16(l):
+        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+            l.weight.data = l.weight.data.half()
+            if l.bias is not None:
+                l.bias.data = l.bias.data.half()
+
+        if isinstance(l, nn.MultiheadAttention):
+            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+                tensor = getattr(l, attr)
+                if tensor is not None:
+                    tensor.data = tensor.data.half()
+
+        for name in ["text_projection", "proj"]:
+            if hasattr(l, name):
+                attr = getattr(l, name)
+                if attr is not None:
+                    attr.data = attr.data.half()
+
+    model.apply(_convert_weights_to_fp16)
+
+
 def model_adaptor(model, height, width, weights=None):
     # if (height, width) != (224, 224):
     if weights is not None:
         weights = torch.load(weights)
-    vision_width = weights["image_encoder.conv1.weight"].shape[0]
-    vision_layers = len(
-        [k for k in weights.keys() if k.startswith("image_encoder.") and k.endswith(".attn.in_proj_weight")])
-    vision_patch_size = weights["image_encoder.conv1.weight"].shape[-1]
-    embed_dim = weights["text_encoder.text_projection"].shape[1]
-    h_resolution = height // vision_patch_size
-    w_resolution = width // vision_patch_size
-    model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, 16, vision_width, vision_layers, vision_width // 64, embed_dim)
     if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer)):
-        pretrained_weight = model.visual.positional_embedding.data
-        if pretrained_weight.size() != model.visual.positional_embedding.size():
-            posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, h_resolution, w_resolution)
-            model.visual.positional_embedding = nn.Parameter(posemb)
-
         bottleneck_proj = BNNeck(model.visual.proj.size(1), True)
-        bottleneck = BNNeck(pretrained_weight.size(1), False)
+        bottleneck = BNNeck(model.visual.proj.size(0), False)
+
+        matched_weights = OrderedDict()
+        bottleneck_weights = OrderedDict()
 
         if weights is not None:
-            matched_weights = OrderedDict()
+            vision_width = weights["image_encoder.conv1.weight"].shape[0]
+            vision_layers = len(
+                [k for k in weights.keys() if k.startswith("image_encoder.") and k.endswith(".attn.in_proj_weight")])
+            vision_patch_size = weights["image_encoder.conv1.weight"].shape[-1]
+            embed_dim = weights["text_encoder.text_projection"].shape[1]
+            h_resolution = height // vision_patch_size
+            w_resolution = width // vision_patch_size
+
+            pretrained_weight = model.visual.positional_embedding.data
+            if pretrained_weight.size() != model.visual.positional_embedding.size():
+                posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, h_resolution,
+                                          w_resolution)
+                model.visual.positional_embedding = nn.Parameter(posemb)
             for key in weights:
                 if key.startswith("image_encoder"):
-                    matched_key = "visual." + ".".join(key.split(".")[1:])
-                else:
+                    matched_key = ".".join(key.split(".")[1:])
+                    matched_weights[matched_key] = weights[key].to(model.state_dict()["visual."+matched_key].dtype)
+                elif "bottleneck" in key:
                     matched_key = key
-                if matched_key in model.state_dict():
-                    matched_weights[matched_key] = weights[key].to(model.state_dict()[matched_key].dtype)
-            model.load_state_dict(matched_weights, strict=False)
-            bottleneck.load_state_dict(matched_weights, strict=False)
-            bottleneck_proj.load_state_dict(matched_weights, strict=False)
+                    bottleneck_weights[matched_key] = weights[key]
+
+            model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, 16,
+                                                               vision_width, vision_layers, vision_width // 64,
+                                                               embed_dim)
+
+        if matched_weights:
+            model.visual.load_state_dict(matched_weights, strict=True)
+            convert_weights(model.visual)
+        if bottleneck_weights:
+            bottleneck.load_state_dict(bottleneck_weights, strict=False)
+            bottleneck_proj.load_state_dict(bottleneck_weights, strict=False)
     else:
         pretrained_weight = model.attnpool.positional_embedding.data
         if model.attnpool.positional_embedding.size() != pretrained_weight.size():
