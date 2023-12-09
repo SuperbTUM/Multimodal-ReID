@@ -1,0 +1,15 @@
+{
+  "train_batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "optimizer": {
+    "type": "SGD",
+    "params": {
+      "lr": 0.002
+    }
+  },
+  "zero_allow_untested_optimizer": true,
+  "zero_optimization": {
+    "stage": 3,
+    "reduce_bucket_size": 5e8
+  }
+}
