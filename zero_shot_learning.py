@@ -62,6 +62,7 @@ def inference(model,
     bottleneck_proj.eval()
 
     embeddings = []
+    embeddings_proj = []
     targets = []
     camera_ids = []
     sequence_ids = []
@@ -69,7 +70,6 @@ def inference(model,
     with torch.no_grad():
         for i, (images, target, cams, seqs) in enumerate(tqdm(loader)):
             images = images.cuda()
-            # target = target.cuda()
 
             # predict
             image_features_last, image_features, image_features_proj = model.encode_image(images)
@@ -77,19 +77,17 @@ def inference(model,
             image_features_proj = image_features_proj[:, 0]
             # image_features = bottleneck(image_features)
             # image_features_proj = bottleneck_proj(image_features_proj)
-            if multimodal:
-                logits = image_features_proj
-            else:
-                logits = torch.cat((image_features, image_features_proj), dim=1)
+            logits = torch.cat((image_features, image_features_proj), dim=1)
 
             embeddings.append(logits)
+            if multimodal:
+                embeddings_proj.append(image_features_proj)
             targets.append(target)
             camera_ids.append(cams)
             sequence_ids.append(seqs)
 
         for i, (images, target, cams, seqs) in enumerate(tqdm(loader_augment)):
             images = images.cuda()
-            # target = target.cuda()
 
             # predict
             image_features_last, image_features, image_features_proj = model.encode_image(images)
@@ -97,19 +95,18 @@ def inference(model,
             image_features_proj = image_features_proj[:, 0]
             # image_features = bottleneck(image_features)
             # image_features_proj = bottleneck_proj(image_features_proj)
-            if multimodal:
-                image_features = image_features_proj
-            else:
-                image_features = torch.cat((image_features, image_features_proj), dim=1)
+            image_features = torch.cat((image_features, image_features_proj), dim=1)
 
             image_features = (embeddings[i] + image_features) / 2.
             if multimodal:
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-                logits = 1./0.07 * image_features.float() @ zeroshot_weights.T.float()
+                image_features_proj = (embeddings_proj[i] + image_features_proj) / 2.
+                image_features_proj /= image_features_proj.norm(dim=-1, keepdim=True)
+                logits = 1./0.07 * image_features_proj.float() @ zeroshot_weights.T.float()
                 logits = logits.softmax(dim=-1)
+
+                logits = torch.cat((image_features, logits), dim=1)
             else:
                 logits = image_features
-            # logits = F.normalize(logits, dim=-1)
 
             embeddings[i] = logits
 
