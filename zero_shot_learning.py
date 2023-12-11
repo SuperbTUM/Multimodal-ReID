@@ -102,11 +102,11 @@ def inference(model,
                 logits = 1./0.07 * image_features_proj.float() @ zeroshot_weights.T.float()
                 logits = logits.softmax(dim=-1)
                 image_features = (embeddings[i] + image_features) / 2.
-                logits = torch.cat((image_features, logits), dim=1)
+                logits = torch.cat((image_features.float(), logits), dim=1)
             else:
                 image_features = torch.cat((image_features, image_features_proj), dim=1)
                 image_features = (embeddings[i] + image_features) / 2.
-                logits = image_features
+                logits = image_features.float()
 
             embeddings[i] = logits
 
