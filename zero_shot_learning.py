@@ -79,9 +79,10 @@ def inference(model,
             # image_features_proj = bottleneck_proj(image_features_proj)
             logits = torch.cat((image_features, image_features_proj), dim=1)
 
-            embeddings.append(logits)
             if multimodal:
                 embeddings_proj.append(image_features_proj)
+                logits = image_features
+            embeddings.append(logits)
             targets.append(target)
             camera_ids.append(cams)
             sequence_ids.append(seqs)
@@ -95,17 +96,16 @@ def inference(model,
             image_features_proj = image_features_proj[:, 0]
             # image_features = bottleneck(image_features)
             # image_features_proj = bottleneck_proj(image_features_proj)
-            image_features = torch.cat((image_features, image_features_proj), dim=1)
-
-            image_features = (embeddings[i] + image_features) / 2.
             if multimodal:
                 image_features_proj = (embeddings_proj[i] + image_features_proj) / 2.
                 image_features_proj /= image_features_proj.norm(dim=-1, keepdim=True)
                 logits = 1./0.07 * image_features_proj.float() @ zeroshot_weights.T.float()
                 logits = logits.softmax(dim=-1)
-
+                image_features = (embeddings[i] + image_features) / 2.
                 logits = torch.cat((image_features, logits), dim=1)
             else:
+                image_features = torch.cat((image_features, image_features_proj), dim=1)
+                image_features = (embeddings[i] + image_features) / 2.
                 logits = image_features
 
             embeddings[i] = logits
