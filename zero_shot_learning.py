@@ -12,7 +12,7 @@ from data_prepare import get_prompts, get_loader, get_prompts_augmented
 
 
 def load_model(model_name, classnames, templates, weights=None):
-    model, preprocess = clip.load(model_name)
+    model, _ = clip.load(model_name)
     model.eval()
     '''
     # text encoder not trained
@@ -47,7 +47,7 @@ def load_model(model_name, classnames, templates, weights=None):
         return class_embeddings
 
     zeroshot_weights = zeroshot_classifier(classnames, templates)
-    return zeroshot_weights, preprocess, model
+    return zeroshot_weights, model
 
 
 def inference(model,
@@ -143,21 +143,23 @@ def params_parser():
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--mm", action="store_true")
+    args.add_argument("--clip_weights", type=str, default="Market1501_clipreid_ViT-B-16_60.pth")
     return args.parse_args()
 
 
 if __name__ == "__main__":
     params = params_parser()
     model_name = params.model
+    image_height, image_width = params.height, int(params.height * params.ratio)
+    loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(params.root, params.bs,
+                                                                                                image_height,
+                                                                                                image_width)
     if params.augmented_template:
         identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
     else:
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
-    zeroshot_weights, transforms_, model = load_model(model_name, identity_list, template_dict, "Market1501_clipreid_ViT-B-16_60.pth")
-    image_height, image_width = params.height, int(params.height * params.ratio)
-    model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, "Market1501_clipreid_ViT-B-16_60.pth")
-
-    loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(transforms_, params.root, params.bs, image_height, image_width)
+    zeroshot_weights, model = load_model(model_name, identity_list, template_dict)
+    model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, params.clip_weights)
 
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck, bottleneck_proj, zeroshot_weights, loader_gallery, loader_gallery_augmented, params.mm)
     embeddings_query, targets_query, cameras_query, sequences_query = inference(model, bottleneck, bottleneck_proj, zeroshot_weights, loader_query, loader_query_augmented, params.mm)

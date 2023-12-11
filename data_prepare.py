@@ -51,7 +51,7 @@ class reidDataset(Dataset):
         return detailed_info
 
 
-def get_loader_train(preprocess, root, batch_size, image_height, image_width):
+def get_loader_train(root, batch_size, image_height, image_width):
     transform_train = transforms.Compose([
         transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(),
@@ -68,12 +68,9 @@ def get_loader_train(preprocess, root, batch_size, image_height, image_width):
     return loader_train
 
 
-def get_loader(preprocess, root, batch_size=64, image_height=224, image_width=112):
-    # ratio = image_height / image_width
+def get_loader(root, batch_size=64, image_height=224, image_width=112):
     transform_test = transforms.Compose([
         transforms.Resize((image_height, image_width)),
-        # transforms.Pad((int(5 * ratio), 5)),
-        # transforms.RandomCrop((image_height, image_width)),
         # ToSquare(),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),#(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -102,6 +99,16 @@ def get_loader(preprocess, root, batch_size=64, image_height=224, image_width=11
     loader_query_augmented = DataLoader(reid_dataset_query_augmented, batch_size=batch_size, num_workers=4,
                                         shuffle=False, pin_memory=True)
     return loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented
+
+
+def get_prompts_simple(identity_list, num_class):
+    sentence_templates = ["itap of a {}", "a bad photo of the {}", "a origami {}", "a photo of the large {}",
+                          "a {} in a video game", "art of the {}", "a photo of the small {}"]
+    templates = [list() for _ in range(num_class)]
+    for i in range(num_class):
+        for st in sentence_templates:
+            templates[i].append(st.format("person no." + str(i)))
+    return identity_list, {identity: template for identity, template in zip(identity_list, templates)}
 
 
 def get_prompts(file_name):

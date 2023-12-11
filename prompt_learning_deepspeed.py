@@ -241,17 +241,18 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--local_rank", default=0, type=int)
     args.add_argument("--deepspeed_config", type=str, default="deepspeed_prompter_config.json")
+    args.add_argument("--clip_weights", type=str, default="Market1501_clipreid_ViT-B-16_60.pth")
     return args.parse_args()
 
 
 if __name__ == "__main__":
     params = params_parser()
     trainer_config = json.load(open(params.deepspeed_config))
-    model, transforms = clip.load(params.model)
+    model, _ = clip.load(params.model)
     model.eval()
     image_height, image_width = params.height, int(params.height * params.ratio)
-    model = model_adaptor(model, image_height, image_width, "Market1501_clipreid_ViT-B-16_60.pth")[0]
-    loader_train = get_loader_train(transforms, params.root, params.bs, image_height, image_width)
+    model = model_adaptor(model, image_height, image_width, params.clip_weights)[0]
+    loader_train = get_loader_train(params.root, params.bs, image_height, image_width)
     classnames = ["person " + str(i) for i in range(751)]
 
     trained_model = train_prompter(trainer_config,
