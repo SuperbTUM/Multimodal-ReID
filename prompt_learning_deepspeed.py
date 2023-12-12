@@ -252,7 +252,8 @@ if __name__ == "__main__":
     model.eval()
     image_height, image_width = params.height, int(params.height * params.ratio)
     model = model_adaptor(model, image_height, image_width, params.clip_weights)[0]
-    loader_train = get_loader_train(params.root, params.bs, image_height, image_width)
+    loader_train = get_loader_train(params.root, params.bs, image_height, image_width,
+                                    "vit" if "ViT" in params.model else "rn")
     classnames = ["person " + str(i) for i in range(751)]
 
     trained_model = train_prompter(trainer_config,

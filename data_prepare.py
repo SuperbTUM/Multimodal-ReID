@@ -51,15 +51,14 @@ class reidDataset(Dataset):
         return detailed_info
 
 
-def get_loader_train(root, batch_size, image_height, image_width):
+def get_loader_train(root, batch_size, image_height, image_width, model_type):
     transform_train = transforms.Compose([
         transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(),
         transforms.Pad((10, 5)),
         transforms.RandomCrop((image_height, image_width)),
-        # ToSquare(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),#(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
         transforms.RandomErasing()
     ])
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
@@ -68,12 +67,11 @@ def get_loader_train(root, batch_size, image_height, image_width):
     return loader_train
 
 
-def get_loader(root, batch_size=64, image_height=224, image_width=112):
+def get_loader(root, batch_size, image_height, image_width, model_type):
     transform_test = transforms.Compose([
         transforms.Resize((image_height, image_width)),
-        # ToSquare(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),#(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
     ])
     preprocess = transform_test
     transform_test_augmented = transforms.Compose([
@@ -81,9 +79,8 @@ def get_loader(root, batch_size=64, image_height=224, image_width=112):
         transforms.RandomHorizontalFlip(1.0),
         # transforms.Pad((int(5 * ratio), 5)),
         # transforms.RandomCrop((image_height, image_width)),
-        # ToSquare(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),#(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
     ])
     preprocess_augmented = transform_test_augmented
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
@@ -329,14 +326,14 @@ def get_prompts_augmented(file_name):
             template_advanced += items
         else:
             template_advanced += "nothing"
-        templates = [", ".join((template_basic1, template_hat, template_advanced)) + ".",
-                     ", ".join((template_basic2, template_hat, template_advanced)) + ".",
-                     ", ".join((template_basic3, template_hat, template_advanced)) + ".",
-                     ", ".join((template_basic4, template_hat, template_advanced)) + ".",
-                     ", ".join((template_basic1, template_advanced, template_hat)) + ".",
-                     ", ".join((template_basic2, template_advanced, template_hat)) + ".",
-                     ", ".join((template_basic3, template_advanced, template_hat)) + ".",
-                     ", ".join((template_basic4, template_advanced, template_hat)) + "."
+        templates = [", ".join((template_basic1, template_hat, template_advanced)),
+                     ", ".join((template_basic2, template_hat, template_advanced)),
+                     ", ".join((template_basic3, template_hat, template_advanced)),
+                     ", ".join((template_basic4, template_hat, template_advanced)),
+                     ", ".join((template_basic1, template_advanced, template_hat)),
+                     ", ".join((template_basic2, template_advanced, template_hat)),
+                     ", ".join((template_basic3, template_advanced, template_hat)),
+                     ", ".join((template_basic4, template_advanced, template_hat))
                      ]
         ensembled_templates = []
         for sentence_template in sentence_templates:

@@ -107,7 +107,7 @@ def load_pretrained_weights(model, weight_path):
 def resize_pos_embed(posemb, posemb_new, height, width):
     # Rescale the grid of position embeddings when loading from state_dict. Adapted from
     # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
-    ntok_new = posemb_new.shape[1]
+    ntok_new = posemb_new.shape[0]
 
     posemb_token, posemb_grid = posemb[:1], posemb[1:]
     ntok_new -= 1
@@ -182,11 +182,11 @@ def model_adaptor(model, height, width, weights=None):
             h_resolution = height // vision_patch_size
             w_resolution = width // vision_patch_size
 
-            pretrained_weight = model.visual.positional_embedding.data
-            if pretrained_weight.size() != model.visual.positional_embedding.size():
-                posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, h_resolution,
-                                          w_resolution)
-                model.visual.positional_embedding = nn.Parameter(posemb)
+            # pretrained_weight = weights["image_encoder.positional_embedding"].data
+            # if pretrained_weight.size() != model.visual.positional_embedding.size():
+            #     posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, h_resolution,
+            #                               w_resolution)
+            #     model.visual.positional_embedding = nn.Parameter(posemb)
             for key in weights:
                 if key.startswith("image_encoder"):
                     matched_key = ".".join(key.split(".")[1:])
@@ -206,11 +206,36 @@ def model_adaptor(model, height, width, weights=None):
             bottleneck.load_state_dict(bottleneck_weights, strict=False)
             bottleneck_proj.load_state_dict(bottleneck_weights, strict=False)
     else:
-        pretrained_weight = model.attnpool.positional_embedding.data
-        if model.attnpool.positional_embedding.size() != pretrained_weight.size():
-            posemb = resize_pos_embed(pretrained_weight, model.attnpool.positional_embedding, height // 32, width // 32)
-            model.attnpool.positional_embedding = nn.Parameter(posemb)
-        bottleneck_proj = BNNeck(model.attnpool.k_proj.in_features, True)
-        bottleneck = BNNeck(model.attnpool.c_proj.out_features, False)
+        h_resolution = height // 16
+        w_resolution = width // 16
+        # pretrained_weight = weights["image_encoder.attnpool.positional_embedding"].data
+        # if model.visual.attnpool.positional_embedding.size() != pretrained_weight.size():
+        #     posemb = resize_pos_embed(pretrained_weight, model.visual.attnpool.positional_embedding, h_resolution, w_resolution)
+        #     model.visual.attnpool.positional_embedding = nn.Parameter(posemb)
+
+        matched_weights = OrderedDict()
+        bottleneck_weights = OrderedDict()
+        if weights is not None:
+            vision_width = weights["image_encoder.layer1.0.conv1.weight"].shape[0]
+            vision_layers = tuple([len(
+                set(k.split(".")[2] for k in weights if k.startswith(f"image_encoder.layer{b}"))) for b in [1, 2, 3, 4]])
+            embed_dim = weights["text_encoder.text_projection"].shape[1]
+            for key in weights:
+                if key.startswith("image_encoder"):
+                    matched_key = ".".join(key.split(".")[1:])
+                    matched_weights[matched_key] = weights[key].to(model.state_dict()["visual." + matched_key].dtype)
+                elif "bottleneck" in key:
+                    matched_key = key
+                    bottleneck_weights[matched_key] = weights[key]
+            model.visual = custom_clip_model.ModifiedResNet(vision_layers, embed_dim, vision_width * 32 // 64,
+                                                            h_resolution*w_resolution, vision_width)
+        bottleneck = BNNeck(model.visual.attnpool.k_proj.in_features, False)
+        bottleneck_proj = BNNeck(model.visual.attnpool.c_proj.out_features, True)
+        if matched_weights:
+            model.visual.load_state_dict(matched_weights, strict=True)
+            convert_weights(model.visual)
+        if bottleneck_weights:
+            bottleneck.load_state_dict(bottleneck_weights, strict=False)
+            bottleneck_proj.load_state_dict(bottleneck_weights, strict=False)
 
     return model.cuda(), bottleneck.cuda(), bottleneck_proj.cuda()

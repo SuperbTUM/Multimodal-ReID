@@ -56,7 +56,8 @@ def inference(model,
               zeroshot_weights,
               loader,
               loader_augment,
-              multimodal):
+              multimodal,
+              model_type):
     model.eval()
     bottleneck.eval()
     bottleneck_proj.eval()
@@ -73,8 +74,12 @@ def inference(model,
 
             # predict
             image_features_last, image_features, image_features_proj = model.encode_image(images)
-            image_features = image_features[:, 0]
-            image_features_proj = image_features_proj[:, 0]
+            if model_type == "vit":
+                image_features = image_features[:, 0]
+                image_features_proj = image_features_proj[:, 0]
+            else:
+                image_features = F.avg_pool2d(image_features, 1).view(image_features.size(0), -1)
+                image_features_proj = image_features_proj[0]
             # image_features = bottleneck(image_features)
             # image_features_proj = bottleneck_proj(image_features_proj)
             logits = torch.cat((image_features, image_features_proj), dim=1)
@@ -92,8 +97,12 @@ def inference(model,
 
             # predict
             image_features_last, image_features, image_features_proj = model.encode_image(images)
-            image_features = image_features[:, 0]
-            image_features_proj = image_features_proj[:, 0]
+            if model_type == "vit":
+                image_features = image_features[:, 0]
+                image_features_proj = image_features_proj[:, 0]
+            else:
+                image_features = F.avg_pool2d(image_features, 1).view(image_features.size(0), -1)
+                image_features_proj = image_features_proj[0]
             # image_features = bottleneck(image_features)
             # image_features_proj = bottleneck_proj(image_features_proj)
             if multimodal:
@@ -153,7 +162,8 @@ if __name__ == "__main__":
     image_height, image_width = params.height, int(params.height * params.ratio)
     loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(params.root, params.bs,
                                                                                                 image_height,
-                                                                                                image_width)
+                                                                                                image_width,
+                                                                                                "vit" if "ViT" in params.model else "rn")
     if params.augmented_template:
         identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
     else:
@@ -161,6 +171,12 @@ if __name__ == "__main__":
     zeroshot_weights, model = load_model(model_name, identity_list, template_dict)
     model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, params.clip_weights)
 
-    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck, bottleneck_proj, zeroshot_weights, loader_gallery, loader_gallery_augmented, params.mm)
-    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, bottleneck, bottleneck_proj, zeroshot_weights, loader_query, loader_query_augmented, params.mm)
+    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck,
+                                                                                        bottleneck_proj, zeroshot_weights,
+                                                                                        loader_gallery, loader_gallery_augmented,
+                                                                                        params.mm, "vit" if "ViT" in params.model else "rn")
+    embeddings_query, targets_query, cameras_query, sequences_query = inference(model, bottleneck,
+                                                                                bottleneck_proj, zeroshot_weights,
+                                                                                loader_query, loader_query_augmented,
+                                                                                params.mm, "vit" if "ViT" in params.model else "rn")
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
