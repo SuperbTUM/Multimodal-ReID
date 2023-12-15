@@ -190,6 +190,7 @@ def train_prompter(classnames,
     if params.amp:
         clip_model = clip_model.float()
     model = CustomCLIP(classnames, clip_model).cuda()
+    model.train()
 
     if pretrained is not None:
         load_pretrained_weights(model.prompt_learner, pretrained)
@@ -226,16 +227,17 @@ def train_prompter(classnames,
 
         scheduler.step()
 
-    torch.save(clip_model.prompt_learner, params.save_path if os.path.exists(params.save_path) else "clip_model_prompter.pt")
-    return clip_model
+    model.eval()
+    torch.save(model.prompt_learner, params.save_path if os.path.exists(params.save_path) else "clip_model_prompter.pt")
+    return model
 
 
 def params_parser():
     args = argparse.ArgumentParser()
-    args.add_argument("--epochs", default=32, type=int)
-    args.add_argument("--root", default="", type=str)
+    args.add_argument("--epochs", default=10, type=int)
+    args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
-    args.add_argument("--bs", default=64, type=int)
+    args.add_argument("--bs", default=1, type=int)
     args.add_argument("--save_path", default="clip_model_prompter.pt")
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
