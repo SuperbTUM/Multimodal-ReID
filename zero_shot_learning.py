@@ -11,7 +11,7 @@ from evaluate import R1_mAP_eval
 from data_prepare import get_prompts, get_loader, get_prompts_augmented
 
 
-def load_model(model_name, classnames, templates, weights=None):
+def load_model(model_name, classnames, templates):
     model, _ = clip.load(model_name)
     model.eval()
     '''
@@ -78,7 +78,7 @@ def inference(model,
                 image_features = image_features[:, 0]
                 image_features_proj = image_features_proj[:, 0]
             else:
-                image_features = F.avg_pool2d(image_features, 1).view(image_features.size(0), -1)
+                image_features = F.avg_pool2d(image_features, image_features.shape[2:4]).view(images.size(0), -1)
                 image_features_proj = image_features_proj[0]
             # image_features = bottleneck(image_features)
             # image_features_proj = bottleneck_proj(image_features_proj)
@@ -101,21 +101,21 @@ def inference(model,
                 image_features = image_features[:, 0]
                 image_features_proj = image_features_proj[:, 0]
             else:
-                image_features = F.avg_pool2d(image_features, 1).view(image_features.size(0), -1)
+                image_features = F.avg_pool2d(image_features, image_features.shape[2:4]).view(images.size(0), -1)
                 image_features_proj = image_features_proj[0]
             # image_features = bottleneck(image_features)
             # image_features_proj = bottleneck_proj(image_features_proj)
             if multimodal:
                 image_features_proj = (embeddings_proj[i] + image_features_proj) / 2.
                 image_features_proj /= image_features_proj.norm(dim=-1, keepdim=True)
-                logits = 1./0.07 * image_features_proj.float() @ zeroshot_weights.T.float()
+                logits = 1./0.07 * image_features_proj @ zeroshot_weights.T
                 logits = logits.softmax(dim=-1)
                 image_features = (embeddings[i] + image_features) / 2.
-                logits = torch.cat((image_features.float(), logits), dim=1)
+                logits = torch.cat((image_features, logits), dim=1)
             else:
                 image_features = torch.cat((image_features, image_features_proj), dim=1)
                 image_features = (embeddings[i] + image_features) / 2.
-                logits = image_features.float()
+                logits = image_features
 
             embeddings[i] = logits
 
@@ -134,6 +134,8 @@ def get_cmc_map(
         gallery_cams,
         query_cams
 ):
+    gallery_embeddings = gallery_embeddings.cpu().float()
+    query_embeddings = query_embeddings.cpu().float()
     evaluator = R1_mAP_eval(len(query_labels), max_rank=50, feat_norm=True)
     evaluator.reset()
     evaluator.update((torch.cat((query_embeddings, gallery_embeddings), dim=0),
@@ -145,7 +147,7 @@ def get_cmc_map(
 
 def params_parser():
     args = argparse.ArgumentParser()
-    args.add_argument("--root", default="", type=str)
+    args.add_argument("--root", default="./", type=str)
     args.add_argument("--bs", default=64, type=int)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--augmented_template", action="store_true")
