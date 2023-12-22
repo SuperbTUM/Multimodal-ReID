@@ -23,8 +23,8 @@ class PromptLearner(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = 16
-        ctx_init = ""
+        n_ctx = 4
+        ctx_init = "a photo of a"
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         vis_dim = clip_model.visual.output_dim
