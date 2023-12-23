@@ -204,6 +204,9 @@ def train_prompter(classnames,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
     scaler = GradScaler()
 
+    if not os.path.exists(params.save_path):
+        os.mkdir(params.save_path)
+
     for epoch in range(epochs):
         iterator = tqdm(dataloader)
         if params.amp:
@@ -226,9 +229,11 @@ def train_prompter(classnames,
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
         scheduler.step()
+        checkpoint_path = "/".join((params.save_path, "clip_model_prompter_{}.pth".format(epoch)))
+        torch.save(model.prompt_learner, checkpoint_path)
 
     model.eval()
-    torch.save(model.prompt_learner, params.save_path if os.path.exists(params.save_path) else "clip_model_prompter.pt")
+
     return model
 
 
@@ -238,7 +243,7 @@ def params_parser():
     args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=1, type=int)
-    args.add_argument("--save_path", default="clip_model_prompter.pt")
+    args.add_argument("--save_path", default="./")
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
