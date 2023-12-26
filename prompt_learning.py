@@ -1,4 +1,5 @@
 import os
+import glob
 import argparse
 from collections import OrderedDict
 
@@ -14,7 +15,8 @@ _tokenizer = _Tokenizer()
 from tqdm import tqdm
 
 from utils import load_pretrained_weights, model_adaptor
-from data_prepare import get_loader_train
+from data_prepare import get_loader_train, get_loader
+from evaluate import R1_mAP_eval
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -152,7 +154,8 @@ class CustomCLIP(nn.Module):
         self.dtype = clip_model.dtype
 
     def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype))[2]
+        image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))[1:]
+        image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
@@ -169,7 +172,10 @@ class CustomCLIP(nn.Module):
 
         logits = torch.stack(logits)
 
-        return logits
+        if self.training:
+            return logits
+        else:
+            return torch.cat((image_features_non_proj, logits), dim=1)
 
 
 def train_batch(model, batch):
@@ -237,13 +243,60 @@ def train_prompter(classnames,
     return model
 
 
+def test_prompter(clip_model,
+                  prompt_learner_weight,
+                  loader_test):
+    model = CustomCLIP(classnames, clip_model).cuda()
+    model.eval()
+    load_pretrained_weights(model.prompt_learner, prompt_learner_weight)
+
+    embeddings = []
+    targets = []
+    camera_ids = []
+    sequence_ids = []
+
+    with torch.no_grad():
+        for i, (images, target, cams, seqs) in enumerate(tqdm(loader_test)):
+            images = images.cuda()
+            logits = model(images)
+
+            embeddings.append(logits)
+            targets.append(target)
+            camera_ids.append(cams)
+            sequence_ids.append(seqs)
+    embeddings = torch.cat(embeddings, dim=0)
+    targets = torch.cat(targets, dim=0)
+    camera_ids = torch.cat(camera_ids, dim=0)
+    sequence_ids = torch.cat(sequence_ids, dim=0)
+    return embeddings, targets, camera_ids, sequence_ids
+
+
+def get_cmc_map(
+        gallery_embeddings,
+        query_embeddings,
+        gallery_labels,
+        query_labels,
+        gallery_cams,
+        query_cams
+):
+    gallery_embeddings = gallery_embeddings.cpu().float()
+    query_embeddings = query_embeddings.cpu().float()
+    evaluator = R1_mAP_eval(len(query_labels), max_rank=50, feat_norm=True)
+    evaluator.reset()
+    evaluator.update((torch.cat((query_embeddings, gallery_embeddings), dim=0),
+                      torch.cat((query_labels, gallery_labels), dim=0),
+                      torch.cat((query_cams, gallery_cams), dim=0)))
+    cmc, mAP = evaluator.compute()
+    return cmc, mAP
+
+
 def params_parser():
     args = argparse.ArgumentParser()
     args.add_argument("--epochs", default=10, type=int)
     args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=1, type=int)
-    args.add_argument("--save_path", default="./")
+    args.add_argument("--save_path", default="./checkpoints")
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
@@ -259,9 +312,19 @@ if __name__ == "__main__":
     model = model_adaptor(model, image_height, image_width, params.clip_weights)[0]
     loader_train = get_loader_train(params.root, params.bs, image_height, image_width,
                                     "vit" if "ViT" in params.model else "rn")
+    loader_gallery, loader_query = get_loader(params.root, params.bs,
+                                              image_height,
+                                              image_width,
+                                              "vit" if "ViT" in params.model else "rn")[:2]
     classnames = ["person " + str(i) for i in range(751)]
 
     trained_model = train_prompter(classnames,
                                    model,
                                    loader_train,
                                    params.epochs)
+    latest_model = sorted(glob.glob("/".join((params.save_path, "*"))), reverse=True)[0]
+    embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
+        test_prompter(trained_model, latest_model, loader_gallery)
+    embeddings_query, targets_query, cameras_query, sequences_query = \
+        test_prompter(trained_model, latest_model, loader_query)
+    get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

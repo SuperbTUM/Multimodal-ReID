@@ -70,10 +70,13 @@ def load_pretrained_weights(model, weight_path):
         >>> load_pretrained_weights(model, weight_path)
     """
     checkpoint = load_checkpoint(weight_path)
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
+    try:
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+    except TypeError:
+        state_dict = checkpoint.state_dict()
 
     model_dict = model.state_dict()
     new_state_dict = OrderedDict()
