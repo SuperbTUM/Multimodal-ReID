@@ -17,6 +17,7 @@ from tqdm import tqdm
 from utils import load_pretrained_weights, model_adaptor
 from data_prepare import get_loader_train, get_loader
 from evaluate import R1_mAP_eval
+from schedulers import ConstantWarmupScheduler
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -206,8 +207,11 @@ def train_prompter(classnames,
         if "prompt_learner" not in name:
             param.requires_grad_(False)
 
-    optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.002)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+    optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
+    scheduler = ConstantWarmupScheduler(optimizer,
+                                        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
+                                        1,
+                                        1e-5)
     scaler = GradScaler()
 
     if not os.path.exists(params.save_path):
@@ -236,7 +240,7 @@ def train_prompter(classnames,
 
         scheduler.step()
         checkpoint_path = "/".join((params.save_path, "clip_model_prompter_{}.pth".format(epoch)))
-        torch.save(model.prompt_learner, checkpoint_path)
+        torch.save(model.prompt_learner.state_dict(), checkpoint_path)
 
     model.eval()
 
