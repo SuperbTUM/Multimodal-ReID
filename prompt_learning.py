@@ -22,35 +22,15 @@ from schedulers import ConstantWarmupScheduler
 cudnn.enabled = True
 cudnn.deterministic = True
 
+
 class PromptLearner(nn.Module):
-    def __init__(self, classnames, clip_model):
+    def __init__(self, n_cls, clip_model):
         super().__init__()
-        n_cls = len(classnames)
         n_ctx = 4
-        ctx_init = "a photo of a"
+        ctx_init = "a photo of a " + " ".join(["X"] * n_ctx) + " person"
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         vis_dim = clip_model.visual.output_dim
-
-        if ctx_init:
-            # use given words to initialize context vectors
-            ctx_init = ctx_init.replace("_", " ")
-            n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init).cuda()
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
-            prompt_prefix = ctx_init
-        else:
-            # random initialization
-            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
-
-        print(f'Initial context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens): {n_ctx}")
-
-        self.ctx = nn.Parameter(ctx_vectors)
 
         self.meta_net = nn.Sequential(OrderedDict([
             ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
@@ -61,24 +41,25 @@ class PromptLearner(nn.Module):
         if not params.amp:
             self.meta_net.half()
 
-        classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
-
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).cuda()  # (n_cls, n_tkn)
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()  # (n_cls, n_tkn)
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        n_cls_ctx = 4
+        cls_vectors = torch.empty(n_cls, n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(cls_vectors, std=0.02)
+        self.ctx = nn.Parameter(cls_vectors)
 
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
         # those computed using the current class names
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx + n_cls_ctx:, :])  # CLS, EOS
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
+        self.n_cls_ctx = n_cls_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
-        self.name_lens = name_lens
 
     def construct_prompts(self, ctx, prefix, suffix, label=None):
         # dim0 is either batch_size (during training) or n_cls (during testing)
@@ -89,6 +70,9 @@ class PromptLearner(nn.Module):
         if label is not None:
             prefix = prefix[label]
             suffix = suffix[label]
+
+        prefix = prefix.expand(ctx.size(0), -1, -1)
+        suffix = suffix.expand(ctx.size(0), -1, -1)
 
         prompts = torch.cat(
             [
@@ -101,10 +85,10 @@ class PromptLearner(nn.Module):
 
         return prompts
 
-    def forward(self, im_features):
+    def forward(self, im_features, label):
         prefix = self.token_prefix
         suffix = self.token_suffix
-        ctx = self.ctx  # (n_ctx, ctx_dim)
+        ctx = self.ctx[label]  # (n_ctx, ctx_dim)
         bias = self.meta_net(im_features)  # (batch, ctx_dim)
         bias = bias.unsqueeze(1)  # (batch, 1, ctx_dim)
         ctx = ctx.unsqueeze(0)  # (1, n_ctx, ctx_dim)
@@ -113,7 +97,7 @@ class PromptLearner(nn.Module):
         # Use instance-conditioned context tokens for all classes
         prompts = []
         for ctx_shifted_i in ctx_shifted:
-            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
+            ctx_i = ctx_shifted_i.expand(self.n_cls, -1, -1)
             pts_i = self.construct_prompts(ctx_i, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
             prompts.append(pts_i)
         prompts = torch.stack(prompts)
@@ -154,36 +138,36 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image):
+    def forward(self, image, label):
         image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))[1:]
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-        prompts = self.prompt_learner(image_features)
-        tokenized_prompts = self.tokenized_prompts
-        logit_scale = self.logit_scale.exp()
-        logits = []
-
-        for pts_i, imf_i in zip(prompts, image_features):
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
-            logits.append(l_i)
-
-        logits = torch.stack(logits)
 
         if self.training:
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            prompts = self.prompt_learner(image_features, label)
+            tokenized_prompts = self.tokenized_prompts
+            logit_scale = self.logit_scale.exp()
+            logits = []
+
+            for pts_i, imf_i in zip(prompts, image_features):
+                text_features = self.text_encoder(pts_i, tokenized_prompts)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                l_i = logit_scale * imf_i @ text_features.t()
+                logits.append(l_i)
+
+            logits = torch.stack(logits)
+
             return logits
         else:
-            return torch.cat((image_features_non_proj, logits), dim=1)
+            return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
 def train_batch(model, batch):
     image, label = batch[:2]
     image = image.cuda()
     label = label.cuda()
-    output = model(image)
+    output = model(image, label)
     loss = F.cross_entropy(output, label)
     return loss
 
@@ -247,10 +231,69 @@ def train_prompter(classnames,
     return model
 
 
+def train_vision_model(classnames,
+                       clip_model,
+                       dataloader,
+                       epochs,
+                       pretrained=None):
+    print("Building custom CLIP")
+    if params.amp:
+        clip_model = clip_model.float()
+    model = CustomCLIP(classnames, clip_model).cuda()
+    model.train()
+
+    if pretrained is not None:
+        load_pretrained_weights(model.image_encoder, pretrained)
+
+    print("Turning off gradients in both the prompter and the text encoder")
+    for name, param in model.named_parameters():
+        if "image_encoder" not in name:
+            param.requires_grad_(False)
+
+    optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
+    scheduler = ConstantWarmupScheduler(optimizer,
+                                        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
+                                        1,
+                                        1e-5)
+    scaler = GradScaler()
+
+    if not os.path.exists(params.save_path):
+        os.mkdir(params.save_path)
+
+    for epoch in range(epochs):
+        iterator = tqdm(dataloader)
+        if params.amp:
+            for images, target, cams, seqs in iterator:
+                batch = images, target
+                with autocast():
+                    loss = train_batch(model, batch)
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+        else:
+            for images, target, cams, seqs in iterator:
+                batch = images, target
+                loss = train_batch(model, batch)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+
+        scheduler.step()
+        checkpoint_path = "/".join((params.save_path, "clip_model_image_encoder_{}.pth".format(epoch)))
+        torch.save(model.image_encoder.state_dict(), checkpoint_path)
+
+    model.eval()
+
+    return model
+
+
 def test_prompter(clip_model,
                   prompt_learner_weight,
                   loader_test):
-    model = CustomCLIP(classnames, clip_model).cuda()
+    model = CustomCLIP(n_cls, clip_model).cuda()
     model.eval()
     load_pretrained_weights(model.prompt_learner, prompt_learner_weight)
 
@@ -314,19 +357,22 @@ if __name__ == "__main__":
     model.eval()
     image_height, image_width = params.height, int(params.height * params.ratio)
     model = model_adaptor(model, image_height, image_width, params.clip_weights)[0]
-    loader_train = get_loader_train(params.root, params.bs, image_height, image_width,
+    loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
                                     "vit" if "ViT" in params.model else "rn")
     loader_gallery, loader_query = get_loader(params.root, params.bs,
                                               image_height,
                                               image_width,
                                               "vit" if "ViT" in params.model else "rn")[:2]
-    classnames = ["person " + str(i) for i in range(751)]
 
-    trained_model = train_prompter(classnames,
+    trained_model = train_prompter(n_cls,
                                    model,
                                    loader_train,
                                    params.epochs)
-    latest_model = sorted(glob.glob("/".join((params.save_path, "*"))), reverse=True)[0]
+    trained_model = train_vision_model(n_cls,
+                                       trained_model,
+                                       loader_train,
+                                       params.epochs)
+    latest_model = sorted(glob.glob("/".join((params.save_path, "clip_model_image_encoder_*"))), reverse=True)[0]
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
         test_prompter(trained_model, latest_model, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \

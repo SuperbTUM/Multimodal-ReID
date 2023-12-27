@@ -62,9 +62,10 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type):
         transforms.RandomErasing()
     ])
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    num_pids = dataset.num_train_pids
     reid_dataset_train = reidDataset(dataset.train, transform_train)
     loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
-    return loader_train
+    return loader_train, num_pids
 
 
 def get_loader(root, batch_size, image_height, image_width, model_type):
