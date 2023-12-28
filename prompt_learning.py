@@ -18,6 +18,7 @@ from utils import load_pretrained_weights, model_adaptor
 from data_prepare import get_loader_train, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import ConstantWarmupScheduler
+from losses import WeightedRegularizedTriplet
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -139,7 +140,8 @@ class CustomCLIP(nn.Module):
         self.dtype = clip_model.dtype
 
     def forward(self, image, label):
-        image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))[1:]
+        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+        image_features_last = image_features_last[:, 0]
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
 
@@ -158,17 +160,26 @@ class CustomCLIP(nn.Module):
 
             logits = torch.stack(logits)
 
-            return logits
+            return logits, image_features_last, image_features_non_proj, image_features
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
-def train_batch(model, batch):
+def train_batch_prompter(model, batch):
     image, label = batch[:2]
     image = image.cuda()
     label = label.cuda()
-    output = model(image, label)
+    output = model(image, label)[0]
     loss = F.cross_entropy(output, label)
+    return loss
+
+
+def train_batch_vision_model(model, batch, triplet_func):
+    image, label = batch[:2]
+    image = image.cuda()
+    label = label.cuda()
+    output, feat1, feat2, feat3 = model(image, label)
+    loss = F.cross_entropy(output, label) + triplet_func(feat1, label) + triplet_func(feat2, label) + triplet_func(feat3, label)
     return loss
 
 
@@ -207,7 +218,7 @@ def train_prompter(classnames,
             for images, target, cams, seqs in iterator:
                 batch = images, target
                 with autocast():
-                    loss = train_batch(model, batch)
+                    loss = train_batch_prompter(model, batch)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -216,7 +227,7 @@ def train_prompter(classnames,
         else:
             for images, target, cams, seqs in iterator:
                 batch = images, target
-                loss = train_batch(model, batch)
+                loss = train_batch_prompter(model, batch)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -255,6 +266,7 @@ def train_vision_model(classnames,
                                         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
                                         1,
                                         1e-5)
+    triplet_func = WeightedRegularizedTriplet()
     scaler = GradScaler()
 
     if not os.path.exists(params.save_path):
@@ -266,7 +278,7 @@ def train_vision_model(classnames,
             for images, target, cams, seqs in iterator:
                 batch = images, target
                 with autocast():
-                    loss = train_batch(model, batch)
+                    loss = train_batch_vision_model(model, batch, triplet_func)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -275,7 +287,7 @@ def train_vision_model(classnames,
         else:
             for images, target, cams, seqs in iterator:
                 batch = images, target
-                loss = train_batch(model, batch)
+                loss = train_batch_vision_model(model, batch, triplet_func)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
