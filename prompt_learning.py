@@ -18,7 +18,6 @@ from utils import load_pretrained_weights, model_adaptor
 from data_prepare import get_loader_train, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import ConstantWarmupScheduler
-from losses import WeightedRegularizedTriplet
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -129,6 +128,14 @@ class TextEncoder(nn.Module):
         return x
 
 
+def weights_init_classifier(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, std=0.001)
+        if m.bias:
+            nn.init.constant_(m.bias, 0.0)
+
+
 class CustomCLIP(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
@@ -139,11 +146,17 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
+        self.vision_classifier = nn.Linear(768, classnames, bias=False)
+        self.vision_classifier.apply(weights_init_classifier)
+        self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
+        self.vision_classifier_proj.apply(weights_init_classifier)
+
     def forward(self, image, label):
-        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
-        image_features_last = image_features_last[:, 0]
+        _, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
+        cls_score = self.vision_classifier(image_features_non_proj.float())
+        cls_score_proj = self.vision_classifier_proj(image_features.float())
 
         if self.training:
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -160,7 +173,7 @@ class CustomCLIP(nn.Module):
 
             logits = torch.stack(logits)
 
-            return logits, image_features_last, image_features_non_proj, image_features
+            return logits, cls_score, cls_score_proj
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
@@ -174,12 +187,12 @@ def train_batch_prompter(model, batch):
     return loss
 
 
-def train_batch_vision_model(model, batch, triplet_func):
+def train_batch_vision_model(model, batch):
     image, label = batch[:2]
     image = image.cuda()
     label = label.cuda()
-    output, feat1, feat2, feat3 = model(image, label)
-    loss = F.cross_entropy(output, label) + triplet_func(feat1, label) + triplet_func(feat2, label) + triplet_func(feat3, label)
+    output, cls_score1, cls_score2 = model(image, label)
+    loss = F.cross_entropy(output, label) + F.cross_entropy(cls_score1, label, label_smoothing=0.1) + F.cross_entropy(cls_score2, label, label_smoothing=0.1)
     return loss
 
 
@@ -258,7 +271,7 @@ def train_vision_model(classnames,
 
     print("Turning off gradients in both the prompter and the text encoder")
     for name, param in model.named_parameters():
-        if "image_encoder" not in name:
+        if "image_encoder" not in name and "vision_classifier" not in name:
             param.requires_grad_(False)
 
     optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
@@ -266,7 +279,6 @@ def train_vision_model(classnames,
                                         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
                                         1,
                                         1e-5)
-    triplet_func = WeightedRegularizedTriplet()
     scaler = GradScaler()
 
     if not os.path.exists(params.save_path):
@@ -278,7 +290,7 @@ def train_vision_model(classnames,
             for images, target, cams, seqs in iterator:
                 batch = images, target
                 with autocast():
-                    loss = train_batch_vision_model(model, batch, triplet_func)
+                    loss = train_batch_vision_model(model, batch)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -287,7 +299,7 @@ def train_vision_model(classnames,
         else:
             for images, target, cams, seqs in iterator:
                 batch = images, target
-                loss = train_batch_vision_model(model, batch, triplet_func)
+                loss = train_batch_vision_model(model, batch)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
