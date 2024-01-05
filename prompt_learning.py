@@ -18,6 +18,7 @@ from utils import load_pretrained_weights, model_adaptor
 from data_prepare import get_loader_train, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import ConstantWarmupScheduler
+from losses import SupConLoss
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -88,10 +89,9 @@ class PromptLearner(nn.Module):
     def forward(self, im_features, label):
         prefix = self.token_prefix
         suffix = self.token_suffix
-        ctx = self.ctx[label]  # (n_ctx, ctx_dim)
+        ctx = self.ctx[label]  # (1, n_ctx, ctx_dim)
         bias = self.meta_net(im_features)  # (batch, ctx_dim)
         bias = bias.unsqueeze(1)  # (batch, 1, ctx_dim)
-        ctx = ctx.unsqueeze(0)  # (1, n_ctx, ctx_dim)
         ctx_shifted = ctx + bias  # (batch, n_ctx, ctx_dim)
 
         # Use instance-conditioned context tokens for all classes
@@ -164,36 +164,21 @@ class CustomCLIP(nn.Module):
             tokenized_prompts = self.tokenized_prompts
             logit_scale = self.logit_scale.exp()
             logits = []
+            texts = []
 
             for pts_i, imf_i in zip(prompts, image_features):
                 text_features = self.text_encoder(pts_i, tokenized_prompts)
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                 l_i = logit_scale * imf_i @ text_features.t()
                 logits.append(l_i)
+                texts.append(text_features)
 
             logits = torch.stack(logits)
+            texts = torch.stack(texts)
 
-            return logits, cls_score, cls_score_proj
+            return texts, image_features, logits, cls_score, cls_score_proj
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
-
-
-def train_batch_prompter(model, batch):
-    image, label = batch[:2]
-    image = image.cuda()
-    label = label.cuda()
-    output = model(image, label)[0]
-    loss = F.cross_entropy(output, label)
-    return loss
-
-
-def train_batch_vision_model(model, batch):
-    image, label = batch[:2]
-    image = image.cuda()
-    label = label.cuda()
-    output, cls_score1, cls_score2 = model(image, label)
-    loss = F.cross_entropy(output, label) + F.cross_entropy(cls_score1, label, label_smoothing=0.1) + F.cross_entropy(cls_score2, label, label_smoothing=0.1)
-    return loss
 
 
 def train_prompter(classnames,
@@ -201,6 +186,15 @@ def train_prompter(classnames,
                    dataloader,
                    epochs,
                    pretrained=None):
+
+    def train_batch_prompter(batch):
+        image, label = batch[:2]
+        image = image.cuda()
+        label = label.cuda()
+        text_features, image_features = model(image, label)[:2]
+        loss = loss_func(text_features, image_features, label, label) + loss_func(image_features, text_features, label, label)
+        return loss
+
     print("Building custom CLIP")
     if params.amp:
         clip_model = clip_model.float()
@@ -221,6 +215,7 @@ def train_prompter(classnames,
                                         1,
                                         1e-5)
     scaler = GradScaler()
+    loss_func = SupConLoss("cuda")
 
     if not os.path.exists(params.save_path):
         os.mkdir(params.save_path)
@@ -231,7 +226,7 @@ def train_prompter(classnames,
             for images, target, cams, seqs in iterator:
                 batch = images, target
                 with autocast():
-                    loss = train_batch_prompter(model, batch)
+                    loss = train_batch_prompter(batch)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -240,7 +235,7 @@ def train_prompter(classnames,
         else:
             for images, target, cams, seqs in iterator:
                 batch = images, target
-                loss = train_batch_prompter(model, batch)
+                loss = train_batch_prompter(batch)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -260,6 +255,18 @@ def train_vision_model(classnames,
                        dataloader,
                        epochs,
                        pretrained=None):
+
+    def train_batch_vision_model(batch):
+        image, label = batch[:2]
+        image = image.cuda()
+        label = label.cuda()
+        output, cls_score1, cls_score2 = model(image, label)
+        loss = F.cross_entropy(output, label) + F.cross_entropy(cls_score1, label,
+                                                                label_smoothing=0.1) + F.cross_entropy(cls_score2,
+                                                                                                       label,
+                                                                                                       label_smoothing=0.1)
+        return loss
+
     print("Building custom CLIP")
     if params.amp:
         clip_model = clip_model.float()
@@ -268,13 +275,17 @@ def train_vision_model(classnames,
 
     if pretrained is not None:
         load_pretrained_weights(model.image_encoder, pretrained)
+        load_pretrained_weights(model.vision_classifier, pretrained)
+        load_pretrained_weights(model.vision_classifier_proj, pretrained)
 
     print("Turning off gradients in both the prompter and the text encoder")
     for name, param in model.named_parameters():
         if "image_encoder" not in name and "vision_classifier" not in name:
             param.requires_grad_(False)
+        else:
+            param.requires_grad_(True)
 
-    optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
+    optimizer = torch.optim.SGD(list(model.image_encoder.parameters()) + list(model.vision_classifier.parameters()) + list(model.vision_classifier_proj.parameters()), lr=0.001)
     scheduler = ConstantWarmupScheduler(optimizer,
                                         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
                                         1,
@@ -290,7 +301,7 @@ def train_vision_model(classnames,
             for images, target, cams, seqs in iterator:
                 batch = images, target
                 with autocast():
-                    loss = train_batch_vision_model(model, batch)
+                    loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -299,7 +310,7 @@ def train_vision_model(classnames,
         else:
             for images, target, cams, seqs in iterator:
                 batch = images, target
-                loss = train_batch_vision_model(model, batch)
+                loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
