@@ -1,4 +1,5 @@
 import copy
+import math
 import numpy as np
 from typing import Tuple, Union
 from collections import OrderedDict
@@ -496,10 +497,11 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int,
+    def __init__(self, h_resolution: int, w_resolution: int, patch_size: int, width: int, layers: int, heads: int,
                  output_dim: int, design_details):
         super().__init__()
-        self.input_resolution = input_resolution
+        self.h_resolution = h_resolution
+        self.w_resolution = w_resolution
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
         if design_details["vision_depth"] == 0:
@@ -515,7 +517,7 @@ class VisionTransformer(nn.Module):
             # self.VPT.half()
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((h_resolution*w_resolution) + 1, width))
         self.ln_pre = LayerNorm(width)
         # hyper-parameter if need to add prompt embeddings inside to the input
         # of transformer block or not:
@@ -559,16 +561,17 @@ class VisionTransformer(nn.Module):
 
 
 class VisionTransformer_MaPLe(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,
+    def __init__(self, h_resolution: int, w_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,
                  design_details):
         super().__init__()
-        self.input_resolution = input_resolution
+        self.h_resolution = h_resolution
+        self.w_resolution = w_resolution
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
         self.VPT_shallow = True
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((h_resolution*w_resolution) + 1, width))
         self.ln_pre = LayerNorm(width)
         # hyper-parameter if need to add prompt embeddings inside to the input
         # of transformer block or not:
@@ -600,23 +603,28 @@ class VisionTransformer_MaPLe(nn.Module):
 
         x = x.permute(1, 0, 2)  # NLD -> LND
         # Again combine the inputs, so nn.sequential can work
-        outputs = self.transformer([x, compound_deeper_prompts, 0])  # third argument is counter
-        x = outputs[0]
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        x11 = self.transformer.resblocks[:11]([x, compound_deeper_prompts, 0])  # third argument is counter
+        x12 = self.transformer.resblocks[11]([x, compound_deeper_prompts, 0])
 
-        x = self.ln_post(x[:, 0, :])
+        x11 = x11[0]
+        x11 = x11.permute(1, 0, 2)  # LND -> NLD
+        x12 = x12[0]
+        x12 = x12.permute(1, 0, 2)
+
+        x12 = self.ln_post(x12[:, 0, :])
 
         if self.proj is not None:
-            x = x @ self.proj
+            x_proj = x @ self.proj
 
-        return x
+        return x11, x12, x_proj
 
 
 class CLIP(nn.Module):
     def __init__(self,
                  embed_dim: int,
                  # vision
-                 image_resolution: int,
+                 h_resolution: int,
+                 w_resolution: int,
                  vision_layers: Union[Tuple[int, int, int, int], int],
                  vision_width: int,
                  vision_patch_size: int,
@@ -639,14 +647,15 @@ class CLIP(nn.Module):
                 layers=vision_layers,
                 output_dim=embed_dim,
                 heads=vision_heads,
-                input_resolution=image_resolution,
+                input_resolution=h_resolution*w_resolution,
                 width=vision_width
             )
         else:
             vision_heads = vision_width // 64
             if trainer == "MaPLe":
                 self.visual = VisionTransformer_MaPLe(
-                    input_resolution=image_resolution,
+                    h_resolution=h_resolution,
+                    w_resolution=w_resolution,
                     patch_size=vision_patch_size,
                     width=vision_width,
                     layers=vision_layers,
@@ -656,7 +665,8 @@ class CLIP(nn.Module):
                 )
             else:
                 self.visual = VisionTransformer(
-                    input_resolution=image_resolution,
+                    h_resolution=h_resolution,
+                    w_resolution=w_resolution,
                     patch_size=vision_patch_size,
                     width=vision_width,
                     layers=vision_layers,
@@ -787,7 +797,24 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict, design_details):
+def resize_pos_embed(posemb, posemb_new, height, width):
+    # Rescale the grid of position embeddings when loading from state_dict. Adapted from
+    # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
+    ntok_new = posemb_new.shape[0]
+
+    posemb_token, posemb_grid = posemb[:1], posemb[1:]
+    ntok_new -= 1
+
+    gs_old = int(math.sqrt(len(posemb_grid)))
+    print('Resized position embedding from size:{} to size: {} with height:{} width: {}'.format(posemb.shape, posemb_new.shape, height, width))
+    posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
+    posemb_grid = F.interpolate(posemb_grid, size=(height, width), mode='bicubic')
+    posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, height * width, -1)
+    posemb = torch.cat([posemb_token, posemb_grid.squeeze(0)], dim=0)
+    return posemb
+
+
+def build_model(state_dict: dict, h_resolution, w_resolution, design_details):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -814,11 +841,23 @@ def build_model(state_dict: dict, design_details):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
+    h_resolution = h_resolution // 16
+    w_resolution = w_resolution // 16
+
     model = CLIP(
         embed_dim,
-        image_resolution, vision_layers, vision_width, vision_patch_size,
+        h_resolution, w_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, design_details
     )
+
+    if vit:
+        state_dict["visual.positional_embedding"] = resize_pos_embed(state_dict["visual.positional_embedding"],
+                                                                     model.visual.positional_embedding, h_resolution,
+                                                                     w_resolution)
+    else:  # RN50
+        state_dict["visual.attnpool.positional_embedding"] = resize_pos_embed(
+            state_dict["visual.attnpool.positional_embedding"], model.visual.attnpool.positional_embedding,
+            h_resolution, w_resolution)
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:

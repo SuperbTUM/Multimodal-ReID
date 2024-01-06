@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from clip import model as clip_model
 import custom_clip_model
+import maple
 
 
 def load_checkpoint(fpath):
@@ -165,11 +166,11 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def model_adaptor(model, height, width, weights=None):
+def model_adaptor(model, height, width, design_details=None, weights=None):
     # if (height, width) != (224, 224):
     if weights is not None:
         weights = torch.load(weights)
-    if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer)):
+    if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer, maple.VisionTransformer, maple.VisionTransformer_MaPLe)):
         bottleneck_proj = BNNeck(model.visual.proj.size(1), True)
         bottleneck = BNNeck(model.visual.proj.size(0), False)
 
@@ -185,11 +186,24 @@ def model_adaptor(model, height, width, weights=None):
             h_resolution = height // vision_patch_size
             w_resolution = width // vision_patch_size
 
-            # pretrained_weight = weights["image_encoder.positional_embedding"].data
-            # if pretrained_weight.size() != model.visual.positional_embedding.size():
-            #     posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, h_resolution,
-            #                               w_resolution)
-            #     model.visual.positional_embedding = nn.Parameter(posemb)
+            if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer)):
+                model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, 16,
+                                                                   vision_width, vision_layers, vision_width // 64,
+                                                                   embed_dim)
+            elif isinstance(model.visual, maple.VisionTransformer):
+                model.visual = maple.VisionTransformer(h_resolution, w_resolution, vision_patch_size,
+                                                       vision_width, vision_layers, vision_width // 64,
+                                                       embed_dim, design_details)
+            else:
+                model.visual = maple.VisionTransformer_MaPLe(h_resolution, w_resolution, vision_patch_size,
+                                                             vision_width, vision_layers, vision_width // 64,
+                                                             embed_dim, design_details)
+
+            pretrained_weight = weights["image_encoder.positional_embedding"].data
+            if pretrained_weight.size() != model.visual.positional_embedding.size():
+                posemb = resize_pos_embed(pretrained_weight, model.visual.positional_embedding, h_resolution,
+                                          w_resolution)
+                model.visual.positional_embedding = nn.Parameter(posemb)
             for key in weights:
                 if key.startswith("image_encoder"):
                     matched_key = ".".join(key.split(".")[1:])
@@ -197,10 +211,6 @@ def model_adaptor(model, height, width, weights=None):
                 elif "bottleneck" in key:
                     matched_key = key
                     bottleneck_weights[matched_key] = weights[key]
-
-            model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, 16,
-                                                               vision_width, vision_layers, vision_width // 64,
-                                                               embed_dim)
 
         if matched_weights:
             model.visual.load_state_dict(matched_weights, strict=True)
@@ -211,10 +221,10 @@ def model_adaptor(model, height, width, weights=None):
     else:
         h_resolution = height // 16
         w_resolution = width // 16
-        # pretrained_weight = weights["image_encoder.attnpool.positional_embedding"].data
-        # if model.visual.attnpool.positional_embedding.size() != pretrained_weight.size():
-        #     posemb = resize_pos_embed(pretrained_weight, model.visual.attnpool.positional_embedding, h_resolution, w_resolution)
-        #     model.visual.attnpool.positional_embedding = nn.Parameter(posemb)
+        pretrained_weight = weights["image_encoder.attnpool.positional_embedding"].data
+        if model.visual.attnpool.positional_embedding.size() != pretrained_weight.size():
+            posemb = resize_pos_embed(pretrained_weight, model.visual.attnpool.positional_embedding, h_resolution, w_resolution)
+            model.visual.attnpool.positional_embedding = nn.Parameter(posemb)
 
         matched_weights = OrderedDict()
         bottleneck_weights = OrderedDict()
@@ -230,8 +240,12 @@ def model_adaptor(model, height, width, weights=None):
                 elif "bottleneck" in key:
                     matched_key = key
                     bottleneck_weights[matched_key] = weights[key]
-            model.visual = custom_clip_model.ModifiedResNet(vision_layers, embed_dim, vision_width * 32 // 64,
-                                                            h_resolution*w_resolution, vision_width)
+            if isinstance(model.visual, (clip_model.ModifiedResNet, custom_clip_model.ModifiedResNet)):
+                model.visual = custom_clip_model.ModifiedResNet(vision_layers, embed_dim, vision_width * 32 // 64,
+                                                                h_resolution * w_resolution, vision_width)
+            else:
+                model.visual = maple.ModifiedResNet(vision_layers, embed_dim, vision_width * 32 // 64,
+                                                    h_resolution * w_resolution, vision_width)
         bottleneck = BNNeck(model.visual.attnpool.k_proj.in_features, False)
         bottleneck_proj = BNNeck(model.visual.attnpool.c_proj.out_features, True)
         if matched_weights:
