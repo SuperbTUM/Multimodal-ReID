@@ -16,8 +16,8 @@ from tqdm import tqdm
 from utils import load_pretrained_weights, model_adaptor
 from data_prepare import get_loader_train, get_loader
 from evaluate import R1_mAP_eval
-from schedulers import ConstantWarmupScheduler
-from losses import SupConLoss
+from schedulers import ConstantWarmupScheduler, create_scheduler
+from losses import SupConLoss, WeightedRegularizedTriplet
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -36,6 +36,14 @@ def weights_init_classifier(m):
             nn.init.constant_(m.bias, 0.0)
 
 
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    if classname.find('BatchNorm') != -1:
+        if m.affine:
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+
+
 class CustomCLIPCoCoop(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
@@ -46,8 +54,15 @@ class CustomCLIPCoCoop(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
+        self.vision_bottleneck = nn.BatchNorm1d(768)
+        self.vision_bottleneck.bias.requires_grad_(False)
+        self.vision_bottleneck.apply(weights_init_kaiming)
         self.vision_classifier = nn.Linear(768, classnames, bias=False)
         self.vision_classifier.apply(weights_init_classifier)
+
+        self.vision_bottleneck_proj = nn.BatchNorm1d(512)
+        self.vision_bottleneck_proj.bias.requires_grad_(False)
+        self.vision_bottleneck_proj.apply(weights_init_kaiming)
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
@@ -57,7 +72,9 @@ class CustomCLIPCoCoop(nn.Module):
         image_features = image_features[:, 0]
 
         if self.training:
+            image_features_non_proj = self.vision_bottleneck(image_features_non_proj)
             cls_score = self.vision_classifier(image_features_non_proj.float())
+            image_features = self.vision_bottleneck_proj(image_features)
             cls_score_proj = self.vision_classifier_proj(image_features.float())
 
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -92,8 +109,15 @@ class CustomCLIPMaple(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
+        self.vision_bottleneck = nn.BatchNorm1d(768)
+        self.vision_bottleneck.bias.requires_grad_(False)
+        self.vision_bottleneck.apply(weights_init_kaiming)
         self.vision_classifier = nn.Linear(768, classnames, bias=False)
         self.vision_classifier.apply(weights_init_classifier)
+
+        self.vision_bottleneck_proj = nn.BatchNorm1d(512)
+        self.vision_bottleneck_proj.bias.requires_grad_(False)
+        self.vision_bottleneck_proj.apply(weights_init_kaiming)
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
@@ -103,25 +127,28 @@ class CustomCLIPMaple(nn.Module):
 
         prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner(label)
         text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
-        image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_ctx, deep_compound_prompts_vision)[1:]
+        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_ctx, deep_compound_prompts_vision)
+        image_features_last = image_features_last[:, 0]
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
 
+        features_non_proj = self.vision_bottleneck(image_features_non_proj)
+        features = self.vision_bottleneck_proj(image_features)
+
         if self.training:
-            cls_score = self.vision_classifier(image_features_non_proj.float())
-            cls_score_proj = self.vision_classifier_proj(image_features.float())
+            cls_score = self.vision_classifier(features_non_proj.float())
+            cls_score_proj = self.vision_classifier_proj(features.float())
 
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logits = logit_scale * image_features @ text_features.t()
 
-            return text_features, image_features, logits, cls_score, cls_score_proj
+            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last, image_features_non_proj, image_features]
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
-def train_prompter(classnames,
-                   base_model,
+def train_prompter(model,
                    dataloader,
                    epochs,
                    pretrained=None):
@@ -131,16 +158,13 @@ def train_prompter(classnames,
         image = image.cuda()
         label = label.cuda()
         text_features, image_features = model(image, label)[:2]
-        loss = loss_func(text_features, image_features, label, label) + loss_func(image_features, text_features, label, label)
+        loss = loss_func(text_features, image_features, label, label) + \
+               loss_func(image_features, text_features, label, label)
         return loss
 
     print("Building custom CLIP")
     if params.amp:
-        base_model = base_model.float()
-    if params.maple:
-        model = CustomCLIPMaple(classnames, base_model).cuda()
-    else:
-        model = CustomCLIPCoCoop(classnames, base_model).cuda()
+        model = model.float()
     model.train()
 
     if pretrained is not None:
@@ -151,11 +175,13 @@ def train_prompter(classnames,
         if "prompt_learner" not in name:
             param.requires_grad_(False)
 
-    optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
-    scheduler = ConstantWarmupScheduler(optimizer,
-                                        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
-                                        1,
-                                        1e-5)
+    # optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
+    # scheduler = ConstantWarmupScheduler(optimizer,
+    #                                     torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
+    #                                     5,
+    #                                     1e-6)
+    optimizer = torch.optim.Adam(model.prompt_learner.parameters(), lr=0.00035, weight_decay=1e-4)
+    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
     scaler = GradScaler()
     loss_func = SupConLoss("cuda")
 
@@ -183,17 +209,14 @@ def train_prompter(classnames,
                 optimizer.step()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
-        scheduler.step()
+        scheduler.step(epoch)
         checkpoint_path = "/".join((params.save_path, "clip_model_prompter_{}.pth".format(epoch)))
         torch.save(model.prompt_learner.state_dict(), checkpoint_path)
 
     model.eval()
 
-    return model
 
-
-def train_vision_model(classnames,
-                       base_model,
+def train_vision_model(model,
                        dataloader,
                        epochs,
                        pretrained=None):
@@ -202,40 +225,48 @@ def train_vision_model(classnames,
         image, label = batch[:2]
         image = image.cuda()
         label = label.cuda()
-        output, cls_score1, cls_score2 = model(image, label)[2:]
-        loss = F.cross_entropy(output, label) + F.cross_entropy(cls_score1, label,
-                                                                label_smoothing=0.1) + F.cross_entropy(cls_score2,
-                                                                                                       label,
-                                                                                                       label_smoothing=0.1)
+        output, cls_scores, image_features_list = model(image, label)[1:]
+        cls_score1, cls_score2 = cls_scores
+        image_features_last, image_features_non_proj, image_features = image_features_list
+        loss = F.cross_entropy(output, label) + \
+               0.25 * F.cross_entropy(cls_score1, label, label_smoothing=0.1) + \
+               0.25 * F.cross_entropy(cls_score2, label, label_smoothing=0.1)
+        if params.bs >= 4:
+            loss += triplet_loss(image_features_last, label) + \
+                triplet_loss(image_features_non_proj, label) + \
+                triplet_loss(image_features, label)
         return loss
 
     print("Building custom CLIP")
     if params.amp:
-        base_model = base_model.float()
-    if params.maple:
-        model = CustomCLIPMaple(classnames, base_model).cuda()
-    else:
-        model = CustomCLIPCoCoop(classnames, base_model).cuda()
+        model = model.float()
     model.train()
 
     if pretrained is not None:
         load_pretrained_weights(model.image_encoder, pretrained)
         load_pretrained_weights(model.vision_classifier, pretrained)
         load_pretrained_weights(model.vision_classifier_proj, pretrained)
+        load_pretrained_weights(model.bottleneck, pretrained)
+        load_pretrained_weights(model.bottleneck_proj, pretrained)
 
     print("Turning off gradients in both the prompter and the text encoder")
     for name, param in model.named_parameters():
-        if "image_encoder" not in name and "vision_classifier" not in name:
+        if "image_encoder" not in name and "vision_classifier" not in name and "vision_bottleneck" not in name:
             param.requires_grad_(False)
         else:
             param.requires_grad_(True)
 
-    optimizer = torch.optim.SGD(list(model.image_encoder.parameters()) + list(model.vision_classifier.parameters()) + list(model.vision_classifier_proj.parameters()), lr=0.001)
+    optimizer = torch.optim.Adam(list(model.image_encoder.parameters()) + \
+                                 list(model.vision_classifier.parameters()) + \
+                                 list(model.vision_classifier_proj.parameters()) + \
+                                 list(model.bottleneck.parameters()) + \
+                                 list(model.bottleneck_proj.parameters()), lr=0.000005, weight_decay=1e-4)
     scheduler = ConstantWarmupScheduler(optimizer,
-                                        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
-                                        1,
+                                        torch.optim.lr_scheduler.MultiStepLR(optimizer, [epochs // 3, epochs // 3 * 2]),
+                                        10,
                                         1e-5)
     scaler = GradScaler()
+    triplet_loss = WeightedRegularizedTriplet()
 
     if not os.path.exists(params.save_path):
         os.mkdir(params.save_path)
@@ -267,16 +298,10 @@ def train_vision_model(classnames,
 
     model.eval()
 
-    return model
 
-
-def test_prompter(base_model,
+def test_prompter(model,
                   prompt_learner_weight,
                   loader_test):
-    if params.maple:
-        model = CustomCLIPMaple(n_cls, base_model).cuda()
-    else:
-        model = CustomCLIPCoCoop(n_cls, base_model).cuda()
     model.eval()
     load_pretrained_weights(model.prompt_learner, prompt_learner_weight)
 
@@ -322,7 +347,8 @@ def get_cmc_map(
 
 def params_parser():
     args = argparse.ArgumentParser()
-    args.add_argument("--epochs", default=10, type=int)
+    args.add_argument("--epochs_stage1", default=10, type=int)
+    args.add_argument("--epochs_stage2", default=10, type=int)
     args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=1, type=int)
@@ -352,7 +378,7 @@ if __name__ == "__main__":
                           "vision_depth": 0,
                           "language_depth": 0, "vision_ctx": 0,
                           "language_ctx": 0,
-                          "maple_length": 4}
+                          "maple_length": 2}
         model = build_model(state_dict or model.state_dict(), image_height, image_width, design_details)
         model = model.cuda()
     else:
@@ -364,22 +390,25 @@ if __name__ == "__main__":
 
     loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
                                     "vit" if "ViT" in params.model else "rn")
+    if params.maple:
+        model = CustomCLIPMaple(n_cls, model).cuda()
+    else:
+        model = CustomCLIPCoCoop(n_cls, model).cuda()
+
     loader_gallery, loader_query = get_loader(params.root, params.bs,
                                               image_height,
                                               image_width,
                                               "vit" if "ViT" in params.model else "rn")[:2]
 
-    trained_model = train_prompter(n_cls,
-                                   model,
-                                   loader_train,
-                                   params.epochs)
-    trained_model = train_vision_model(n_cls,
-                                       trained_model,
-                                       loader_train,
-                                       params.epochs)
+    train_prompter(model,
+                   loader_train,
+                   params.epochs_stage1)
+    train_vision_model(model,
+                       loader_train,
+                       params.epochs_stage2)
     latest_model = sorted(glob.glob("/".join((params.save_path, "clip_model_image_encoder_*"))), reverse=True)[0]
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
-        test_prompter(trained_model, latest_model, loader_gallery)
+        test_prompter(model, latest_model, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \
-        test_prompter(trained_model, latest_model, loader_query)
+        test_prompter(model, latest_model, loader_query)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

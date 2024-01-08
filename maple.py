@@ -21,7 +21,7 @@ def _get_clones(module, N):
 class MultiModalPromptLearner(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
-        n_ctx = 4
+        n_ctx = 2
         n_cls_ctx = 4
         ctx_init = "a photo of a"
         dtype = clip_model.dtype
@@ -81,8 +81,8 @@ class MultiModalPromptLearner(nn.Module):
             prefix = prefix[label]
             suffix = suffix[label]
 
-        prefix = prefix.expand(self.n_cls, -1, -1)
-        suffix = suffix.expand(self.n_cls, -1, -1)
+        prefix = prefix.expand(ctx.size(0), -1, -1)
+        suffix = suffix.expand(ctx.size(0), -1, -1)
 
         prompts = torch.cat(
             [
@@ -97,11 +97,12 @@ class MultiModalPromptLearner(nn.Module):
 
     def forward(self, label):
         ctx = self.ctx[label]
+        b = label.shape[0]
 
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
         else:
-            ctx = ctx.expand(self.n_cls, -1, -1)
+            ctx = ctx.expand(b, -1, -1)
 
         prefix = self.token_prefix
         suffix = self.token_suffix
@@ -115,7 +116,7 @@ class MultiModalPromptLearner(nn.Module):
         # Now the other way around
         # We will project the textual prompts from 512 to 768
         return prompts, self.proj(
-            self.ctx), self.compound_prompts_text, visual_deep_prompts  # pass here original, as for visual 768 is required
+            self.ctx[label]), self.compound_prompts_text, visual_deep_prompts  # pass here original, as for visual 768 is required
 
 
 class TextEncoder(nn.Module):
@@ -611,10 +612,10 @@ class VisionTransformer_MaPLe(nn.Module):
         x12 = x12[0]
         x12 = x12.permute(1, 0, 2)
 
-        x12 = self.ln_post(x12[:, 0, :])
+        x12 = self.ln_post(x12)
 
         if self.proj is not None:
-            x_proj = x @ self.proj
+            x_proj = x12 @ self.proj
 
         return x11, x12, x_proj
 
