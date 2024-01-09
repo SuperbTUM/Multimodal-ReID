@@ -378,7 +378,7 @@ if __name__ == "__main__":
                           "vision_depth": 0,
                           "language_depth": 0, "vision_ctx": 0,
                           "language_ctx": 0,
-                          "maple_length": 2}
+                          "maple_length": 4}
         model = build_model(state_dict or model.state_dict(), image_height, image_width, design_details)
         model = model.cuda()
     else:

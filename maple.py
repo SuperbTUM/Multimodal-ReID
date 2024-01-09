@@ -21,9 +21,9 @@ def _get_clones(module, N):
 class MultiModalPromptLearner(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
-        n_ctx = 2
+        n_ctx = 4
         n_cls_ctx = 4
-        ctx_init = "a photo of a"
+        ctx_init = "a photo of a X X X X person"
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
 
@@ -605,7 +605,7 @@ class VisionTransformer_MaPLe(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
         # Again combine the inputs, so nn.sequential can work
         x11 = self.transformer.resblocks[:11]([x, compound_deeper_prompts, 0])  # third argument is counter
-        x12 = self.transformer.resblocks[11]([x, compound_deeper_prompts, 0])
+        x12 = self.transformer.resblocks[11](x11)
 
         x11 = x11[0]
         x11 = x11.permute(1, 0, 2)  # LND -> NLD
