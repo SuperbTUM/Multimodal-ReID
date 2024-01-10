@@ -65,7 +65,7 @@ class Market1501(BaseImageDataset):
         pid2label = {pid: label for label, pid in enumerate(pid_container)}
 
         dataset = []
-        for img_path in img_paths:
+        for idx, img_path in enumerate(img_paths):
             pid, camid, seqid = map(int, pattern.search(img_path).groups())
             if pid == -1:
                 continue  # junk images are just ignored
@@ -76,6 +76,6 @@ class Market1501(BaseImageDataset):
             seqid -= 1  # index starts from 0
             if relabel:
                 pid = pid2label[pid]
-            dataset.append((img_path, pid, camid, seqid))
+            dataset.append((img_path, pid, camid, seqid, idx))
 
         return dataset

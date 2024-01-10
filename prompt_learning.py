@@ -1,5 +1,4 @@
 import os
-import glob
 import argparse
 
 import torch
@@ -22,8 +21,7 @@ from losses import SupConLoss, WeightedRegularizedTriplet
 cudnn.enabled = True
 cudnn.deterministic = True
 
-
-from cocoop import PromptLearner, TextEncoder
+from cocoop import PromptLearner as PromptLearnerCoCoop, TextEncoder
 from maple import build_model, MultiModalPromptLearner, TextEncoder as TextEncoderMaple
 import clip_maple
 
@@ -44,10 +42,58 @@ def weights_init_kaiming(m):
             nn.init.constant_(m.bias, 0.0)
 
 
-class CustomCLIPCoCoop(nn.Module):
+class PromptLearner(nn.Module):
+    def __init__(self, num_class, clip_model):
+        super().__init__()
+        ctx_init = "A photo of a X X X X person."
+
+        dtype = clip_model.dtype
+        token_embedding = clip_model.token_embedding
+        ctx_dim = 512
+        # use given words to initialize context vectors
+        ctx_init = ctx_init.replace("_", " ")
+        n_ctx = 4
+
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()
+        with torch.no_grad():
+            embedding = token_embedding(tokenized_prompts).type(dtype)
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+        n_cls_ctx = 4
+        cls_vectors = torch.empty(num_class, n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(cls_vectors, std=0.02)
+        self.cls_ctx = nn.Parameter(cls_vectors)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
+        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + n_cls_ctx:, :])
+        self.num_class = num_class
+        self.n_cls_ctx = n_cls_ctx
+
+    def forward(self, label):
+        cls_ctx = self.cls_ctx[label]
+        b = label.shape[0]
+        prefix = self.token_prefix.expand(b, -1, -1)
+        suffix = self.token_suffix.expand(b, -1, -1)
+
+        prompts = torch.cat(
+            [
+                prefix,  # (n_cls, 1, dim)
+                cls_ctx,  # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+
+class CustomCLIPCoop(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = PromptLearner(classnames, clip_model, params)
+        self.prompt_learner = PromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -66,35 +112,107 @@ class CustomCLIPCoCoop(nn.Module):
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
-    def forward(self, image, label):
-        _, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+    def forward(self, image, label, get_image=False, get_texts=False):
+        if get_texts:
+            prompts = self.prompt_learner(label)
+            tokenized_prompts = self.tokenized_prompts
+
+            text_features = self.text_encoder(prompts, tokenized_prompts)
+            return text_features
+
+        if get_image:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            image_features = image_features[:, 0]
+            return image_features
+
+        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+        image_features_last = image_features_last[:, 0]
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
 
+        image_features_non_proj = self.vision_bottleneck(image_features_non_proj)
+        cls_score = self.vision_classifier(image_features_non_proj.float())
+        image_features = self.vision_bottleneck_proj(image_features)
+        cls_score_proj = self.vision_classifier_proj(image_features.float())
+
+        # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        prompts = self.prompt_learner(label)
+        tokenized_prompts = self.tokenized_prompts
+        logit_scale = self.logit_scale.exp()
+
+        text_features = self.text_encoder(prompts, tokenized_prompts)
+        # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        logits = image_features @ text_features.t()
+
         if self.training:
-            image_features_non_proj = self.vision_bottleneck(image_features_non_proj)
-            cls_score = self.vision_classifier(image_features_non_proj.float())
-            image_features = self.vision_bottleneck_proj(image_features)
-            cls_score_proj = self.vision_classifier_proj(image_features.float())
+            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
+                                                                                        image_features_non_proj,
+                                                                                        image_features]
+        else:
+            return torch.cat((image_features_non_proj, image_features), dim=1)
 
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            prompts = self.prompt_learner(image_features, label)
-            tokenized_prompts = self.tokenized_prompts
-            logit_scale = self.logit_scale.exp()
-            logits = []
-            texts = []
 
-            for pts_i, imf_i in zip(prompts, image_features):
-                text_features = self.text_encoder(pts_i, tokenized_prompts)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                l_i = logit_scale * imf_i @ text_features.t()
-                logits.append(l_i)
-                texts.append(text_features)
+class CustomCLIPCoCoop(nn.Module):
+    def __init__(self, classnames, clip_model):
+        super().__init__()
+        self.prompt_learner = PromptLearnerCoCoop(classnames, clip_model, params)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
 
-            logits = torch.stack(logits)
-            texts = torch.stack(texts)
+        self.vision_bottleneck = nn.BatchNorm1d(768)
+        self.vision_bottleneck.bias.requires_grad_(False)
+        self.vision_bottleneck.apply(weights_init_kaiming)
+        self.vision_classifier = nn.Linear(768, classnames, bias=False)
+        self.vision_classifier.apply(weights_init_classifier)
 
-            return texts, image_features, logits, cls_score, cls_score_proj
+        self.vision_bottleneck_proj = nn.BatchNorm1d(512)
+        self.vision_bottleneck_proj.bias.requires_grad_(False)
+        self.vision_bottleneck_proj.apply(weights_init_kaiming)
+        self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
+        self.vision_classifier_proj.apply(weights_init_classifier)
+
+    def forward(self, image, label, get_image=False, get_texts=False):
+        if get_image:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            image_features = image_features[:, 0]
+            return image_features
+
+        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+        image_features_last = image_features_last[:, 0]
+        image_features_non_proj = image_features_non_proj[:, 0]
+        image_features = image_features[:, 0]
+
+        image_features_non_proj = self.vision_bottleneck(image_features_non_proj)
+        cls_score = self.vision_classifier(image_features_non_proj.float())
+        image_features = self.vision_bottleneck_proj(image_features)
+        cls_score_proj = self.vision_classifier_proj(image_features.float())
+
+        # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        prompts = self.prompt_learner(image_features, label)
+        tokenized_prompts = self.tokenized_prompts
+        logit_scale = self.logit_scale.exp()
+        logits = []
+        texts = []
+
+        for pts_i, imf_i in zip(prompts, image_features):
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
+            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            l_i = logit_scale * imf_i @ text_features.t()
+            logits.append(l_i)
+            texts.append(text_features)
+
+        logits = torch.stack(logits)
+        texts = torch.stack(texts)
+
+        if get_texts:
+            return texts
+
+        if self.training:
+            return texts, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
+                                                                                image_features_non_proj, image_features]
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
@@ -121,13 +239,29 @@ class CustomCLIPMaple(nn.Module):
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
-    def forward(self, image, label):
+    def forward(self, image, label, get_image=False, get_texts=False):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
+        if get_texts:
+            prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner(label)
+            text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
+            return text_features
+
+        if get_image:
+            prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner(label)
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype),
+                                                                                              shared_ctx,
+                                                                                              deep_compound_prompts_vision)
+            image_features = image_features[:, 0]
+
+            return image_features
+
         prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner(label)
         text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
-        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_ctx, deep_compound_prompts_vision)
+        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype),
+                                                                                          shared_ctx,
+                                                                                          deep_compound_prompts_vision)
         image_features_last = image_features_last[:, 0]
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
@@ -139,11 +273,13 @@ class CustomCLIPMaple(nn.Module):
             cls_score = self.vision_classifier(features_non_proj.float())
             cls_score_proj = self.vision_classifier_proj(features.float())
 
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            logits = logit_scale * image_features @ text_features.t()
+            # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logits = image_features @ text_features.t()
 
-            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last, image_features_non_proj, image_features]
+            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
+                                                                                        image_features_non_proj,
+                                                                                        image_features]
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
@@ -152,12 +288,12 @@ def train_prompter(model,
                    dataloader,
                    epochs,
                    pretrained=None):
-
     def train_batch_prompter(batch):
         image, label = batch[:2]
         image = image.cuda()
         label = label.cuda()
-        text_features, image_features = model(image, label)[:2]
+        text_features = model(image, label, get_texts=True)
+        image_features = image_features_list[indices]
         loss = loss_func(text_features, image_features, label, label) + \
                loss_func(image_features, text_features, label, label)
         return loss
@@ -165,15 +301,31 @@ def train_prompter(model,
     print("Building custom CLIP")
     if params.amp:
         model = model.float()
-    model.train()
+
+    with torch.no_grad():
+        model.eval()
+        index_list = []
+        image_features_list = []
+        for images, target, cams, seqs, indices in dataloader:
+            images = images.cuda()
+            target = target.cuda()
+            if params.amp:
+                with autocast():
+                    image_features = model(images, target, get_image=True)
+            else:
+                image_features = model(images, target, get_image=True)
+            for image_feature, index in zip(image_features, indices):
+                image_features_list.append(image_feature.cpu())
+                index_list.append(index)
+        index_list = torch.stack(index_list, dim=0).cuda()
+        image_features_list = torch.stack(image_features_list, dim=0).cuda()
+        image_features_list = image_features_list[torch.argsort(index_list)]
 
     if pretrained is not None:
         load_pretrained_weights(model.prompt_learner, pretrained)
+    model.train()
 
     print("Turning off gradients in both the image and the text encoder")
-    for name, param in model.named_parameters():
-        if "prompt_learner" not in name:
-            param.requires_grad_(False)
 
     # optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
     # scheduler = ConstantWarmupScheduler(optimizer,
@@ -191,7 +343,7 @@ def train_prompter(model,
     for epoch in range(epochs):
         iterator = tqdm(dataloader)
         if params.amp:
-            for images, target, cams, seqs in iterator:
+            for images, target, cams, seqs, indices in iterator:
                 batch = images, target
                 with autocast():
                     loss = train_batch_prompter(batch)
@@ -201,7 +353,7 @@ def train_prompter(model,
                 scaler.update()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
         else:
-            for images, target, cams, seqs in iterator:
+            for images, target, cams, seqs, indices in iterator:
                 batch = images, target
                 loss = train_batch_prompter(batch)
                 optimizer.zero_grad()
@@ -220,12 +372,11 @@ def train_vision_model(model,
                        dataloader,
                        epochs,
                        pretrained=None):
-
     def train_batch_vision_model(batch):
         image, label = batch[:2]
         image = image.cuda()
         label = label.cuda()
-        output, cls_scores, image_features_list = model(image, label)[1:]
+        output, cls_scores, image_features_list = model(image, label)[2:]
         cls_score1, cls_score2 = cls_scores
         image_features_last, image_features_non_proj, image_features = image_features_list
         loss = F.cross_entropy(output, label) + \
@@ -233,8 +384,8 @@ def train_vision_model(model,
                0.25 * F.cross_entropy(cls_score2, label, label_smoothing=0.1)
         if params.bs >= 4:
             loss += triplet_loss(image_features_last, label) + \
-                triplet_loss(image_features_non_proj, label) + \
-                triplet_loss(image_features, label)
+                    triplet_loss(image_features_non_proj, label) + \
+                    triplet_loss(image_features, label)
         return loss
 
     print("Building custom CLIP")
@@ -274,7 +425,7 @@ def train_vision_model(model,
     for epoch in range(epochs):
         iterator = tqdm(dataloader)
         if params.amp:
-            for images, target, cams, seqs in iterator:
+            for images, target, cams, seqs, indices in iterator:
                 batch = images, target
                 with autocast():
                     loss = train_batch_vision_model(batch)
@@ -284,7 +435,7 @@ def train_vision_model(model,
                 scaler.update()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
         else:
-            for images, target, cams, seqs in iterator:
+            for images, target, cams, seqs, indices in iterator:
                 batch = images, target
                 loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
@@ -293,17 +444,17 @@ def train_vision_model(model,
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
         scheduler.step()
-        checkpoint_path = "/".join((params.save_path, "clip_model_image_encoder_{}.pth".format(epoch)))
-        torch.save(model.image_encoder.state_dict(), checkpoint_path)
+        checkpoint_path = "/".join((params.save_path, "clip_model_weight_{}.pth".format(epoch)))
+        torch.save(model.state_dict(), checkpoint_path)
 
     model.eval()
 
 
 def test_prompter(model,
-                  prompt_learner_weight,
+                  clip_weight,
                   loader_test):
     model.eval()
-    load_pretrained_weights(model.prompt_learner, prompt_learner_weight)
+    load_pretrained_weights(model, clip_weight)
 
     embeddings = []
     targets = []
@@ -313,9 +464,9 @@ def test_prompter(model,
     with torch.no_grad():
         for i, (images, target, cams, seqs) in enumerate(tqdm(loader_test)):
             images = images.cuda()
-            logits = model(images)
+            image_features_merged = model(images)
 
-            embeddings.append(logits)
+            embeddings.append(image_features_merged)
             targets.append(target)
             camera_ids.append(cams)
             sequence_ids.append(seqs)
@@ -357,14 +508,14 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
     args.add_argument("--clip_weights", type=str, default="Market1501_clipreid_ViT-B-16_60.pth")
-    args.add_argument("--maple", action="store_true")
+    args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "cocoop", "maple"])
     return args.parse_args()
 
 
 if __name__ == "__main__":
     params = params_parser()
     image_height, image_width = params.height, int(params.height * params.ratio)
-    if params.maple:
+    if params.training_mode == "maple":
         url = clip_maple._MODELS[params.model]
         model_path = clip_maple._download(url)
         try:
@@ -389,11 +540,15 @@ if __name__ == "__main__":
     model.eval()
 
     loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
-                                    "vit" if "ViT" in params.model else "rn")
-    if params.maple:
+                                           "vit" if "ViT" in params.model else "rn")
+    if params.training_mode == "maple":
         model = CustomCLIPMaple(n_cls, model).cuda()
-    else:
+    elif params.training_mode == "cocoop":
         model = CustomCLIPCoCoop(n_cls, model).cuda()
+    elif params.training_mode == "coop":
+        model = CustomCLIPCoop(n_cls, model).cuda()
+    else:
+        raise NotImplementedError
 
     loader_gallery, loader_query = get_loader(params.root, params.bs,
                                               image_height,
@@ -406,7 +561,7 @@ if __name__ == "__main__":
     train_vision_model(model,
                        loader_train,
                        params.epochs_stage2)
-    latest_model = sorted(glob.glob("/".join((params.save_path, "clip_model_image_encoder_*"))), reverse=True)[0]
+    latest_model = "/".join((params.save_path, "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
         test_prompter(model, latest_model, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \

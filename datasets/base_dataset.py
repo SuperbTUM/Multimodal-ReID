@@ -6,7 +6,7 @@ class BaseDataset:
     @staticmethod
     def get_imagedata_info(data):
         pids, cams, seqs = [], [], []
-        for _, pid, camid, seqid in data:
+        for _, pid, camid, seqid, idx in data:
             pids += [pid]
             cams += [camid]
             seqs += [seqid]
