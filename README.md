@@ -21,9 +21,9 @@ python3 zero_shot_learning.py --model ViT-B/16 --augmented_template --height 256
 
 Train with Prompt Engineering
 ```bash
-python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64
+python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60
 ```
 Or
 ```bash
-deepspeed prompt_learning_deepspeed.py --height 256
+deepspeed prompt_learning_deepspeed.py --height 256 --amp
 ```

@@ -65,7 +65,7 @@ class CustomCLIPCoop(nn.Module):
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
-    def forward(self, image, label, get_image=False, get_texts=False):
+    def forward(self, image=None, label=None, get_image=False, get_texts=False):
         if get_texts:
             prompts = self.prompt_learner(label)
             tokenized_prompts = self.tokenized_prompts
@@ -127,7 +127,7 @@ class CustomCLIPCoCoop(nn.Module):
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
-    def forward(self, image, label, get_image=False, get_texts=False):
+    def forward(self, image, label=None, get_image=False, get_texts=False):
         if get_image:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features = image_features[:, 0]
@@ -192,7 +192,7 @@ class CustomCLIPMaple(nn.Module):
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
-    def forward(self, image, label, get_image=False, get_texts=False):
+    def forward(self, image=None, label=None, get_image=False, get_texts=False):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
@@ -329,29 +329,44 @@ def train_vision_model(model,
         image, label = batch[:2]
         image = image.cuda()
         label = label.cuda()
-        output, cls_scores, image_features_list = model(image, label)[2:]
+        cls_scores, image_features_list = model(image, label)[3:]
         cls_score1, cls_score2 = cls_scores
         image_features_last, image_features_non_proj, image_features = image_features_list
-        loss = F.cross_entropy(output, label) + \
-               0.25 * F.cross_entropy(cls_score1, label, label_smoothing=0.1) + \
+
+        loss = 0.25 * F.cross_entropy(cls_score1, label, label_smoothing=0.1) + \
                0.25 * F.cross_entropy(cls_score2, label, label_smoothing=0.1)
+        if params.training_mode != "cocoop":
+            output = image_features @ text_features.t()
+            loss += F.cross_entropy(output, label, label_smoothing=0.1)
         if params.bs >= 4:
-            loss += triplet_loss(image_features_last, label) + \
-                    triplet_loss(image_features_non_proj, label) + \
-                    triplet_loss(image_features, label)
+            loss += triplet_loss(image_features_last.float(), label) + \
+                    triplet_loss(image_features_non_proj.float(), label) + \
+                    triplet_loss(image_features.float(), label)
         return loss
 
     print("Building custom CLIP")
     if params.amp:
         model = model.float()
+
+    if params.training_mode != "cocoop":
+        with torch.no_grad():
+            model.eval()
+            text_features = []
+            for i in range(n_cls):
+                label = torch.tensor([i]).cuda()
+                with autocast():
+                    text_feature = model(label=label, get_texts=True)
+                text_features.append(text_feature)
+            text_features = torch.stack(text_features, dim=0).squeeze().cuda()
+
     model.train()
 
     if pretrained is not None:
         load_pretrained_weights(model.image_encoder, pretrained)
         load_pretrained_weights(model.vision_classifier, pretrained)
         load_pretrained_weights(model.vision_classifier_proj, pretrained)
-        load_pretrained_weights(model.bottleneck, pretrained)
-        load_pretrained_weights(model.bottleneck_proj, pretrained)
+        load_pretrained_weights(model.vision_bottleneck, pretrained)
+        load_pretrained_weights(model.vision_bottleneck_proj, pretrained)
 
     print("Turning off gradients in both the prompter and the text encoder")
     for name, param in model.named_parameters():
@@ -363,8 +378,8 @@ def train_vision_model(model,
     optimizer = torch.optim.Adam(list(model.image_encoder.parameters()) + \
                                  list(model.vision_classifier.parameters()) + \
                                  list(model.vision_classifier_proj.parameters()) + \
-                                 list(model.bottleneck.parameters()) + \
-                                 list(model.bottleneck_proj.parameters()), lr=0.000005, weight_decay=1e-4)
+                                 list(model.vision_bottleneck.parameters()) + \
+                                 list(model.vision_bottleneck_proj.parameters()), lr=0.000005, weight_decay=1e-4)
     scheduler = ConstantWarmupScheduler(optimizer,
                                         torch.optim.lr_scheduler.MultiStepLR(optimizer, [epochs // 3, epochs // 3 * 2]),
                                         10,
