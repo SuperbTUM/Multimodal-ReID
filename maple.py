@@ -18,6 +18,76 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
+class VLPromptLearner(nn.Module):
+    def __init__(self, n_cls, clip_model):
+        super().__init__()
+
+        n_ctx = 4
+        n_cls_ctx = 4
+        ctx_init = "A photo of X X X X person."
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+
+        # use given words to initialize context vectors
+        ctx_init = ctx_init.replace("_", " ")
+        n_ctx = n_ctx
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+        ctx_vectors = torch.empty(n_cls, n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(ctx_vectors, std=0.02)
+        prompt_prefix = ctx_init
+
+        print(f"Independent V-L design")
+        print(f'Initial text context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
+        self.ctx = nn.Parameter(ctx_vectors)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :1 + n_ctx, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx + n_cls_ctx:, :])  # CLS, EOS
+
+        self.n_ctx = n_ctx
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        # dim0 is either batch_size (during training) or n_cls (during testing)
+        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
+        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
+        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
+
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
+
+        prefix = prefix.expand(ctx.size(0), -1, -1)
+        suffix = suffix.expand(ctx.size(0), -1, -1)
+
+        prompts = torch.cat(
+            [
+                prefix,  # (dim0, 1, dim)
+                ctx,  # (dim0, n_ctx, dim)
+                suffix,  # (dim0, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+    def forward(self, label):
+        ctx = self.ctx[label]
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+        prompts = self.construct_prompts(ctx, prefix, suffix)
+
+        return prompts
+
+
 class MultiModalPromptLearner(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
@@ -550,15 +620,17 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        x11 = self.transformer.resblocks[:11](x)
+        x12 = self.transformer.resblocks[11](x11)
+        x11 = x11.permute(1, 0, 2)  # LND -> NLD
+        x12 = x12.permute(1, 0, 2)
 
-        x = self.ln_post(x[:, 0, :])
+        x12 = self.ln_post(x12)
 
         if self.proj is not None:
-            x = x @ self.proj
+            x_proj = x12 @ self.proj
 
-        return x
+        return x11, x12, x_proj
 
 
 class VisionTransformer_MaPLe(nn.Module):
