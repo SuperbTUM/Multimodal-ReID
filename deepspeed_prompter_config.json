@@ -1,13 +1,17 @@
 {
-  "train_batch_size": 1,
+  "train_batch_size": 64,
   "gradient_accumulation_steps": 1,
   "optimizer": {
-    "type": "SGD",
+    "type": "Adam",
     "params": {
-      "lr": 0.002
+      "lr": 0.00005,
+      "weight_decay": 0.0001
     }
   },
-  "zero_allow_untested_optimizer": true,
+  "fp16": {
+    "enabled": true,
+    "auto_cast": true
+  },
   "zero_optimization": {
     "stage": 3,
     "reduce_bucket_size": 5e8,

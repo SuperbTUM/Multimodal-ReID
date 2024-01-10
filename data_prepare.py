@@ -8,6 +8,73 @@ from torchvision import transforms
 from datasets import dataset_market
 
 
+import copy
+import random
+from collections import defaultdict
+
+class RandomIdentitySampler_(torch.utils.data.sampler.Sampler):
+    """
+    Randomly sample N identities, then for each identity,
+    randomly sample K instances, therefore batch size is N*K.
+    Args:
+    - data_source (list): list of (img_path, pid, camid).
+    - num_instances (int): number of instances per identity in a batch.
+    - batch_size (int): number of examples in a batch.
+    """
+
+    def __init__(self, data_source, batch_size, num_instances):
+        self.data_source = data_source
+        self.batch_size = batch_size
+        self.num_instances = num_instances
+        self.num_pids_per_batch = self.batch_size // self.num_instances
+        self.index_dic = defaultdict(list)
+        for index, img_info in enumerate(self.data_source):
+            pid = img_info[1]
+            self.index_dic[pid.item()].append(index)
+        self.pids = list(self.index_dic.keys())
+
+        # estimate number of examples in an epoch
+        self.length = 0
+        for pid in self.pids:
+            idxs = self.index_dic[pid]
+            num = len(idxs)
+            if num < self.num_instances:
+                num = self.num_instances
+            self.length += num - num % self.num_instances
+
+    def __iter__(self):
+        batch_idxs_dict = defaultdict(list)
+
+        for pid in self.pids:
+            idxs = copy.deepcopy(self.index_dic[pid])
+            if len(idxs) < self.num_instances:
+                idxs = np.random.choice(idxs, size=self.num_instances, replace=True)
+            random.shuffle(idxs)
+            batch_idxs = []
+            for idx in idxs:
+                batch_idxs.append(idx)
+                if len(batch_idxs) == self.num_instances:
+                    batch_idxs_dict[pid].append(batch_idxs)
+                    batch_idxs = []
+
+        avai_pids = copy.deepcopy(self.pids)
+        final_idxs = []
+
+        while len(avai_pids) >= self.num_pids_per_batch:
+            selected_pids = random.sample(avai_pids, self.num_pids_per_batch)
+            for pid in selected_pids:
+                batch_idxs = batch_idxs_dict[pid].pop(0)
+                final_idxs.extend(batch_idxs)
+                if len(batch_idxs_dict[pid]) == 0:
+                    avai_pids.remove(pid)
+
+        self.length = len(final_idxs)
+        return iter(final_idxs)
+
+    def __len__(self):
+        return self.length
+
+
 class ToSquare:
     def __init__(self):
         pass
@@ -49,6 +116,24 @@ class reidDataset(Dataset):
         for i in range(2, len(detailed_info)):
             detailed_info[i] = torch.tensor(detailed_info[i], dtype=torch.long)
         return detailed_info
+
+
+def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type):
+    transform_train = transforms.Compose([
+        transforms.Resize((image_height, image_width)),
+        transforms.RandomHorizontalFlip(),
+        transforms.Pad((10, 5)),
+        transforms.RandomCrop((image_height, image_width)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
+        transforms.RandomErasing()
+    ])
+    dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    num_pids = dataset.num_train_pids
+    reid_dataset_train = reidDataset(dataset.train, transform_train)
+    custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 16)
+    loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=False, sampler=custom_sampler, pin_memory=True)
+    return loader_train, num_pids
 
 
 def get_loader_train(root, batch_size, image_height, image_width, model_type):

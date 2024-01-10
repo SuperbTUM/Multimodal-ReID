@@ -12,8 +12,8 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 from tqdm import tqdm
 
-from utils import load_pretrained_weights, model_adaptor
-from data_prepare import get_loader_train, get_loader
+from utils import load_pretrained_weights
+from data_prepare import get_loader_train, get_loader_train_sampled, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import ConstantWarmupScheduler, create_scheduler
 from losses import SupConLoss, WeightedRegularizedTriplet
@@ -315,8 +315,9 @@ def train_prompter(model,
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
         scheduler.step(epoch)
-        checkpoint_path = "/".join((params.save_path, "clip_model_prompter_{}.pth".format(epoch)))
-        torch.save(model.prompt_learner.state_dict(), checkpoint_path)
+        if epoch % 5 == 0 or epoch == params.epochs_stage1 - 1:
+            checkpoint_path = "/".join((params.save_path, "clip_model_prompter_{}.pth".format(epoch)))
+            torch.save(model.prompt_learner.state_dict(), checkpoint_path)
 
     model.eval()
 
@@ -412,8 +413,9 @@ def train_vision_model(model,
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
         scheduler.step()
-        checkpoint_path = "/".join((params.save_path, "clip_model_weight_{}.pth".format(epoch)))
-        torch.save(model.state_dict(), checkpoint_path)
+        if epoch % 5 == 0 or epoch == params.epochs_stage2 - 1:
+            checkpoint_path = "/".join((params.save_path, "clip_model_weight_{}.pth".format(epoch)))
+            torch.save(model.state_dict(), checkpoint_path)
 
     model.eval()
 
@@ -509,6 +511,8 @@ if __name__ == "__main__":
 
     loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
                                            "vit" if "ViT" in params.model else "rn")
+    loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
+                                           "vit" if "ViT" in params.model else "rn")
     if params.training_mode == "maple":
         model = CustomCLIPMaple(n_cls, model).cuda()
     elif params.training_mode == "cocoop":
@@ -527,7 +531,7 @@ if __name__ == "__main__":
                    loader_train,
                    params.epochs_stage1)
     train_vision_model(model,
-                       loader_train,
+                       loader_train_sampled,
                        params.epochs_stage2)
     latest_model = "/".join((params.save_path, "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
