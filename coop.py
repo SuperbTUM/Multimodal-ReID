@@ -1,117 +1,107 @@
 import math
 import numpy as np
-from collections import OrderedDict
-from typing import Tuple, Union
+from typing import Union, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import clip
-from clip.model import ModifiedResNet, VisionTransformer, Transformer, LayerNorm
+from clip.model import LayerNorm, Transformer, ModifiedResNet
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, n_cls, clip_model, params):
+    def __init__(self, num_class, clip_model):
         super().__init__()
-        n_ctx = 4
-        ctx_init = "a photo of a " + " ".join(["X"] * n_ctx) + " person"
+        ctx_init = "A photo of a X X X X person."
+
         dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        vis_dim = clip_model.visual.output_dim
+        token_embedding = clip_model.token_embedding
+        ctx_dim = 512
+        # use given words to initialize context vectors
+        ctx_init = ctx_init.replace("_", " ")
+        n_ctx = 4
 
-        self.meta_net = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
-            ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
-        ]))
-
-        if not params.amp:
-            self.meta_net.half()
-
-        tokenized_prompts = clip.tokenize(ctx_init).cuda()  # (n_cls, n_tkn)
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            embedding = token_embedding(tokenized_prompts).type(dtype)
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
 
         n_cls_ctx = 4
-        cls_vectors = torch.empty(n_cls, n_cls_ctx, ctx_dim, dtype=dtype)
+        cls_vectors = torch.empty(num_class, n_cls_ctx, ctx_dim, dtype=dtype)
         nn.init.normal_(cls_vectors, std=0.02)
-        self.ctx = nn.Parameter(cls_vectors)
+        self.cls_ctx = nn.Parameter(cls_vectors)
 
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
         # those computed using the current class names
-        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx + n_cls_ctx:, :])  # CLS, EOS
-
-        self.n_cls = n_cls
-        self.n_ctx = n_ctx
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
+        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + n_cls_ctx:, :])
+        self.num_class = num_class
         self.n_cls_ctx = n_cls_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
 
-    def construct_prompts(self, ctx, prefix, suffix, label=None):
-        # dim0 is either batch_size (during training) or n_cls (during testing)
-        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
-        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
-        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
-
-        if label is not None:
-            prefix = prefix[label]
-            suffix = suffix[label]
-
-        prefix = prefix.expand(ctx.size(0), -1, -1)
-        suffix = suffix.expand(ctx.size(0), -1, -1)
+    def forward(self, label):
+        cls_ctx = self.cls_ctx[label]
+        b = label.shape[0]
+        prefix = self.token_prefix.expand(b, -1, -1)
+        suffix = self.token_suffix.expand(b, -1, -1)
 
         prompts = torch.cat(
             [
-                prefix,  # (dim0, 1, dim)
-                ctx,  # (dim0, n_ctx, dim)
-                suffix,  # (dim0, *, dim)
+                prefix,  # (n_cls, 1, dim)
+                cls_ctx,  # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
             ],
             dim=1,
         )
 
         return prompts
 
-    def forward(self, im_features, label):
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        ctx = self.ctx[label]  # (1, n_ctx, ctx_dim)
-        bias = self.meta_net(im_features)  # (batch, ctx_dim)
-        bias = bias.unsqueeze(1)  # (batch, 1, ctx_dim)
-        ctx_shifted = ctx + bias  # (batch, n_ctx, ctx_dim)
 
-        # Use instance-conditioned context tokens for all classes
-        prompts = []
-        for ctx_shifted_i in ctx_shifted:
-            ctx_i = ctx_shifted_i.expand(self.n_cls, -1, -1)
-            pts_i = self.construct_prompts(ctx_i, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
-            prompts.append(pts_i)
-        prompts = torch.stack(prompts)
-
-        return prompts
-
-
-class TextEncoder(nn.Module):
-    def __init__(self, clip_model):
+class VisionTransformer(nn.Module):
+    def __init__(self, h_resolution: int, w_resolution: int, patch_size: int, stride_size: int, width: int, layers: int,
+                 heads: int, output_dim: int):
         super().__init__()
-        self.transformer = clip_model.transformer
-        self.positional_embedding = clip_model.positional_embedding
-        self.ln_final = clip_model.ln_final
-        self.text_projection = clip_model.text_projection
-        self.dtype = clip_model.dtype
+        self.h_resolution = h_resolution
+        self.w_resolution = w_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=stride_size,
+                               bias=False)
 
-    def forward(self, prompts, tokenized_prompts):
-        x = prompts + self.positional_embedding.type(self.dtype)
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn(h_resolution * w_resolution + 1, width))
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads)
+
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def forward(self, x: torch.Tensor, cv_emb=None):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat(
+            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        if cv_emb != None:
+            x[:, 0] = x[:, 0] + cv_emb
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
 
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        x11 = self.transformer.resblocks[:11](x)
+        x12 = self.transformer.resblocks[11](x11)
+        x11 = x11.permute(1, 0, 2)  # LND -> NLD
+        x12 = x12.permute(1, 0, 2)  # LND -> NLD
 
-        return x
+        x12 = self.ln_post(x12)
+
+        if self.proj is not None:
+            xproj = x12 @ self.proj
+
+        return x11, x12, xproj
 
 
 class CLIP(nn.Module):

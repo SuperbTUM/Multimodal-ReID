@@ -169,7 +169,10 @@ def convert_weights(model: nn.Module):
 def model_adaptor(model, height, width, design_details=None, weights=None):
     # if (height, width) != (224, 224):
     if weights is not None:
-        weights = torch.load(weights)
+        try:
+            weights = torch.jit.load(weights, map_location="cpu")
+        except:
+            weights = torch.load(weights)
     if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer, maple.VisionTransformer, maple.VisionTransformer_MaPLe)):
         bottleneck_proj = BNNeck(model.visual.proj.size(1), True)
         bottleneck = BNNeck(model.visual.proj.size(0), False)

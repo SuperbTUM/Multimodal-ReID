@@ -21,8 +21,9 @@ from losses import SupConLoss, WeightedRegularizedTriplet
 cudnn.enabled = True
 cudnn.deterministic = True
 
-from cocoop import PromptLearner as PromptLearnerCoCoop, TextEncoder
-from maple import build_model, MultiModalPromptLearner, TextEncoder as TextEncoderMaple
+from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
+from cocoop import build_model as build_model_cocoop, PromptLearner as PromptLearnerCoCoop, TextEncoder
+from maple import build_model as build_model_maple, MultiModalPromptLearner, TextEncoder as TextEncoderMaple
 import clip_maple
 
 
@@ -42,58 +43,10 @@ def weights_init_kaiming(m):
             nn.init.constant_(m.bias, 0.0)
 
 
-class PromptLearner(nn.Module):
-    def __init__(self, num_class, clip_model):
-        super().__init__()
-        ctx_init = "A photo of a X X X X person."
-
-        dtype = clip_model.dtype
-        token_embedding = clip_model.token_embedding
-        ctx_dim = 512
-        # use given words to initialize context vectors
-        ctx_init = ctx_init.replace("_", " ")
-        n_ctx = 4
-
-        tokenized_prompts = clip.tokenize(ctx_init).cuda()
-        with torch.no_grad():
-            embedding = token_embedding(tokenized_prompts).type(dtype)
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
-
-        n_cls_ctx = 4
-        cls_vectors = torch.empty(num_class, n_cls_ctx, ctx_dim, dtype=dtype)
-        nn.init.normal_(cls_vectors, std=0.02)
-        self.cls_ctx = nn.Parameter(cls_vectors)
-
-        # These token vectors will be saved when in save_model(),
-        # but they should be ignored in load_model() as we want to use
-        # those computed using the current class names
-        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
-        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + n_cls_ctx:, :])
-        self.num_class = num_class
-        self.n_cls_ctx = n_cls_ctx
-
-    def forward(self, label):
-        cls_ctx = self.cls_ctx[label]
-        b = label.shape[0]
-        prefix = self.token_prefix.expand(b, -1, -1)
-        suffix = self.token_suffix.expand(b, -1, -1)
-
-        prompts = torch.cat(
-            [
-                prefix,  # (n_cls, 1, dim)
-                cls_ctx,  # (n_cls, n_ctx, dim)
-                suffix,  # (n_cls, *, dim)
-            ],
-            dim=1,
-        )
-
-        return prompts
-
-
 class CustomCLIPCoop(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = PromptLearner(classnames, clip_model)
+        self.prompt_learner = PromptLearnerCoop(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -507,7 +460,6 @@ def params_parser():
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
-    args.add_argument("--clip_weights", type=str, default="Market1501_clipreid_ViT-B-16_60.pth")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "cocoop", "maple"])
     return args.parse_args()
 
@@ -515,29 +467,30 @@ def params_parser():
 if __name__ == "__main__":
     params = params_parser()
     image_height, image_width = params.height, int(params.height * params.ratio)
-    if params.training_mode == "maple":
-        url = clip_maple._MODELS[params.model]
-        model_path = clip_maple._download(url)
-        try:
-            # loading JIT archive
-            model = torch.jit.load(model_path, map_location="cpu").eval()
-            state_dict = None
+    url = clip_maple._MODELS[params.model]
+    model_path = clip_maple._download(url)
+    try:
+        # loading JIT archive
+        model = torch.jit.load(model_path, map_location="cpu").eval()
+        state_dict = None
 
-        except RuntimeError:
-            state_dict = torch.load(model_path, map_location="cpu")
+    except RuntimeError:
+        state_dict = torch.load(model_path, map_location="cpu")
+    if params.training_mode == "maple":
         design_details = {"trainer": 'MaPLe',
                           "vision_depth": 0,
                           "language_depth": 0, "vision_ctx": 0,
                           "language_ctx": 0,
                           "maple_length": 4}
-        model = build_model(state_dict or model.state_dict(), image_height, image_width, design_details)
-        model = model.cuda()
+        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
+    elif params.training_mode == "cocoop":
+        model = build_model_cocoop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
+    elif params.training_mode == "coop":
+        model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
     else:
-        design_details = None
-        model, _ = clip.load(params.model)
-        model = model_adaptor(model, image_height, image_width, design_details, params.clip_weights)[0]
+        raise NotImplementedError
 
-    model.eval()
+    model = model.cuda()
 
     loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
                                            "vit" if "ViT" in params.model else "rn")
