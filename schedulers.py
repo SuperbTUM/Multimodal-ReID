@@ -1,5 +1,6 @@
 import math
 from typing import Dict, Any
+from bisect import bisect_right
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
 
@@ -225,52 +226,46 @@ def create_scheduler(optimizer, num_epochs, lr_min, warmup_lr_init, warmup_t, no
     return lr_scheduler
 
 
-class _BaseWarmupScheduler(_LRScheduler):
-
+class WarmupMultiStepLR(_LRScheduler):
     def __init__(
-        self,
-        optimizer,
-        successor,
-        warmup_epoch,
-        last_epoch=-1,
-        verbose=False
+            self,
+            optimizer,
+            milestones,  # steps
+            gamma=0.1,
+            warmup_factor=1.0 / 3,
+            warmup_iters=500,
+            warmup_method="linear",
+            last_epoch=-1,
     ):
-        self.successor = successor
-        self.warmup_epoch = warmup_epoch
-        super().__init__(optimizer, last_epoch, verbose)
+        if not list(milestones) == sorted(milestones):
+            raise ValueError(
+                "Milestones should be a list of" " increasing integers. Got {}",
+                milestones,
+            )
+
+        if warmup_method not in ("constant", "linear"):
+            raise ValueError(
+                "Only 'constant' or 'linear' warmup_method accepted"
+                "got {}".format(warmup_method)
+            )
+        self.milestones = milestones
+        self.gamma = gamma
+        self.warmup_factor = warmup_factor
+        self.warmup_iters = warmup_iters
+        self.warmup_method = warmup_method
+        super(WarmupMultiStepLR, self).__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        raise NotImplementedError
-
-    def step(self, epoch=None):
-        if self.last_epoch >= self.warmup_epoch:
-            self.successor.step(epoch)
-            self._last_lr = self.successor.get_last_lr()
-        else:
-            super().step(epoch)
-
-
-class LinearWarmupScheduler(_BaseWarmupScheduler):
-
-    def __init__(
-        self,
-        optimizer,
-        successor,
-        warmup_epoch,
-        min_lr,
-        last_epoch=-1,
-        verbose=False
-    ):
-        self.min_lr = min_lr
-        super().__init__(
-            optimizer, successor, warmup_epoch, last_epoch, verbose
-        )
-
-    def get_lr(self):
-        if self.last_epoch >= self.warmup_epoch:
-            return self.successor.get_last_lr()
-        if self.last_epoch == 0:
-            return [self.min_lr for _ in self.base_lrs]
+        warmup_factor = 1
+        if self.last_epoch < self.warmup_iters:
+            if self.warmup_method == "constant":
+                warmup_factor = self.warmup_factor
+            elif self.warmup_method == "linear":
+                alpha = self.last_epoch / self.warmup_iters
+                warmup_factor = self.warmup_factor * (1 - alpha) + alpha
         return [
-            lr * self.last_epoch / self.warmup_epoch for lr in self.base_lrs
+            base_lr
+            * warmup_factor
+            * self.gamma ** bisect_right(self.milestones, self.last_epoch)
+            for base_lr in self.base_lrs
         ]

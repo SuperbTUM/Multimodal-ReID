@@ -17,7 +17,7 @@ from tqdm import tqdm
 from utils import load_pretrained_weights
 from data_prepare import get_loader_train
 from losses import SupConLoss, WeightedRegularizedTriplet
-from schedulers import LinearWarmupScheduler, create_scheduler
+from schedulers import WarmupMultiStepLR, create_scheduler
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -361,10 +361,7 @@ def train_vision_model(ds_args,
                                  list(model.vision_classifier_proj.parameters()) + \
                                  list(model.vision_bottleneck.parameters()) + \
                                  list(model.vision_bottleneck_proj.parameters()), lr=0.000005, weight_decay=1e-4)
-    scheduler = LinearWarmupScheduler(optimizer,
-                                      torch.optim.lr_scheduler.MultiStepLR(optimizer, [epochs // 3, epochs // 3 * 2]),
-                                      10,
-                                      5e-7)
+    scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
     triplet_loss = WeightedRegularizedTriplet()
 
     if not os.path.exists(params.save_path):
