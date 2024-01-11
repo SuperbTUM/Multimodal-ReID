@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from datasets import dataset_market
+from datasets import dataset_market, dataset_dukemtmc
 
 
 import copy
@@ -153,7 +153,7 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type):
     return loader_train, num_pids
 
 
-def get_loader(root, batch_size, image_height, image_width, model_type):
+def get_loader(root, batch_size, image_height, image_width, model_type, dataset_name="market1501"):
     transform_test = transforms.Compose([
         transforms.Resize((image_height, image_width)),
         transforms.ToTensor(),
@@ -163,13 +163,18 @@ def get_loader(root, batch_size, image_height, image_width, model_type):
     transform_test_augmented = transforms.Compose([
         transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(1.0),
-        # transforms.Pad((int(5 * ratio), 5)),
-        # transforms.RandomCrop((image_height, image_width)),
+        transforms.Pad((10, 5)),
+        transforms.RandomCrop((image_height, image_width)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
     ])
     preprocess_augmented = transform_test_augmented
-    dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    if dataset_name == "market1501":
+        dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    elif dataset_name == "dukemtmc":
+        dataset = dataset_dukemtmc.DukeMTMCreID(root="/".join((root, "DukeMTMC-reID")))
+    else:
+        raise NotImplementedError
     reid_dataset_gallery = reidDataset(dataset.gallery, preprocess)
     reid_dataset_query = reidDataset(dataset.query, preprocess)
     loader_gallery = DataLoader(reid_dataset_gallery, batch_size=batch_size, num_workers=4, shuffle=False,

@@ -284,8 +284,9 @@ def train_prompter(model,
     scaler = GradScaler()
     loss_func = SupConLoss("cuda")
 
-    if not os.path.exists(params.save_path):
-        os.mkdir(params.save_path)
+    saving_path = os.path.join(params.save_path, params.training_mode)
+    if not os.path.exists(saving_path):
+        os.mkdir(saving_path)
 
     for epoch in range(epochs):
         iterator = tqdm(dataloader)
@@ -310,7 +311,7 @@ def train_prompter(model,
 
         scheduler.step(epoch)
         if epoch % 5 == 0 or epoch == params.epochs_stage1 - 1:
-            checkpoint_path = "/".join((params.save_path, "clip_model_prompter_{}.pth".format(epoch)))
+            checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
 
     model.eval()
@@ -382,8 +383,9 @@ def train_vision_model(model,
     scaler = GradScaler()
     triplet_loss = WeightedRegularizedTriplet()
 
-    if not os.path.exists(params.save_path):
-        os.mkdir(params.save_path)
+    saving_path = os.path.join(params.save_path, params.training_mode)
+    if not os.path.exists(saving_path):
+        os.mkdir(saving_path)
 
     for epoch in range(epochs):
         iterator = tqdm(dataloader)
@@ -408,7 +410,7 @@ def train_vision_model(model,
 
         scheduler.step()
         if epoch % 5 == 0 or epoch == params.epochs_stage2 - 1:
-            checkpoint_path = "/".join((params.save_path, "clip_model_weight_{}.pth".format(epoch)))
+            checkpoint_path = "/".join((saving_path, "clip_model_weight_{}.pth".format(epoch)))
             torch.save(model.state_dict(), checkpoint_path)
 
     model.eval()
@@ -473,6 +475,7 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "cocoop", "ivlp"])
+    args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc"])
     return args.parse_args()
 
 
@@ -507,7 +510,7 @@ if __name__ == "__main__":
     loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
                                            "vit" if "ViT" in params.model else "rn")
     loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                           "vit" if "ViT" in params.model else "rn")
+                                                       "vit" if "ViT" in params.model else "rn")
     if params.training_mode == "ivlp":
         model = CustomCLIPIVLP(n_cls, model).cuda()
     elif params.training_mode == "cocoop":
@@ -517,10 +520,11 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
-    loader_gallery, loader_query = get_loader(params.root, params.bs,
-                                              image_height,
-                                              image_width,
-                                              "vit" if "ViT" in params.model else "rn")[:2]
+    loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(params.root, params.bs,
+                                                                                                image_height,
+                                                                                                image_width,
+                                                                                                "vit" if "ViT" in params.model else "rn",
+                                                                                                params.test_dataset)
 
     train_prompter(model,
                    loader_train,
@@ -528,9 +532,15 @@ if __name__ == "__main__":
     train_vision_model(model,
                        loader_train_sampled,
                        params.epochs_stage2)
-    latest_model = "/".join((params.save_path, "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
+    latest_model = "/".join((os.path.join(params.save_path, params.training_mode), "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
         test_prompter(model, latest_model, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \
         test_prompter(model, latest_model, loader_query)
+    embeddings_gallery_augmented, _, _, _ = \
+        test_prompter(model, latest_model, loader_gallery_augmented)
+    embeddings_query_augmented, _, _, _ = \
+        test_prompter(model, latest_model, loader_query_augmented)
+    embeddings_gallery = (embeddings_gallery + embeddings_gallery_augmented) / 2
+    embeddings_query = (embeddings_query + embeddings_query_augmented) / 2
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
