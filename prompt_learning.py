@@ -15,7 +15,7 @@ from tqdm import tqdm
 from utils import load_pretrained_weights
 from data_prepare import get_loader_train, get_loader_train_sampled, get_loader
 from evaluate import R1_mAP_eval
-from schedulers import ConstantWarmupScheduler, create_scheduler
+from schedulers import LinearWarmupScheduler, create_scheduler
 from losses import SupConLoss, WeightedRegularizedTriplet
 
 cudnn.enabled = True
@@ -376,10 +376,10 @@ def train_vision_model(model,
                                  list(model.vision_classifier_proj.parameters()) + \
                                  list(model.vision_bottleneck.parameters()) + \
                                  list(model.vision_bottleneck_proj.parameters()), lr=0.000005, weight_decay=1e-4)
-    scheduler = ConstantWarmupScheduler(optimizer,
-                                        torch.optim.lr_scheduler.MultiStepLR(optimizer, [epochs // 3, epochs // 3 * 2]),
-                                        10,
-                                        1e-5)
+    scheduler = LinearWarmupScheduler(optimizer,
+                                      torch.optim.lr_scheduler.MultiStepLR(optimizer, [30, 50]),
+                                      10,
+                                      5e-7)
     scaler = GradScaler()
     triplet_loss = WeightedRegularizedTriplet()
 
@@ -466,7 +466,7 @@ def get_cmc_map(
 def params_parser():
     args = argparse.ArgumentParser()
     args.add_argument("--epochs_stage1", default=10, type=int)
-    args.add_argument("--epochs_stage2", default=10, type=int)
+    args.add_argument("--epochs_stage2", default=60, type=int)
     args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=1, type=int)
@@ -532,7 +532,8 @@ if __name__ == "__main__":
     train_vision_model(model,
                        loader_train_sampled,
                        params.epochs_stage2)
-    latest_model = "/".join((os.path.join(params.save_path, params.training_mode), "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
+    latest_model = "/".join((os.path.join(params.save_path, params.training_mode),
+                             "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
         test_prompter(model, latest_model, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \

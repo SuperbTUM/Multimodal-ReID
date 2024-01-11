@@ -69,7 +69,7 @@ def inference(model,
     sequence_ids = []
 
     with torch.no_grad():
-        for i, (images, target, cams, seqs) in enumerate(tqdm(loader)):
+        for i, (images, target, cams, seqs, indices) in enumerate(tqdm(loader)):
             images = images.cuda()
 
             # predict
@@ -92,7 +92,7 @@ def inference(model,
             camera_ids.append(cams)
             sequence_ids.append(seqs)
 
-        for i, (images, target, cams, seqs) in enumerate(tqdm(loader_augment)):
+        for i, (images, target, cams, seqs, indices) in enumerate(tqdm(loader_augment)):
             images = images.cuda()
 
             # predict
@@ -155,6 +155,7 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--mm", action="store_true")
     args.add_argument("--clip_weights", type=str, default="Market1501_clipreid_ViT-B-16_60.pth")
+    args.add_argument("--test_dataset", type=str, choices=["market1501", "dukemtmc"], default="market1501")
     return args.parse_args()
 
 
@@ -165,13 +166,14 @@ if __name__ == "__main__":
     loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(params.root, params.bs,
                                                                                                 image_height,
                                                                                                 image_width,
-                                                                                                "vit" if "ViT" in params.model else "rn")
+                                                                                                "vit" if "ViT" in params.model else "rn",
+                                                                                                params.dataset_test)
     if params.augmented_template:
         identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
     else:
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
     zeroshot_weights, model = load_model(model_name, identity_list, template_dict)
-    model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, params.clip_weights)
+    model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, None, params.clip_weights)
 
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck,
                                                                                         bottleneck_proj, zeroshot_weights,

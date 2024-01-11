@@ -250,18 +250,18 @@ class _BaseWarmupScheduler(_LRScheduler):
             super().step(epoch)
 
 
-class ConstantWarmupScheduler(_BaseWarmupScheduler):
+class LinearWarmupScheduler(_BaseWarmupScheduler):
 
     def __init__(
         self,
         optimizer,
         successor,
         warmup_epoch,
-        cons_lr,
+        min_lr,
         last_epoch=-1,
         verbose=False
     ):
-        self.cons_lr = cons_lr
+        self.min_lr = min_lr
         super().__init__(
             optimizer, successor, warmup_epoch, last_epoch, verbose
         )
@@ -269,4 +269,8 @@ class ConstantWarmupScheduler(_BaseWarmupScheduler):
     def get_lr(self):
         if self.last_epoch >= self.warmup_epoch:
             return self.successor.get_last_lr()
-        return [self.cons_lr for _ in self.base_lrs]
+        if self.last_epoch == 0:
+            return [self.min_lr for _ in self.base_lrs]
+        return [
+            lr * self.last_epoch / self.warmup_epoch for lr in self.base_lrs
+        ]

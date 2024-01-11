@@ -17,7 +17,7 @@ from tqdm import tqdm
 from utils import load_pretrained_weights
 from data_prepare import get_loader_train
 from losses import SupConLoss, WeightedRegularizedTriplet
-from schedulers import ConstantWarmupScheduler, create_scheduler
+from schedulers import LinearWarmupScheduler, create_scheduler
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -89,16 +89,15 @@ class CustomCLIPCoop(nn.Module):
         image_features = self.vision_bottleneck_proj(image_features)
         cls_score_proj = self.vision_classifier_proj(image_features.float())
 
-        # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        prompts = self.prompt_learner(label)
-        tokenized_prompts = self.tokenized_prompts
-        logit_scale = self.logit_scale.exp()
-
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        logits = image_features @ text_features.t()
-
         if self.training:
+            # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            prompts = self.prompt_learner(label)
+            tokenized_prompts = self.tokenized_prompts
+            logit_scale = self.logit_scale.exp()
+
+            text_features = self.text_encoder(prompts, tokenized_prompts)
+            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logits = image_features @ text_features.t()
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
                                                                                         image_features_non_proj,
                                                                                         image_features]
@@ -362,10 +361,10 @@ def train_vision_model(ds_args,
                                  list(model.vision_classifier_proj.parameters()) + \
                                  list(model.vision_bottleneck.parameters()) + \
                                  list(model.vision_bottleneck_proj.parameters()), lr=0.000005, weight_decay=1e-4)
-    scheduler = ConstantWarmupScheduler(optimizer,
-                                        torch.optim.lr_scheduler.MultiStepLR(optimizer, [epochs // 3, epochs // 3 * 2]),
-                                        10,
-                                        1e-5)
+    scheduler = LinearWarmupScheduler(optimizer,
+                                      torch.optim.lr_scheduler.MultiStepLR(optimizer, [epochs // 3, epochs // 3 * 2]),
+                                      10,
+                                      5e-7)
     triplet_loss = WeightedRegularizedTriplet()
 
     if not os.path.exists(params.save_path):
@@ -390,7 +389,7 @@ def train_vision_model(ds_args,
 def params_parser():
     args = argparse.ArgumentParser()
     args.add_argument("--epochs_stage1", default=10, type=int)
-    args.add_argument("--epochs_stage2", type=int, default=10)
+    args.add_argument("--epochs_stage2", default=60, type=int)
     args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="ViT-B/16", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=1, type=int)
@@ -432,7 +431,7 @@ if __name__ == "__main__":
 
     model = model.cuda()
     loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
-                                    "vit" if "ViT" in params.model else "rn")
+                                           "vit" if "ViT" in params.model else "rn")
 
     train_prompter(model,
                    loader_train,
