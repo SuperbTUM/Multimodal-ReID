@@ -93,7 +93,7 @@ class MultiModalPromptLearner(nn.Module):
         super().__init__()
         n_ctx = 4
         n_cls_ctx = 4
-        ctx_init = "a photo of a X X X X person"
+        ctx_init = "A photo of a X X X X person."
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
 

@@ -232,7 +232,7 @@ class CustomCLIPIVLP(nn.Module):
 
 
 def train_prompter(model,
-                   dataloader,
+                   dataloader_train_val,
                    epochs,
                    pretrained=None):
     def train_batch_prompter(batch):
@@ -240,7 +240,7 @@ def train_prompter(model,
         image = image.cuda()
         label = label.cuda()
         text_features = model(image, label, get_texts=True)
-        image_features = image_features_list[indices]
+        image_features = image_features_list[indices_train]
         loss = loss_func(text_features, image_features, label, label) + \
                loss_func(image_features, text_features, label, label)
         return loss
@@ -253,7 +253,7 @@ def train_prompter(model,
         model.eval()
         index_list = []
         image_features_list = []
-        for images, target, cams, seqs, indices in dataloader:
+        for images, target, cams, seqs, indices in dataloader_train_val:
             images = images.cuda()
             target = target.cuda()
             if params.amp:
@@ -289,9 +289,10 @@ def train_prompter(model,
         os.mkdir(saving_path)
 
     for epoch in range(epochs):
-        iterator = tqdm(dataloader)
+        scheduler.step(epoch)
+        iterator = tqdm(dataloader_train_val)
         if params.amp:
-            for images, target, cams, seqs, indices in iterator:
+            for images, target, cams, seqs, indices_train in iterator:
                 batch = images, target
                 with autocast():
                     loss = train_batch_prompter(batch)
@@ -299,17 +300,16 @@ def train_prompter(model,
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+                iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
         else:
-            for images, target, cams, seqs, indices in iterator:
+            for images, target, cams, seqs, indices_train in iterator:
                 batch = images, target
                 loss = train_batch_prompter(batch)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+                iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
 
-        scheduler.step(epoch)
         if epoch % 5 == 0 or epoch == params.epochs_stage1 - 1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
@@ -365,17 +365,18 @@ def train_vision_model(model,
         load_pretrained_weights(model.vision_bottleneck_proj, pretrained)
 
     print("Turning off gradients in both the prompter and the text encoder")
+    base_lr = 5e-6
+    learnable_params = []
     for name, param in model.named_parameters():
-        if "image_encoder" not in name and "vision_classifier" not in name and "vision_bottleneck" not in name:
+        if "text_encoder" in name or "prompt_learner" in name:
             param.requires_grad_(False)
+        elif not param.requires_grad:
+            continue
         else:
             param.requires_grad_(True)
+            learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
 
-    optimizer = torch.optim.Adam(list(model.image_encoder.parameters()) + \
-                                 list(model.vision_classifier.parameters()) + \
-                                 list(model.vision_classifier_proj.parameters()) + \
-                                 list(model.vision_bottleneck.parameters()) + \
-                                 list(model.vision_bottleneck_proj.parameters()), lr=0.000005, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(learnable_params, lr=base_lr, weight_decay=1e-4)
     scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
     scaler = GradScaler()
     triplet_loss = WeightedRegularizedTriplet()
@@ -504,8 +505,8 @@ if __name__ == "__main__":
 
     model = model.cuda()
 
-    loader_train, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
-                                           "vit" if "ViT" in params.model else "rn")
+    _, loader_train_val, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
+                                           "vit" if "ViT" in params.model else "rn", True)
     loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
                                                        "vit" if "ViT" in params.model else "rn")
     if params.training_mode == "ivlp":
@@ -524,7 +525,7 @@ if __name__ == "__main__":
                                                                                                 params.test_dataset)
 
     train_prompter(model,
-                   loader_train,
+                   loader_train_val,
                    params.epochs_stage1)
     train_vision_model(model,
                        loader_train_sampled,

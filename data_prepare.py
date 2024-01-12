@@ -131,26 +131,39 @@ def get_loader_train_sampled(root, batch_size, image_height, image_width, model_
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
     num_pids = dataset.num_train_pids
     reid_dataset_train = reidDataset(dataset.train, transform_train)
-    custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 16)
+    custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 4)
     loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=False, sampler=custom_sampler, pin_memory=True)
     return loader_train, num_pids
 
 
-def get_loader_train(root, batch_size, image_height, image_width, model_type):
+def get_loader_train(root, batch_size, image_height, image_width, model_type, with_val_transform=False):
     transform_train = transforms.Compose([
         transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(),
         transforms.Pad((10, 5)),
         transforms.RandomCrop((image_height, image_width)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
+                             std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
         transforms.RandomErasing()
     ])
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
     num_pids = dataset.num_train_pids
     reid_dataset_train = reidDataset(dataset.train, transform_train)
     loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
-    return loader_train, num_pids
+
+    if with_val_transform:
+        transform_val = transforms.Compose([
+            transforms.Resize((image_height, image_width)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
+                                 std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225))
+        ])
+        reid_dataset_val = reidDataset(dataset.train, transform_val)
+        loader_val = DataLoader(reid_dataset_val, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
+        return loader_train, loader_val, num_pids
+    else:
+        return loader_train, num_pids
 
 
 def get_loader(root, batch_size, image_height, image_width, model_type, dataset_name="market1501"):
