@@ -23,7 +23,7 @@ def euclidean_dist(x, y):
     xx = torch.pow(x, 2).sum(1, keepdim=True).expand(m, n)
     yy = torch.pow(y, 2).sum(1, keepdim=True).expand(n, m).t()
     dist = xx + yy
-    dist.addmm_(x, y.t(), beta=1, alpha=-2)
+    dist = dist - 2 * torch.matmul(x, y.t())
     dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
     return dist
 
@@ -129,4 +129,37 @@ class SupConLoss(nn.Module):
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = - mean_log_prob_pos.mean()
 
+        return loss
+
+
+class CrossEntropyLabelSmooth(nn.Module):
+    """Cross entropy loss with label smoothing regularizer.
+
+    Reference:
+    Szegedy et al. Rethinking the Inception Architecture for Computer Vision. CVPR 2016.
+    Equation: y = (1 - epsilon) * y + epsilon / K.
+
+    Args:
+        num_classes (int): number of classes.
+        epsilon (float): weight.
+    """
+
+    def __init__(self, num_classes, epsilon=0.1, use_gpu=True):
+        super(CrossEntropyLabelSmooth, self).__init__()
+        self.num_classes = num_classes
+        self.epsilon = epsilon
+        self.use_gpu = use_gpu
+        self.logsoftmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: prediction matrix (before softmax) with shape (batch_size, num_classes)
+            targets: ground truth labels with shape (num_classes)
+        """
+        log_probs = self.logsoftmax(inputs)
+        targets = torch.zeros(log_probs.size()).scatter_(1, targets.unsqueeze(1).data.cpu(), 1)
+        if self.use_gpu: targets = targets.cuda()
+        targets = (1 - self.epsilon) * targets + self.epsilon / self.num_classes
+        loss = (- targets * log_probs).mean(0).sum()
         return loss

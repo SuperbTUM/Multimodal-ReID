@@ -16,7 +16,7 @@ from utils import load_pretrained_weights
 from data_prepare import get_loader_train, get_loader_train_sampled, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import WarmupMultiStepLR, create_scheduler
-from losses import SupConLoss, WeightedRegularizedTriplet
+from losses import SupConLoss, WeightedRegularizedTriplet, CrossEntropyLabelSmooth
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -98,7 +98,7 @@ class CustomCLIPCoop(nn.Module):
             logits = image_features @ text_features.t()
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
                                                                                         image_features_non_proj,
-                                                                                        image_features]
+                                                                                        image_features], image_features
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
@@ -163,7 +163,7 @@ class CustomCLIPCoCoop(nn.Module):
 
         if self.training:
             return texts, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
-                                                                                image_features_non_proj, image_features]
+                                                                                image_features_non_proj, image_features], image_features
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
@@ -223,7 +223,7 @@ class CustomCLIPIVLP(nn.Module):
 
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
                                                                                         image_features_non_proj,
-                                                                                        image_features]
+                                                                                        image_features], image_features
         else:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features_non_proj = image_features_non_proj[:, 0]
@@ -235,38 +235,57 @@ def train_prompter(model,
                    dataloader_train_val,
                    epochs,
                    pretrained=None):
-    def train_batch_prompter(batch):
-        image, label = batch[:2]
-        image = image.cuda()
-        label = label.cuda()
-        text_features = model(image, label, get_texts=True)
-        image_features = image_features_list[indices_train]
-        loss = loss_func(text_features, image_features, label, label) + \
-               loss_func(image_features, text_features, label, label)
-        return loss
+    # def train_batch_prompter(batch):
+    #     image, label = batch[:2]
+    #     image = image.cuda()
+    #     label = label.cuda()
+    #     text_features = model(image, label, get_texts=True)
+    #     image_features = image_features_list[indices_train]
+    #     loss_i2t = loss_func(image_features, text_features, label, label)
+    #     loss_t2i = loss_func(text_features, image_features, label, label)
+    #     loss = loss_i2t + loss_t2i
+
+    #     return loss
 
     print("Building custom CLIP")
     if params.amp:
         model = model.float()
 
+    # with torch.no_grad():
+    #     model.eval()
+    #     index_list = []
+    #     image_features_list = []
+    #     for images, target, cams, seqs, indices in dataloader_train_val:
+    #         images = images.cuda()
+    #         target = target.cuda()
+    #         if params.amp:
+    #             with autocast():
+    #                 image_features = model(images, target, get_image=True)
+    #         else:
+    #             image_features = model(images, target, get_image=True)
+    #         for image_feature, index in zip(image_features, indices):
+    #             image_features_list.append(image_feature.cpu())
+    #             index_list.append(index)
+    #     index_list = torch.stack(index_list, dim=0).cuda()
+    #     image_features_list = torch.stack(image_features_list, dim=0).cuda()
+    #     image_features_list = image_features_list[torch.argsort(index_list)]
+    labels = []
+    image_features = []
     with torch.no_grad():
-        model.eval()
-        index_list = []
-        image_features_list = []
-        for images, target, cams, seqs, indices in dataloader_train_val:
-            images = images.cuda()
-            target = target.cuda()
-            if params.amp:
-                with autocast():
-                    image_features = model(images, target, get_image=True)
-            else:
-                image_features = model(images, target, get_image=True)
-            for image_feature, index in zip(image_features, indices):
-                image_features_list.append(image_feature.cpu())
-                index_list.append(index)
-        index_list = torch.stack(index_list, dim=0).cuda()
-        image_features_list = torch.stack(image_features_list, dim=0).cuda()
-        image_features_list = image_features_list[torch.argsort(index_list)]
+        for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val):
+            img = img.cuda()
+            target = vid.cuda()
+            with autocast(enabled=True):
+                image_feature = model(img, target, get_image=True)
+                for i, img_feat in zip(target, image_feature):
+                    labels.append(i)
+                    image_features.append(img_feat.cpu())
+        labels_list = torch.stack(labels, dim=0).cuda()  # N
+        image_features_list = torch.stack(image_features, dim=0).cuda()
+
+        batch = params.bs
+        num_image = labels_list.shape[0]
+        i_ter = num_image // batch
 
     if pretrained is not None:
         load_pretrained_weights(model.prompt_learner, pretrained)
@@ -274,11 +293,6 @@ def train_prompter(model,
 
     print("Turning off gradients in both the image and the text encoder")
 
-    # optimizer = torch.optim.SGD(model.prompt_learner.parameters(), lr=0.001)
-    # scheduler = ConstantWarmupScheduler(optimizer,
-    #                                     torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs),
-    #                                     5,
-    #                                     1e-6)
     optimizer = torch.optim.Adam(model.prompt_learner.parameters(), lr=0.00035, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
     scaler = GradScaler()
@@ -288,30 +302,61 @@ def train_prompter(model,
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
-    for epoch in range(epochs):
+    # for epoch in range(1, epochs + 1):
+    #     scheduler.step(epoch)
+    #     iterator = tqdm(dataloader_train_val)
+    #     if params.amp:
+    #         for images, target, cams, seqs, indices_train in iterator:
+    #             batch = images, target
+    #             with autocast():
+    #                 loss = train_batch_prompter(batch)
+    #             optimizer.zero_grad()
+    #             scaler.scale(loss).backward()
+    #             scaler.step(optimizer)
+    #             scaler.update()
+    #             iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
+    #     else:
+    #         for images, target, cams, seqs, indices_train in iterator:
+    #             batch = images, target
+    #             loss = train_batch_prompter(batch)
+    #             optimizer.zero_grad()
+    #             loss.backward()
+    #             optimizer.step()
+    #             iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
+    for epoch in range(1, epochs + 1):
         scheduler.step(epoch)
-        iterator = tqdm(dataloader_train_val)
-        if params.amp:
-            for images, target, cams, seqs, indices_train in iterator:
-                batch = images, target
-                with autocast():
-                    loss = train_batch_prompter(batch)
-                optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
-        else:
-            for images, target, cams, seqs, indices_train in iterator:
-                batch = images, target
-                loss = train_batch_prompter(batch)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
+        model.train()
 
-        if epoch % 5 == 0 or epoch == params.epochs_stage1 - 1:
-            checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch)))
+        iter_list = torch.randperm(num_image).cuda()
+        for i in range(i_ter + 1):
+            optimizer.zero_grad()
+            if i != i_ter:
+                b_list = iter_list[i * batch:(i + 1) * batch]
+            else:
+                b_list = iter_list[i * batch:num_image]
+
+            target = labels_list[b_list]
+            image_features = image_features_list[b_list]
+            with autocast(enabled=True):
+                text_features = model(label=target, get_texts=True)
+            loss_i2t = loss_func(image_features, text_features, target, target)
+            loss_t2i = loss_func(text_features, image_features, target, target)
+
+            loss = loss_i2t + loss_t2i
+
+            scaler.scale(loss).backward()
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            torch.cuda.synchronize()
+            if (i + 1) % 100 == 0:
+                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
+                      .format(epoch, (i + 1), len(dataloader_train_val),
+                              loss, scheduler._get_lr(epoch)[0]))
+
+        if epoch % 5 == 0 or epoch == params.epochs_stage1:
+            checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
 
     model.eval()
@@ -325,19 +370,19 @@ def train_vision_model(model,
         image, label = batch[:2]
         image = image.cuda()
         label = label.cuda()
-        cls_scores, image_features_list = model(image, label)[3:]
+        cls_scores, image_features_list, image_features_proj = model(image, label)[3:]
         cls_score1, cls_score2 = cls_scores
         image_features_last, image_features_non_proj, image_features = image_features_list
 
-        loss = 0.25 * F.cross_entropy(cls_score1, label, label_smoothing=0.1) + \
-               0.25 * F.cross_entropy(cls_score2, label, label_smoothing=0.1)
+        loss = 0.25 * ce_loss(cls_score1, label) + \
+               0.25 * ce_loss(cls_score2, label)
         if params.training_mode != "cocoop":
-            output = image_features @ text_features.t()
-            loss += F.cross_entropy(output, label, label_smoothing=0.1)
+            output = image_features_proj @ text_features.t()
+            loss += ce_loss(output, label)
         if params.bs >= 4:
-            loss += triplet_loss(image_features_last.float(), label) + \
-                    triplet_loss(image_features_non_proj.float(), label) + \
-                    triplet_loss(image_features.float(), label)
+            loss += triplet_loss(image_features_last, label) + \
+                    triplet_loss(image_features_non_proj, label) + \
+                    triplet_loss(image_features, label)
         return loss
 
     print("Building custom CLIP")
@@ -374,12 +419,17 @@ def train_vision_model(model,
             continue
         else:
             param.requires_grad_(True)
-            learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
+            if "bias" in name:
+                lr = base_lr * 2
+                learnable_params += [{"params": [param], "lr": lr, "weight_decay": 1e-4}]
+            else:
+                learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=base_lr, weight_decay=1e-4)
     scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
     scaler = GradScaler()
     triplet_loss = WeightedRegularizedTriplet()
+    ce_loss = CrossEntropyLabelSmooth(n_cls)
 
     saving_path = os.path.join(params.save_path, params.training_mode)
     if not os.path.exists(saving_path):
@@ -387,6 +437,7 @@ def train_vision_model(model,
 
     for epoch in range(epochs):
         iterator = tqdm(dataloader)
+        scheduler.step()
         if params.amp:
             for images, target, cams, seqs, indices in iterator:
                 batch = images, target
@@ -406,7 +457,6 @@ def train_vision_model(model,
                 optimizer.step()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
-        scheduler.step()
         if epoch % 5 == 0 or epoch == params.epochs_stage2 - 1:
             checkpoint_path = "/".join((saving_path, "clip_model_weight_{}.pth".format(epoch)))
             torch.save(model.state_dict(), checkpoint_path)
