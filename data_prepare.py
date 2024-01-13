@@ -4,6 +4,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from timm.data.random_erasing import RandomErasing
 
 from datasets import dataset_market, dataset_dukemtmc
 
@@ -120,13 +121,13 @@ class reidDataset(Dataset):
 
 def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type):
     transform_train = transforms.Compose([
-        transforms.Resize((image_height, image_width)),
+        transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
-        transforms.Pad((10, 5)),
+        transforms.Pad(10),
         transforms.RandomCrop((image_height, image_width)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
-        transforms.RandomErasing()
+        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
     ])
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
     num_pids = dataset.num_train_pids
@@ -138,14 +139,14 @@ def get_loader_train_sampled(root, batch_size, image_height, image_width, model_
 
 def get_loader_train(root, batch_size, image_height, image_width, model_type, with_val_transform=False):
     transform_train = transforms.Compose([
-        transforms.Resize((image_height, image_width)),
+        transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
         transforms.Pad((10, 5)),
         transforms.RandomCrop((image_height, image_width)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
                              std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
-        transforms.RandomErasing()
+        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
     ])
     dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
     num_pids = dataset.num_train_pids
@@ -154,7 +155,7 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type, wi
 
     if with_val_transform:
         transform_val = transforms.Compose([
-            transforms.Resize((image_height, image_width)),
+            transforms.Resize((image_height, image_width), interpolation=3),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
                                  std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225))

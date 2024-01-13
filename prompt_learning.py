@@ -468,7 +468,8 @@ def test_prompter(model,
                   clip_weight,
                   loader_test):
     model.eval()
-    load_pretrained_weights(model, clip_weight)
+    if clip_weight is not None:
+        load_pretrained_weights(model, clip_weight)
 
     embeddings = []
     targets = []
@@ -583,13 +584,13 @@ if __name__ == "__main__":
     latest_model = "/".join((os.path.join(params.save_path, params.training_mode),
                              "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
-        test_prompter(model, latest_model, loader_gallery)
+        test_prompter(model, None, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \
-        test_prompter(model, latest_model, loader_query)
+        test_prompter(model, None, loader_query)
     embeddings_gallery_augmented, _, _, _ = \
-        test_prompter(model, latest_model, loader_gallery_augmented)
+        test_prompter(model, None, loader_gallery_augmented)
     embeddings_query_augmented, _, _, _ = \
-        test_prompter(model, latest_model, loader_query_augmented)
+        test_prompter(model, None, loader_query_augmented)
     embeddings_gallery = (embeddings_gallery + embeddings_gallery_augmented) / 2
     embeddings_query = (embeddings_query + embeddings_query_augmented) / 2
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

@@ -30,6 +30,6 @@ deepspeed prompt_learning_deepspeed.py --height 256 --amp
 
 **Cross-domain Evaluation**
 
-CoOp M->D Rank@1:65.3%, Rank@5:78.8%, Rank@10:82.9%, mAP:45.5%
+CoOp M->D Rank@1:67.8%, Rank@5:79.4%, Rank@10:83.0%, mAP:46.8%
 
-IVLP M->D Rank@1:67.4%, Rank@5:78.8%, Rank@10:83.0%, mAP:47.1%
+IVLP M->D Rank@1:70.0%, Rank@5:82.4%, Rank@10:85.6%, mAP:52.4%
