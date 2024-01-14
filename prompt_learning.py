@@ -21,10 +21,11 @@ from losses import SupConLoss, WeightedRegularizedTriplet, CrossEntropyLabelSmoo
 cudnn.enabled = True
 cudnn.deterministic = True
 
+from text_encoder import TextEncoder, TextEncoderAugmented
 from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
-from cocoop import build_model as build_model_cocoop, PromptLearner as PromptLearnerCoCoop, TextEncoder
+from cocoop import build_model as build_model_cocoop, PromptLearner as PromptLearnerCoCoop
 from maple import build_model as build_model_maple, VLPromptLearner
-import clip_maple
+import clip_custom
 
 
 def weights_init_classifier(m):
@@ -74,11 +75,17 @@ class CustomCLIPCoop(nn.Module):
             return text_features
 
         if get_image:
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            if params.amp:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+            else:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features = image_features[:, 0]
             return image_features
 
-        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+        if params.amp:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+        else:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
         image_features_last = image_features_last[:, 0]
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
@@ -127,11 +134,17 @@ class CustomCLIPCoCoop(nn.Module):
 
     def forward(self, image, label=None, get_image=False, get_texts=False):
         if get_image:
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            if params.amp:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+            else:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features = image_features[:, 0]
             return image_features
 
-        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+        if params.amp:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+        else:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
         image_features_last = image_features_last[:, 0]
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
@@ -199,7 +212,10 @@ class CustomCLIPIVLP(nn.Module):
             return text_features
 
         if get_image:
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            if params.amp:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+            else:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features = image_features[:, 0]
 
             return image_features
@@ -207,7 +223,10 @@ class CustomCLIPIVLP(nn.Module):
         if self.training:
             prompts = self.prompt_learner(label)
             text_features = self.text_encoder(prompts, tokenized_prompts)
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            if params.amp:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+            else:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features_last = image_features_last[:, 0]
             image_features_non_proj = image_features_non_proj[:, 0]
             image_features = image_features[:, 0]
@@ -225,7 +244,10 @@ class CustomCLIPIVLP(nn.Module):
                                                                                         image_features_non_proj,
                                                                                         image_features], image_features
         else:
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            if params.amp:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+            else:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features_non_proj = image_features_non_proj[:, 0]
             image_features = image_features[:, 0]
             return torch.cat((image_features_non_proj, image_features), dim=1)
@@ -386,8 +408,6 @@ def train_vision_model(model,
         return loss
 
     print("Building custom CLIP")
-    if params.amp:
-        model = model.float()
 
     if params.training_mode != "cocoop":
         with torch.no_grad():
@@ -479,8 +499,7 @@ def test_prompter(model,
     with torch.no_grad():
         for i, (images, target, cams, seqs, indices) in enumerate(tqdm(loader_test)):
             images = images.cuda()
-            with autocast():
-                image_features_merged = model(images)
+            image_features_merged = model(images)
 
             embeddings.append(image_features_merged)
             targets.append(target)
@@ -501,8 +520,8 @@ def get_cmc_map(
         gallery_cams,
         query_cams
 ):
-    gallery_embeddings = gallery_embeddings.cpu().float()
-    query_embeddings = query_embeddings.cpu().float()
+    gallery_embeddings = gallery_embeddings.cpu()
+    query_embeddings = query_embeddings.cpu()
     evaluator = R1_mAP_eval(len(query_labels), max_rank=50, feat_norm=True)
     evaluator.reset()
     evaluator.update((torch.cat((query_embeddings, gallery_embeddings), dim=0),
@@ -531,8 +550,8 @@ def params_parser():
 if __name__ == "__main__":
     params = params_parser()
     image_height, image_width = params.height, int(params.height * params.ratio)
-    url = clip_maple._MODELS[params.model]
-    model_path = clip_maple._download(url)
+    url = clip_custom._MODELS[params.model]
+    model_path = clip_custom._download(url)
     try:
         # loading JIT archive
         model = torch.jit.load(model_path, map_location="cpu").eval()

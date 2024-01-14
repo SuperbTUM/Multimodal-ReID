@@ -21,10 +21,11 @@ from schedulers import WarmupMultiStepLR, create_scheduler
 cudnn.enabled = True
 cudnn.deterministic = True
 
+from text_encoder import TextEncoder, TextEncoderAugmented
 from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
-from cocoop import build_model as build_model_cocoop, PromptLearner as PromptLearnerCoCoop, TextEncoder
+from cocoop import build_model as build_model_cocoop, PromptLearner as PromptLearnerCoCoop
 from maple import build_model as build_model_maple, MultiModalPromptLearner, TextEncoder as TextEncoderMaple
-import clip_maple
+import clip_custom
 
 
 def weights_init_classifier(m):
@@ -473,8 +474,8 @@ if __name__ == "__main__":
     loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
                                                        "vit" if "ViT" in params.model else "rn")
 
-    url = clip_maple._MODELS[params.model]
-    model_path = clip_maple._download(url)
+    url = clip_custom._MODELS[params.model]
+    model_path = clip_custom._download(url)
     try:
         # loading JIT archive
         model = torch.jit.load(model_path, map_location="cpu").eval()

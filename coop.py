@@ -9,6 +9,56 @@ import clip
 from clip.model import LayerNorm, Transformer, ModifiedResNet
 
 
+class PromptLearnerAugmented(nn.Module):
+    def __init__(self, num_class, clip_model):
+        super().__init__()
+        ctx_init = ["A photo of a X X X X person.",
+                    "A capture of a X X X X person.",
+                    "A video frame of a X X X X person.",
+                    "An example of a X X X X person."]
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()
+
+        dtype = clip_model.dtype
+        token_embedding = clip_model.token_embedding
+        ctx_dim = 512
+        # use given words to initialize context vectors
+        n_ctx = 4
+
+        with torch.no_grad():
+            embedding = token_embedding(tokenized_prompts).type(dtype)
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+        n_cls_ctx = 4
+        cls_vectors = torch.empty(num_class, n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(cls_vectors, std=0.02)
+        self.cls_ctx = nn.Parameter(cls_vectors)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
+        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + n_cls_ctx:, :])
+        self.num_class = num_class
+        self.n_cls_ctx = n_cls_ctx
+
+    def forward(self, label):
+        cls_ctx = self.cls_ctx[label].unsqueeze(1).expand(-1, 4, -1, -1)
+        b = label.shape[0]
+        prefix = self.token_prefix.unsqueeze(0).expand(b, -1, -1, -1)
+        suffix = self.token_suffix.unsqueeze(0).expand(b, -1, -1, -1)
+
+        prompts = torch.cat(
+            [
+                prefix,
+                cls_ctx,
+                suffix,
+            ],
+            dim=2,
+        )
+
+        return prompts
+
+
 class PromptLearner(nn.Module):
     def __init__(self, num_class, clip_model):
         super().__init__()
