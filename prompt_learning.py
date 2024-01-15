@@ -90,10 +90,10 @@ class CustomCLIPCoop(nn.Module):
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
 
-        image_features_non_proj = self.vision_bottleneck(image_features_non_proj)
-        cls_score = self.vision_classifier(image_features_non_proj.float())
-        image_features = self.vision_bottleneck_proj(image_features)
-        cls_score_proj = self.vision_classifier_proj(image_features.float())
+        features_non_proj = self.vision_bottleneck(image_features_non_proj)
+        cls_score = self.vision_classifier(features_non_proj.float())
+        features = self.vision_bottleneck_proj(image_features)
+        cls_score_proj = self.vision_classifier_proj(features.float())
 
         # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         if self.training:
@@ -149,10 +149,10 @@ class CustomCLIPCoCoop(nn.Module):
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
 
-        image_features_non_proj = self.vision_bottleneck(image_features_non_proj)
-        cls_score = self.vision_classifier(image_features_non_proj.float())
-        image_features = self.vision_bottleneck_proj(image_features)
-        cls_score_proj = self.vision_classifier_proj(image_features.float())
+        features_non_proj = self.vision_bottleneck(image_features_non_proj)
+        cls_score = self.vision_classifier(features_non_proj.float())
+        features = self.vision_bottleneck_proj(image_features)
+        cls_score_proj = self.vision_classifier_proj(features.float())
 
         # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         prompts = self.prompt_learner(image_features, label)

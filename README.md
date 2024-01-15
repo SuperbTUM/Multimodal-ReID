@@ -30,6 +30,8 @@ deepspeed prompt_learning_deepspeed.py --height 256 --bs 64 --epochs_stage1 120
 
 **Cross-domain Evaluation**
 
-CoOp M->D Rank@1:67.8%, Rank@5:79.4%, Rank@10:83.0%, mAP:46.8%
+CoOp M->D Rank@1:70.8%, Rank@5:82.1%, Rank@10:85.7%, mAP:51.9%
+
+CoOp w/. prompt augmentation M->D Rank@1:71.0%, Rank@5:82.3%, Rank@10:85.7%, mAP: 52.5%
 
 IVLP M->D Rank@1:70.0%, Rank@5:82.4%, Rank@10:85.6%, mAP:52.4%
