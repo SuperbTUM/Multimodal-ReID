@@ -352,7 +352,9 @@ def train_vision_model(model,
                        pretrained=None):
     print("Turning off gradients in both the prompter and the text encoder")
     for name, param in model.named_parameters():
-        if "text_encoder" in name or "prompt_learner" in name:
+        # if "text_encoder" in name or "prompt_learner" in name:
+        # experimental
+        if "prompt_learner" in name:
             param.requires_grad_(False)
         elif not param.requires_grad:
             continue
@@ -429,7 +431,7 @@ def train_vision_model(model,
         load_pretrained_weights(model.vision_bottleneck_proj, pretrained)
 
     # scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
-    triplet_loss = WeightedRegularizedTriplet()
+    triplet_loss = WeightedRegularizedTriplet(0.3)
 
     saving_path = os.path.join(params.save_path, params.training_mode)
     if not os.path.exists(saving_path):

@@ -433,7 +433,9 @@ def train_vision_model(model,
     base_lr = 5e-6
     learnable_params = []
     for name, param in model.named_parameters():
-        if "text_encoder" in name or "prompt_learner" in name:
+        # if "text_encoder" in name or "prompt_learner" in name:
+        # experimental
+        if "prompt_learner" in name:
             param.requires_grad_(False)
         elif not param.requires_grad:
             continue

@@ -119,7 +119,17 @@ class reidDataset(Dataset):
         return detailed_info
 
 
-def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type):
+def get_dataset(root, dataset_name):
+    if dataset_name == "market1501":
+        dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    elif dataset_name == "dukemtmc":
+        dataset = dataset_dukemtmc.DukeMTMCreID(root="/".join((root, "DukeMTMC-reID")))
+    else:
+        raise NotImplementedError
+    return dataset
+
+
+def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type, dataset_name="market1501"):
     transform_train = transforms.Compose([
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
@@ -129,7 +139,7 @@ def get_loader_train_sampled(root, batch_size, image_height, image_width, model_
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
         RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
     ])
-    dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    dataset = get_dataset(root, dataset_name)
     num_pids = dataset.num_train_pids
     reid_dataset_train = reidDataset(dataset.train, transform_train)
     custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 4)
@@ -137,7 +147,7 @@ def get_loader_train_sampled(root, batch_size, image_height, image_width, model_
     return loader_train, num_pids
 
 
-def get_loader_train(root, batch_size, image_height, image_width, model_type, with_val_transform=False):
+def get_loader_train(root, batch_size, image_height, image_width, model_type, with_val_transform=False, dataset_name="market1501"):
     transform_train = transforms.Compose([
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
@@ -148,7 +158,7 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type, wi
                              std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
         RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
     ])
-    dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
+    dataset = get_dataset(root, dataset_name)
     num_pids = dataset.num_train_pids
     reid_dataset_train = reidDataset(dataset.train, transform_train)
     loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
@@ -183,12 +193,7 @@ def get_loader(root, batch_size, image_height, image_width, model_type, dataset_
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
     ])
     preprocess_augmented = transform_test_augmented
-    if dataset_name == "market1501":
-        dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
-    elif dataset_name == "dukemtmc":
-        dataset = dataset_dukemtmc.DukeMTMCreID(root="/".join((root, "DukeMTMC-reID")))
-    else:
-        raise NotImplementedError
+    dataset = get_dataset(root, dataset_name)
     reid_dataset_gallery = reidDataset(dataset.gallery, preprocess)
     reid_dataset_query = reidDataset(dataset.query, preprocess)
     loader_gallery = DataLoader(reid_dataset_gallery, batch_size=batch_size, num_workers=4, shuffle=False,

@@ -35,3 +35,5 @@ CoOp M->D Rank@1:70.8%, Rank@5:82.1%, Rank@10:85.7%, mAP:51.9%
 CoOp w/. prompt augmentation M->D Rank@1:71.0%, Rank@5:82.3%, Rank@10:85.7%, mAP: 52.5%
 
 IVLP M->D Rank@1:70.0%, Rank@5:82.4%, Rank@10:85.6%, mAP:52.4%
+
+IVLP w/. text encoder unlocked M->D Rank@1:71.2%, Rank@5:82.5%, Rank@10:86.2%, mAP:52.9%
