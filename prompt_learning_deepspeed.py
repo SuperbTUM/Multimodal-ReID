@@ -306,7 +306,7 @@ def train_prompter(model,
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
     scaler = GradScaler()
 
-    saving_path = os.path.join(params.save_path, params.training_mode)
+    saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
 
     for epoch in range(1, epochs + 1):
         scheduler.step(epoch)
@@ -340,7 +340,7 @@ def train_prompter(model,
                       .format(epoch, (i + 1), len(dataloader),
                               loss, scheduler._get_lr(epoch)[0]))
 
-        if epoch % 5 == 0 or epoch == params.epochs_stage1:
+        if epoch % 10 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
     model.eval()
@@ -433,7 +433,7 @@ def train_vision_model(model,
     # scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
     triplet_loss = WeightedRegularizedTriplet(0.3)
 
-    saving_path = os.path.join(params.save_path, params.training_mode)
+    saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
@@ -447,7 +447,8 @@ def train_vision_model(model,
             iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
         ckpt_id = loss.item()
-        model.save_checkpoint(os.path.join(saving_path, "clip_model_weight.pth"), ckpt_id)
+        if epoch % 10 == 0 or epoch == params.epochs_stage2 - 1:
+            model.save_checkpoint(os.path.join(saving_path, "clip_model_weight.pth"), ckpt_id)
 
     model.eval()
 
@@ -464,6 +465,7 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--local_rank", default=0, type=int)
     args.add_argument("--training_mode", type=str, choices=["coop", "cocoop", "ivlp"])
+    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc"])
     return args.parse_args()
 
 
@@ -472,9 +474,9 @@ if __name__ == "__main__":
     image_height, image_width = params.height, int(params.height * params.ratio)
     _, loader_train_val, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
                                                   "vit" if "ViT" in params.model else "rn",
-                                                  True)
+                                                  True, params.train_dataset)
     loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                       "vit" if "ViT" in params.model else "rn")
+                                                       "vit" if "ViT" in params.model else "rn", params.train_dataset)
 
     url = clip_custom._MODELS[params.model]
     model_path = clip_custom._download(url)

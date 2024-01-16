@@ -167,7 +167,7 @@ if __name__ == "__main__":
                                                                                                 image_height,
                                                                                                 image_width,
                                                                                                 "vit" if "ViT" in params.model else "rn",
-                                                                                                params.dataset_test)
+                                                                                                params.test_dataset)
     if params.augmented_template:
         identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
     else:
