@@ -134,15 +134,10 @@ class CustomCLIPPromptSRC(nn.Module):
     def forward(self, image=None, label=None, get_image=False, get_texts=False):
         tokenized_prompts = self.tokenized_prompts
 
-        with torch.no_grad():
-            fixed_embeddings = self.prompt_learner.fixed_embeddings.cuda()
-            if not get_texts:
-                zero_shot_features = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))[-1].cuda()
-
         if get_texts:
             prompts = self.prompt_learner(label)
             text_features = self.text_encoder(prompts, tokenized_prompts)
-            return text_features, fixed_embeddings
+            return text_features
 
         if get_image:
             if params.amp:
@@ -154,6 +149,13 @@ class CustomCLIPPromptSRC(nn.Module):
             return image_features
 
         if self.training:
+
+            with torch.no_grad():
+                if params.amp:
+                    zero_shot_features = self.prompt_learner.ZS_image_encoder(image)[-1]
+                else:
+                    zero_shot_features = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))[-1]
+                zero_shot_features = zero_shot_features[:, 0]
 
             prompts = self.prompt_learner(label)
             text_features = self.text_encoder(prompts, tokenized_prompts)
@@ -173,9 +175,6 @@ class CustomCLIPPromptSRC(nn.Module):
             # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logits = image_features @ text_features.t()
-
-            if self.prompt_learner.training:
-                return text_features, fixed_embeddings
 
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
                                                                                         image_features_non_proj,
@@ -371,22 +370,12 @@ def train_prompter(model,
             target = labels_list[b_list]
             image_features = image_features_list[b_list]
 
-            if params.training_mode != "promptsrc":
-                with autocast(enabled=True):
-                    text_features = model(label=target, get_texts=True)
-                loss_i2t = loss_func(image_features, text_features, target, target)
-                loss_t2i = loss_func(text_features, image_features, target, target)
+            with autocast(enabled=True):
+                text_features = model(label=target, get_texts=True)
+            loss_i2t = loss_func(image_features, text_features, target, target)
+            loss_t2i = loss_func(text_features, image_features, target, target)
 
-                loss = loss_i2t + loss_t2i
-            else:
-                with autocast(enabled=True):
-                    text_features, fixed_embeddings = model(label=target, get_texts=True)
-                loss_i2t = loss_func(image_features, text_features, target, target)
-                loss_t2i = loss_func(text_features, image_features, target, target)
-                # there is a problem here, we can't have fixed embeddings
-                loss_scl_text = F.l1_loss(text_features, fixed_embeddings, reduction="mean")
-
-                loss = loss_i2t + loss_t2i + loss_scl_text
+            loss = loss_i2t + loss_t2i
 
             scaler.scale(loss).backward()
 
@@ -441,10 +430,7 @@ def train_vision_model(model,
         for i in range(n_cls):
             label = torch.tensor([i]).cuda()
             with autocast():
-                if params.training_mode == "promptsrc":
-                    text_features = model(label=label, get_texts=True)[0]
-                else:
-                    text_feature = model(label=label, get_texts=True)
+                text_feature = model(label=label, get_texts=True)
             text_features.append(text_feature)
         text_features = torch.stack(text_features, dim=0).squeeze().cuda()
 
