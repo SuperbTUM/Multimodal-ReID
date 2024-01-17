@@ -23,8 +23,7 @@ cudnn.deterministic = True
 
 from text_encoder import TextEncoder, TextEncoderAugmented
 from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
-from cocoop import build_model as build_model_cocoop, PromptLearner as PromptLearnerCoCoop
-from maple import build_model as build_model_maple, VLPromptLearner
+from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC
 import clip_custom
 
 
@@ -110,10 +109,10 @@ class CustomCLIPCoop(nn.Module):
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
-class CustomCLIPCoCoop(nn.Module):
-    def __init__(self, classnames, clip_model):
+class CustomCLIPPromptSRC(nn.Module):
+    def __init__(self, classnames, clip_model, zero_shot_model):
         super().__init__()
-        self.prompt_learner = PromptLearnerCoCoop(classnames, clip_model, params)
+        self.prompt_learner = VLPromptLearnerSRC(classnames, clip_model, zero_shot_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -132,52 +131,62 @@ class CustomCLIPCoCoop(nn.Module):
         self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
-    def forward(self, image, label=None, get_image=False, get_texts=False):
+    def forward(self, image=None, label=None, get_image=False, get_texts=False):
+        tokenized_prompts = self.tokenized_prompts
+
+        with torch.no_grad():
+            fixed_embeddings = self.prompt_learner.fixed_embeddings.cuda()
+            if not get_texts:
+                zero_shot_features = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))[-1].cuda()
+
+        if get_texts:
+            prompts = self.prompt_learner(label)
+            text_features = self.text_encoder(prompts, tokenized_prompts)
+            return text_features, fixed_embeddings
+
         if get_image:
             if params.amp:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
             else:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features = image_features[:, 0]
+
             return image_features
 
-        if params.amp:
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
-        else:
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
-        image_features_last = image_features_last[:, 0]
-        image_features_non_proj = image_features_non_proj[:, 0]
-        image_features = image_features[:, 0]
-
-        features_non_proj = self.vision_bottleneck(image_features_non_proj)
-        cls_score = self.vision_classifier(features_non_proj.float())
-        features = self.vision_bottleneck_proj(image_features)
-        cls_score_proj = self.vision_classifier_proj(features.float())
-
-        # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        prompts = self.prompt_learner(image_features, label)
-        tokenized_prompts = self.tokenized_prompts
-        logit_scale = self.logit_scale.exp()
-        logits = []
-        texts = []
-
-        for pts_i, imf_i in zip(prompts, image_features):
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
-            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
-            logits.append(l_i)
-            texts.append(text_features)
-
-        logits = torch.stack(logits)
-        texts = torch.stack(texts)
-
-        if get_texts:
-            return texts
-
         if self.training:
-            return texts, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
-                                                                                image_features_non_proj, image_features], image_features
+
+            prompts = self.prompt_learner(label)
+            text_features = self.text_encoder(prompts, tokenized_prompts)
+            if params.amp:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+            else:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            image_features_last = image_features_last[:, 0]
+            image_features_non_proj = image_features_non_proj[:, 0]
+            image_features = image_features[:, 0]
+
+            features_non_proj = self.vision_bottleneck(image_features_non_proj)
+            features = self.vision_bottleneck_proj(image_features)
+            cls_score = self.vision_classifier(features_non_proj.float())
+            cls_score_proj = self.vision_classifier_proj(features.float())
+
+            # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logits = image_features @ text_features.t()
+
+            if self.prompt_learner.training:
+                return text_features, fixed_embeddings
+
+            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
+                                                                                        image_features_non_proj,
+                                                                                        image_features], image_features, zero_shot_features
         else:
+            if params.amp:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
+            else:
+                image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
+            image_features_non_proj = image_features_non_proj[:, 0]
+            image_features = image_features[:, 0]
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
@@ -361,12 +370,23 @@ def train_prompter(model,
 
             target = labels_list[b_list]
             image_features = image_features_list[b_list]
-            with autocast(enabled=True):
-                text_features = model(label=target, get_texts=True)
-            loss_i2t = loss_func(image_features, text_features, target, target)
-            loss_t2i = loss_func(text_features, image_features, target, target)
 
-            loss = loss_i2t + loss_t2i
+            if params.training_mode != "promptsrc":
+                with autocast(enabled=True):
+                    text_features = model(label=target, get_texts=True)
+                loss_i2t = loss_func(image_features, text_features, target, target)
+                loss_t2i = loss_func(text_features, image_features, target, target)
+
+                loss = loss_i2t + loss_t2i
+            else:
+                with autocast(enabled=True):
+                    text_features, fixed_embeddings = model(label=target, get_texts=True)
+                loss_i2t = loss_func(image_features, text_features, target, target)
+                loss_t2i = loss_func(text_features, image_features, target, target)
+                # there is a problem here, we can't have fixed embeddings
+                loss_scl_text = F.l1_loss(text_features, fixed_embeddings, reduction="mean")
+
+                loss = loss_i2t + loss_t2i + loss_scl_text
 
             scaler.scale(loss).backward()
 
@@ -394,15 +414,19 @@ def train_vision_model(model,
         image, label = batch[:2]
         image = image.cuda()
         label = label.cuda()
-        cls_scores, image_features_list, image_features_proj = model(image, label)[3:]
+        loss = 0.
+        if params.training_mode == "promptsrc":
+            cls_scores, image_features_list, image_features_proj, zero_shot_features = model(image, label)[3:]
+            loss += F.l1_loss(image_features_proj, zero_shot_features, reduction="mean")
+        else:
+            cls_scores, image_features_list, image_features_proj = model(image, label)[3:]
         cls_score1, cls_score2 = cls_scores
         image_features_last, image_features_non_proj, image_features = image_features_list
 
-        loss = 0.25 * ce_loss(cls_score1, label) + \
+        loss += 0.25 * ce_loss(cls_score1, label) + \
                0.25 * ce_loss(cls_score2, label)
-        if params.training_mode != "cocoop":
-            output = image_features_proj @ text_features.t()
-            loss += ce_loss(output, label)
+        output = image_features_proj @ text_features.t()
+        loss += ce_loss(output, label)
         if params.bs >= 4:
             loss += triplet_loss(image_features_last, label) + \
                     triplet_loss(image_features_non_proj, label) + \
@@ -411,16 +435,18 @@ def train_vision_model(model,
 
     print("Building custom CLIP")
 
-    if params.training_mode != "cocoop":
-        with torch.no_grad():
-            model.eval()
-            text_features = []
-            for i in range(n_cls):
-                label = torch.tensor([i]).cuda()
-                with autocast():
+    with torch.no_grad():
+        model.eval()
+        text_features = []
+        for i in range(n_cls):
+            label = torch.tensor([i]).cuda()
+            with autocast():
+                if params.training_mode == "promptsrc":
+                    text_features = model(label=label, get_texts=True)[0]
+                else:
                     text_feature = model(label=label, get_texts=True)
-                text_features.append(text_feature)
-            text_features = torch.stack(text_features, dim=0).squeeze().cuda()
+            text_features.append(text_feature)
+        text_features = torch.stack(text_features, dim=0).squeeze().cuda()
 
     model.train()
 
@@ -546,7 +572,7 @@ def params_parser():
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
-    args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "cocoop", "ivlp"])
+    args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp"])
     args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc"])
     args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc"])
     return args.parse_args()
@@ -571,8 +597,19 @@ if __name__ == "__main__":
                           "vision_ctx": 4,
                           "language_ctx": 4}
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
-    elif params.training_mode == "cocoop":
-        model = build_model_cocoop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
+    elif params.training_mode == "promptsrc":
+        design_details_zero_shot = {"trainer": 'IVLP',
+                          "vision_depth": 0,
+                          "language_depth": 0,
+                          "vision_ctx": 0,
+                          "language_ctx": 0}
+        design_details = {"trainer": 'IVLP',
+                          "vision_depth": 12,
+                          "language_depth": 12,
+                          "vision_ctx": 4,
+                          "language_ctx": 4}
+        model_zero_shot = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot)
+        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
     elif params.training_mode == "coop":
         model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
     else:
@@ -586,8 +623,8 @@ if __name__ == "__main__":
                                                        "vit" if "ViT" in params.model else "rn", params.train_dataset)
     if params.training_mode == "ivlp":
         model = CustomCLIPIVLP(n_cls, model).cuda()
-    elif params.training_mode == "cocoop":
-        model = CustomCLIPCoCoop(n_cls, model).cuda()
+    elif params.training_mode == "promptsrc":
+        model = CustomCLIPPromptSRC(n_cls, model, model_zero_shot).cuda()
     elif params.training_mode == "coop":
         model = CustomCLIPCoop(n_cls, model).cuda()
     else:

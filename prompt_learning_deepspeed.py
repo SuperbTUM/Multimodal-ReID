@@ -23,8 +23,7 @@ cudnn.deterministic = True
 
 from text_encoder import TextEncoder, TextEncoderAugmented
 from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
-from cocoop import build_model as build_model_cocoop, PromptLearner as PromptLearnerCoCoop
-from maple import build_model as build_model_maple, MultiModalPromptLearner, TextEncoder as TextEncoderMaple
+from maple import build_model as build_model_maple, VLPromptLearner, TextEncoder as TextEncoderMaple
 import clip_custom
 
 
@@ -105,76 +104,10 @@ class CustomCLIPCoop(nn.Module):
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
-class CustomCLIPCoCoop(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        self.prompt_learner = PromptLearnerCoCoop(classnames, clip_model, params)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
-        self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
-
-        self.vision_bottleneck = nn.BatchNorm1d(768)
-        self.vision_bottleneck.bias.requires_grad_(False)
-        self.vision_bottleneck.apply(weights_init_kaiming)
-        self.vision_classifier = nn.Linear(768, classnames, bias=False)
-        self.vision_classifier.apply(weights_init_classifier)
-
-        self.vision_bottleneck_proj = nn.BatchNorm1d(512)
-        self.vision_bottleneck_proj.bias.requires_grad_(False)
-        self.vision_bottleneck_proj.apply(weights_init_kaiming)
-        self.vision_classifier_proj = nn.Linear(512, classnames, bias=False)
-        self.vision_classifier_proj.apply(weights_init_classifier)
-
-    def forward(self, image, label=None, get_image=False, get_texts=False):
-        if get_image:
-            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
-            image_features = image_features[:, 0]
-            return image_features
-
-        image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
-        image_features_last = image_features_last[:, 0]
-        image_features_non_proj = image_features_non_proj[:, 0]
-        image_features = image_features[:, 0]
-
-        image_features_non_proj = self.vision_bottleneck(image_features_non_proj)
-        cls_score = self.vision_classifier(image_features_non_proj.float())
-        image_features = self.vision_bottleneck_proj(image_features)
-        cls_score_proj = self.vision_classifier_proj(image_features.float())
-
-        # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        prompts = self.prompt_learner(image_features, label)
-        tokenized_prompts = self.tokenized_prompts
-        logit_scale = self.logit_scale.exp()
-        logits = []
-        texts = []
-
-        for pts_i, imf_i in zip(prompts, image_features):
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
-            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
-            logits.append(l_i)
-            texts.append(text_features)
-
-        logits = torch.stack(logits)
-        texts = torch.stack(texts)
-
-        if get_texts:
-            return texts
-
-        if self.training:
-            return texts, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
-                                                                                image_features_non_proj,
-                                                                                image_features], image_features
-        else:
-            return torch.cat((image_features_non_proj, image_features), dim=1)
-
-
 class CustomCLIPIVLP(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = MultiModalPromptLearner(classnames, clip_model)
+        self.prompt_learner = VLPromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoderMaple(clip_model)
@@ -464,7 +397,7 @@ def params_parser():
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--local_rank", default=0, type=int)
-    args.add_argument("--training_mode", type=str, choices=["coop", "cocoop", "ivlp"])
+    args.add_argument("--training_mode", type=str, choices=["coop", "ivlp"])
     args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc"])
     return args.parse_args()
 
@@ -494,9 +427,6 @@ if __name__ == "__main__":
                           "language_ctx": 4}
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
         model = CustomCLIPIVLP(n_cls, model).cuda()
-    elif params.training_mode == "cocoop":
-        model = build_model_cocoop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
-        model = CustomCLIPCoCoop(n_cls, model).cuda()
     elif params.training_mode == "coop":
         model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
         model = CustomCLIPCoop(n_cls, model).cuda()

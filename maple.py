@@ -88,49 +88,38 @@ class VLPromptLearner(nn.Module):
         return prompts
 
 
-class MultiModalPromptLearner(nn.Module):
-    def __init__(self, n_cls, clip_model):
+class VLPromptLearnerSRC(nn.Module):
+    def __init__(self, n_cls, clip_model, zero_shot_model):
         super().__init__()
+
         n_ctx = 4
         n_cls_ctx = 4
+        ctx_dim = 512
         ctx_init = "A photo of a X X X X person."
         dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-
-        self.compound_prompts_depth = 9  # max=12, but will create 11 such shared prompts
 
         # use given words to initialize context vectors
         ctx_init = ctx_init.replace("_", " ")
         n_ctx = n_ctx
         tokenized_prompts = clip.tokenize(ctx_init).cuda()
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
         ctx_vectors = torch.empty(n_cls, n_cls_ctx, ctx_dim, dtype=dtype)
         nn.init.normal_(ctx_vectors, std=0.02)
 
-        prompt_prefix = ctx_init
-
-        print('MaPLe design: Multi-modal Prompt Learning')
-        print(f'Initial context: "{prompt_prefix}"')
-        print(f"Number of MaPLe context words (tokens): {n_ctx}")
-        # These below, related to the shallow prompts
-        # Linear layer so that the tokens will project to 512 and will be initialized from 768
-        self.proj = nn.Linear(ctx_dim, 768)
-        self.proj.half()
         self.ctx = nn.Parameter(ctx_vectors)
-        # These below parameters related to the shared prompts
-        # Define the compound prompts for the deeper layers
 
-        # Minimum can be 1, which defaults to shallow MaPLe
-        # compound prompts
-        self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(n_ctx, 512))
-                                                       for _ in range(self.compound_prompts_depth - 1)])
-        for single_para in self.compound_prompts_text:
-            nn.init.normal_(single_para, std=0.02)
-        # Also make corresponding projection layers, for each prompt
-        single_layer = nn.Linear(ctx_dim, 768)
-        self.compound_prompt_projections = _get_clones(single_layer, self.compound_prompts_depth - 1)
+        # Also create frozen CLIP
+        clip_model_temp = zero_shot_model.float().cuda()
+        clip_model_temp_image = zero_shot_model
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            self.ZS_image_encoder = clip_model_temp_image.visual
+            # Now pre-compute the frozen VL embeddings
+            # Using multiple text templates to ensure textual diversity during training
+            text_features = clip_model_temp.encode_text(tokenized_prompts)
+            all_teacher_features = text_features
 
+        self.fixed_embeddings = all_teacher_features
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
         # those computed using the current class names
@@ -178,15 +167,7 @@ class MultiModalPromptLearner(nn.Module):
         suffix = self.token_suffix
         prompts = self.construct_prompts(ctx, prefix, suffix)
 
-        # Before returning, need to transform
-        # prompts to 768 for the visual side
-        visual_deep_prompts = []
-        for index, layer in enumerate(self.compound_prompt_projections):
-            visual_deep_prompts.append(layer(self.compound_prompts_text[index]))
-        # Now the other way around
-        # We will project the textual prompts from 512 to 768
-        return prompts, self.proj(
-            self.ctx[label]), self.compound_prompts_text, visual_deep_prompts  # pass here original, as for visual 768 is required
+        return prompts
 
 
 class TextEncoder(nn.Module):
