@@ -25,7 +25,7 @@ python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_
 ```
 Or
 ```bash
-deepspeed prompt_learning_deepspeed.py --height 256 --bs 64 --epochs_stage1 120
+deepspeed prompt_learning_deepspeed.py --height 256 --bs 64 --epochs_stage1 120 --training_mode ivlp
 ```
 
 **Cross-domain Evaluation**

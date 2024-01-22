@@ -406,14 +406,14 @@ def train_vision_model(model,
         loss = 0.
         if params.training_mode == "promptsrc":
             cls_scores, image_features_list, image_features_proj, zero_shot_features = model(image, label)[3:]
-            loss += F.l1_loss(image_features_proj, zero_shot_features, reduction="mean")
+            loss += F.smooth_l1_loss(image_features_proj, zero_shot_features, reduction="mean")
         else:
             cls_scores, image_features_list, image_features_proj = model(image, label)[3:]
         cls_score1, cls_score2 = cls_scores
         image_features_last, image_features_non_proj, image_features = image_features_list
 
         loss += 0.25 * ce_loss(cls_score1, label) + \
-               0.25 * ce_loss(cls_score2, label)
+                0.25 * ce_loss(cls_score2, label)
         output = image_features_proj @ text_features.t()
         loss += ce_loss(output, label)
         if params.bs >= 4:
@@ -432,7 +432,7 @@ def train_vision_model(model,
             with autocast():
                 text_feature = model(label=label, get_texts=True)
             text_features.append(text_feature)
-        text_features = torch.stack(text_features, dim=0).squeeze().cuda()
+        text_features = torch.cat(text_features, dim=0).cuda()
 
     model.train()
 

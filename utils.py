@@ -166,14 +166,14 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def model_adaptor(model, height, width, design_details=None, weights=None):
+def model_adaptor(model, height, width, weights=None, model_type="vit", training_mode="coop"):
     # if (height, width) != (224, 224):
     if weights is not None:
         try:
             weights = torch.jit.load(weights, map_location="cpu")
         except:
             weights = torch.load(weights)
-    if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer, maple.VisionTransformer, maple.VisionTransformer_MaPLe)):
+    if model_type == "vit":
         bottleneck_proj = BNNeck(model.visual.proj.size(1), True)
         bottleneck = BNNeck(model.visual.proj.size(0), False)
 
@@ -189,18 +189,19 @@ def model_adaptor(model, height, width, design_details=None, weights=None):
             h_resolution = height // vision_patch_size
             w_resolution = width // vision_patch_size
 
-            if isinstance(model.visual, (clip_model.VisionTransformer, custom_clip_model.VisionTransformer)):
+            if training_mode == "coop":
                 model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, 16,
                                                                    vision_width, vision_layers, vision_width // 64,
                                                                    embed_dim)
-            elif isinstance(model.visual, maple.VisionTransformer):
+            else:
+                design_details = {"trainer": 'IVLP',
+                                  "vision_depth": 12,
+                                  "language_depth": 12,
+                                  "vision_ctx": 4,
+                                  "language_ctx": 4}
                 model.visual = maple.VisionTransformer(h_resolution, w_resolution, vision_patch_size,
                                                        vision_width, vision_layers, vision_width // 64,
                                                        embed_dim, design_details)
-            else:
-                model.visual = maple.VisionTransformer_MaPLe(h_resolution, w_resolution, vision_patch_size,
-                                                             vision_width, vision_layers, vision_width // 64,
-                                                             embed_dim, design_details)
 
             pretrained_weight = weights["image_encoder.positional_embedding"].data
             if pretrained_weight.size() != model.visual.positional_embedding.size():

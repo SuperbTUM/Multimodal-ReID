@@ -155,6 +155,7 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--mm", action="store_true")
     args.add_argument("--clip_weights", type=str, default="Market1501_clipreid_ViT-B-16_60.pth")
+    args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "ivlp", "promptsrc"])
     args.add_argument("--test_dataset", type=str, choices=["market1501", "dukemtmc"], default="market1501")
     return args.parse_args()
 
@@ -173,7 +174,8 @@ if __name__ == "__main__":
     else:
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
     zeroshot_weights, model = load_model(model_name, identity_list, template_dict)
-    model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, None, params.clip_weights)
+    model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, params.clip_weights, "vit" if "ViT" in params.model else "rn",
+                                                       params.training_mode)
 
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = inference(model, bottleneck,
                                                                                         bottleneck_proj, zeroshot_weights,
