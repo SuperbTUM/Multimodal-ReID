@@ -94,13 +94,10 @@ class CustomCLIPCoop(nn.Module):
         features = self.vision_bottleneck_proj(image_features)
         cls_score_proj = self.vision_classifier_proj(features.float())
 
-        # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         if self.training:
             prompts = self.prompt_learner(label)
             tokenized_prompts = self.tokenized_prompts
-            logit_scale = self.logit_scale.exp()
             text_features = self.text_encoder(prompts, tokenized_prompts)
-            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logits = image_features @ text_features.t()
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
                                                                                         image_features_non_proj,
@@ -172,8 +169,6 @@ class CustomCLIPPromptSRC(nn.Module):
             cls_score = self.vision_classifier(features_non_proj.float())
             cls_score_proj = self.vision_classifier_proj(features.float())
 
-            # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logits = image_features @ text_features.t()
 
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
@@ -244,8 +239,6 @@ class CustomCLIPIVLP(nn.Module):
             cls_score = self.vision_classifier(features_non_proj.float())
             cls_score_proj = self.vision_classifier_proj(features.float())
 
-            # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logits = image_features @ text_features.t()
 
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
@@ -265,40 +258,11 @@ def train_prompter(model,
                    dataloader_train_val,
                    epochs,
                    pretrained=None):
-    # def train_batch_prompter(batch):
-    #     image, label = batch[:2]
-    #     image = image.cuda()
-    #     label = label.cuda()
-    #     text_features = model(image, label, get_texts=True)
-    #     image_features = image_features_list[indices_train]
-    #     loss_i2t = loss_func(image_features, text_features, label, label)
-    #     loss_t2i = loss_func(text_features, image_features, label, label)
-    #     loss = loss_i2t + loss_t2i
-
-    #     return loss
 
     print("Building custom CLIP")
     if params.amp:
         model = model.float()
 
-    # with torch.no_grad():
-    #     model.eval()
-    #     index_list = []
-    #     image_features_list = []
-    #     for images, target, cams, seqs, indices in dataloader_train_val:
-    #         images = images.cuda()
-    #         target = target.cuda()
-    #         if params.amp:
-    #             with autocast():
-    #                 image_features = model(images, target, get_image=True)
-    #         else:
-    #             image_features = model(images, target, get_image=True)
-    #         for image_feature, index in zip(image_features, indices):
-    #             image_features_list.append(image_feature.cpu())
-    #             index_list.append(index)
-    #     index_list = torch.stack(index_list, dim=0).cuda()
-    #     image_features_list = torch.stack(image_features_list, dim=0).cuda()
-    #     image_features_list = image_features_list[torch.argsort(index_list)]
     labels = []
     image_features = []
     with torch.no_grad():
@@ -322,8 +286,13 @@ def train_prompter(model,
     model.train()
 
     print("Turning off gradients in both the image and the text encoder")
+    learnable_params = [{"params": model.prompt_learner.parameters(), "lr": 0.00035, "weight_decay": 1e-4}]
+    if params.training_mode in ("ivlp", "promptsrc"):
+        for name, param in model.named_parameters():
+            if "VPT_shallow" in name:
+                learnable_params += [{"params": param, "lr": 0.00035, "weight_decay": 1e-4}]
 
-    optimizer = torch.optim.Adam(model.prompt_learner.parameters(), lr=0.00035, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(learnable_params, lr=0.00035, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
     scaler = GradScaler()
     loss_func = SupConLoss("cuda")
@@ -334,27 +303,6 @@ def train_prompter(model,
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
-    # for epoch in range(1, epochs + 1):
-    #     scheduler.step(epoch)
-    #     iterator = tqdm(dataloader_train_val)
-    #     if params.amp:
-    #         for images, target, cams, seqs, indices_train in iterator:
-    #             batch = images, target
-    #             with autocast():
-    #                 loss = train_batch_prompter(batch)
-    #             optimizer.zero_grad()
-    #             scaler.scale(loss).backward()
-    #             scaler.step(optimizer)
-    #             scaler.update()
-    #             iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
-    #     else:
-    #         for images, target, cams, seqs, indices_train in iterator:
-    #             batch = images, target
-    #             loss = train_batch_prompter(batch)
-    #             optimizer.zero_grad()
-    #             loss.backward()
-    #             optimizer.step()
-    #             iterator.set_description("epoch: {}, lr: {}, loss: {}".format(epoch, scheduler._get_lr(epoch)[0], loss))
     for epoch in range(1, epochs + 1):
         scheduler.step(epoch)
         model.train()
@@ -450,6 +398,8 @@ def train_vision_model(model,
         # if "text_encoder" in name or "prompt_learner" in name:
         # experimental
         if "prompt_learner" in name:
+            param.requires_grad_(False)
+        elif "VPT_shallow" in name:
             param.requires_grad_(False)
         elif not param.requires_grad:
             continue
