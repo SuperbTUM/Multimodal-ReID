@@ -2,3 +2,4 @@ git+https://github.com/openai/CLIP.git
 deepspeed
 mpi4py
 timm
+beautifulsoup4

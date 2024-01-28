@@ -509,6 +509,7 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp"])
+    args.add_argument("--vpt_ctx", type=int, default=4)
     args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc"])
     args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc"])
     return args.parse_args()
@@ -530,8 +531,8 @@ if __name__ == "__main__":
         design_details = {"trainer": 'IVLP',
                           "vision_depth": 12,
                           "language_depth": 12,
-                          "vision_ctx": 4,
-                          "language_ctx": 4}
+                          "vision_ctx": params.vpt_ctx,
+                          "language_ctx": params.vpt_ctx}
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
     elif params.training_mode == "promptsrc":
         design_details_zero_shot = {"trainer": 'IVLP',
@@ -542,8 +543,8 @@ if __name__ == "__main__":
         design_details = {"trainer": 'IVLP',
                           "vision_depth": 12,
                           "language_depth": 12,
-                          "vision_ctx": 4,
-                          "language_ctx": 4}
+                          "vision_ctx": params.vpt_ctx,
+                          "language_ctx": params.vpt_ctx}
         model_zero_shot = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot)
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
     elif params.training_mode == "coop":
