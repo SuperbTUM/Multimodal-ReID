@@ -24,7 +24,7 @@ class VLPromptLearner(nn.Module):
 
         n_ctx = 4
         n_cls_ctx = 4
-        ctx_init = "A photo of X X X X person."
+        ctx_init = "A photo of X X X X X person."
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
 
@@ -40,7 +40,7 @@ class VLPromptLearner(nn.Module):
 
         print(f"Independent V-L design")
         print(f'Initial text context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
+        print(f"Number of context words (tokens) for Language prompting: {n_cls_ctx}")
         self.ctx = nn.Parameter(ctx_vectors)
 
         # These token vectors will be saved when in save_model(),

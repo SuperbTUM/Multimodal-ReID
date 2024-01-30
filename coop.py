@@ -62,7 +62,7 @@ class PromptLearnerAugmented(nn.Module):
 class PromptLearner(nn.Module):
     def __init__(self, num_class, clip_model):
         super().__init__()
-        ctx_init = "A photo of a X X X X person."
+        ctx_init = "A photo of X X X X X person."
 
         dtype = clip_model.dtype
         token_embedding = clip_model.token_embedding
