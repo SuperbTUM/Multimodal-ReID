@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from timm.data.random_erasing import RandomErasing
 
-from datasets import dataset_market, dataset_dukemtmc
+from datasets import dataset_market, dataset_dukemtmc, dataset_msmt17
 
 
 import copy
@@ -76,33 +76,10 @@ class RandomIdentitySampler_(torch.utils.data.sampler.Sampler):
         return self.length
 
 
-class ToSquare:
-    def __init__(self):
-        pass
-
-    def __call__(self, pil_img, background_color=(0, 0, 0)):
-        return self.expand2square(pil_img, background_color)
-
-    @staticmethod
-    def expand2square(pil_img, background_color=(0, 0, 0)):
-        width, height = pil_img.size
-        if width == height:
-            return pil_img
-        elif width > height:
-            result = Image.new(pil_img.mode, (width, width), background_color)
-            result.paste(pil_img, (0, (width - height) // 2))
-            return result
-        else:
-            result = Image.new(pil_img.mode, (height, height), background_color)
-            result.paste(pil_img, ((height - width) // 2, 0))
-            return result
-
-
 class reidDataset(Dataset):
     def __init__(self, images, transform=None):
         self.images = images
         self.transform = transform
-        self.to_square = ToSquare()
 
     def __len__(self):
         return len(self.images)
@@ -124,6 +101,8 @@ def get_dataset(root, dataset_name):
         dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
     elif dataset_name == "dukemtmc":
         dataset = dataset_dukemtmc.DukeMTMCreID(root="/".join((root, "DukeMTMC-reID")))
+    elif dataset_name == "msmt17":
+        dataset = dataset_msmt17.MSMT17(root=root)
     else:
         raise NotImplementedError
     return dataset

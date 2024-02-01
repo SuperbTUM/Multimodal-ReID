@@ -20,14 +20,14 @@ class MSMT17(BaseImageDataset):
     # images: 32621 (train) + 11659 (query) + 82161 (gallery)
     # cameras: 15
     """
-    dataset_dir = 'MSMT17'
+    dataset_dir = 'MSMT17_V2'
 
     def __init__(self, root='', verbose=True, pid_begin=0, **kwargs):
         super(MSMT17, self).__init__()
         self.pid_begin = pid_begin
         self.dataset_dir = osp.join(root, self.dataset_dir)
-        self.train_dir = osp.join(self.dataset_dir, 'train')
-        self.test_dir = osp.join(self.dataset_dir, 'test')
+        self.train_dir = osp.join(self.dataset_dir, 'mask_train_v2')
+        self.test_dir = osp.join(self.dataset_dir, 'mask_test_v2')
         self.list_train_path = osp.join(self.dataset_dir, 'list_train.txt')
         self.list_val_path = osp.join(self.dataset_dir, 'list_val.txt')
         self.list_query_path = osp.join(self.dataset_dir, 'list_query.txt')
@@ -74,7 +74,6 @@ class MSMT17(BaseImageDataset):
             dataset.append((img_path, self.pid_begin+pid, camid-1, 0, img_idx))
             pid_container.add(pid)
             cam_container.add(camid)
-        print(cam_container, 'cam_container')
         # check if pid starts from 0 and increments with 1
         for idx, pid in enumerate(pid_container):
             assert idx == pid, "See code comment for explanation"

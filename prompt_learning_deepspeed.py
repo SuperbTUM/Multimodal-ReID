@@ -399,7 +399,7 @@ def params_parser():
     args.add_argument("--local_rank", default=0, type=int)
     args.add_argument("--training_mode", type=str, choices=["coop", "ivlp"])
     args.add_argument("--vpt_ctx", type=int, default=4)
-    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc"])
+    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17"])
     return args.parse_args()
 
 

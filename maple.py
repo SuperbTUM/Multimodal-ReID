@@ -95,7 +95,7 @@ class VLPromptLearnerSRC(nn.Module):
         n_ctx = 4
         n_cls_ctx = 4
         ctx_dim = 512
-        ctx_init = "A photo of a X X X X person."
+        ctx_init = "A photo of X X X X X person."
         dtype = clip_model.dtype
 
         # use given words to initialize context vectors

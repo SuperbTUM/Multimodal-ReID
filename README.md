@@ -19,7 +19,7 @@ thanks for the contribution of CLIP-ReID:
 python3 zero_shot_learning.py --model ViT-B/16 --augmented_template --height 256
 ```
 
-Train with Prompt Engineering
+Training Examples with Prompt Engineering
 ```bash
 python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --test_dataset dukemtmc --vpt_ctx 6
 python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --train_dataset dukemtmc --test_dataset market1501 --vpt_ctx 2
@@ -33,14 +33,14 @@ deepspeed prompt_learning_deepspeed.py --height 256 --bs 64 --epochs_stage1 120 
 
 Experimental logs [Only visible to myself atm](https://docs.google.com/document/d/1wBPoy53pGGp1bkmO97LpaA_eDzA4s0OPX8hgvXit8E4/edit?usp=sharing)
 
+Abbreviations: M: Market1501; D: DukeMTMC, MS: MSMT17_V2
+
 M->D
 
 | Method                         | Acc@1 | Acc@5 | Acc@10 | mAP   |
 |--------------------------------|-------|-------|--------|-------|
 | CoOp                           | 69.9% | 81.5% | 85.4%  | 51.2% |
-| CoOp w/. prompt augmentation   | 71.0% | 82.3% | 85.7%  | 52.5% |
-| IVLP                           | 70.0% | 82.4% | 85.6%  | 52.4% |
-| IVLP w/. text encoder unlocked | 71.2% | 82.5% | 86.2%  | 52.9% |
+| IVLP w/. text encoder unlocked | 70.2% | 82.1% | 85.6%  | 52.0% |
 
 
 D->M
@@ -48,4 +48,12 @@ D->M
 | Method                         | Acc@1 | Acc@5 | Acc@10 | mAP   |
 |--------------------------------|-------|-------|--------|-------|
 | CoOp                           | 71.4% | 84.7% | 89.2%  | 44.6% |
-| IVLP w/. text encoder unlocked | 73.1% | 85.6% | 89.9%  | 45.6% |
+| IVLP w/. text encoder unlocked | 73.0% | 85.7% | 89.8%  | 46.0% |
+
+
+MS->M
+
+| Method                         | Acc@1 | Acc@5 | Acc@10 | mAP   |
+|--------------------------------|-------|-------|--------|-------|
+| CoOp w/. tricks                | 74.2% | 86.6% | 91.0%  | 49.3% |
+| IVLP w/. text encoder unlocked | 74.2% | 87.3% | 91.1%  | 49.9% |

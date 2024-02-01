@@ -299,7 +299,10 @@ def train_prompter(model,
 
     if not os.path.exists(params.save_path):
         os.mkdir(params.save_path)
-    saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
+    base_saving_path = os.path.join(params.save_path, params.training_mode)
+    if not os.path.exists(base_saving_path):
+        os.mkdir(base_saving_path)
+    saving_path = os.path.join(base_saving_path, params.train_dataset)
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
@@ -510,8 +513,8 @@ def params_parser():
     args.add_argument("--amp", action="store_true")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp"])
     args.add_argument("--vpt_ctx", type=int, default=4)
-    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc"])
-    args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc"])
+    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17"])
+    args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17"])
     return args.parse_args()
 
 

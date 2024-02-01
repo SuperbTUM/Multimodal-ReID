@@ -13,9 +13,9 @@ class PromptLearnerAugmented(nn.Module):
     def __init__(self, num_class, clip_model):
         super().__init__()
         ctx_init = ["A photo of a X X X X person.",
-                    "A capture of a X X X X person.",
-                    "A video frame of a X X X X person.",
-                    "An example of a X X X X person."]
+                    "A photo of an X X X X person.",
+                    "A photo of the X X X X person.",
+                    "A photo of one X X X X person."]
         tokenized_prompts = clip.tokenize(ctx_init).cuda()
 
         dtype = clip_model.dtype
