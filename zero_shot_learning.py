@@ -156,7 +156,7 @@ def params_parser():
     args.add_argument("--mm", action="store_true")
     args.add_argument("--clip_weights", type=str, default="Market1501_clipreid_ViT-B-16_60.pth")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "ivlp", "promptsrc"])
-    args.add_argument("--test_dataset", type=str, choices=["market1501", "dukemtmc"], default="market1501")
+    args.add_argument("--test_dataset", type=str, choices=["market1501", "dukemtmc", "msmt17", "veri"], default="market1501")
     return args.parse_args()
 
 

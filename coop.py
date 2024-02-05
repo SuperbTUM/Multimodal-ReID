@@ -60,9 +60,12 @@ class PromptLearnerAugmented(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, num_class, clip_model):
+    def __init__(self, num_class, clip_model, dataset_name):
         super().__init__()
-        ctx_init = "A photo of X X X X X person."
+        if dataset_name in ("market1501", "dukemtmc", "msmt17"):
+            ctx_init = "A photo of X X X X X person."
+        else:
+            ctx_init = "A photo of X X X X X vehicle."
 
         dtype = clip_model.dtype
         token_embedding = clip_model.token_embedding
@@ -94,6 +97,57 @@ class PromptLearner(nn.Module):
         b = label.shape[0]
         prefix = self.token_prefix.expand(b, -1, -1)
         suffix = self.token_suffix.expand(b, -1, -1)
+
+        prompts = torch.cat(
+            [
+                prefix,  # (n_cls, 1, dim)
+                cls_ctx,  # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+
+class PromptLearnerVeri(nn.Module):
+    def __init__(self, num_class, clip_model, car_types):
+        super().__init__()
+        ctx_inits = []
+        for car_type in car_types:
+            ctx_init = "A photo of X X X X X {}, a type of vehicle.".format(car_type)
+            ctx_init = ctx_init.replace("_", " ")
+            ctx_inits.append(ctx_init)
+
+        tokenized_prompts = torch.cat([clip.tokenize(ctx_init) for ctx_init in ctx_inits]).cuda()
+
+        dtype = clip_model.dtype
+        token_embedding = clip_model.token_embedding
+        ctx_dim = 512
+        # use given words to initialize context vectors
+        n_ctx = 4
+
+        with torch.no_grad():
+            embedding = token_embedding(tokenized_prompts).type(dtype)
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+        n_cls_ctx = 4
+        cls_vectors = torch.empty(num_class, n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(cls_vectors, std=0.02)
+        self.cls_ctx = nn.Parameter(cls_vectors)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
+        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + n_cls_ctx:, :])
+        self.num_class = num_class
+        self.n_cls_ctx = n_cls_ctx
+
+    def forward(self, label):
+        cls_ctx = self.cls_ctx[label]
+        prefix = self.token_prefix[label]
+        suffix = self.token_suffix[label]
 
         prompts = torch.cat(
             [

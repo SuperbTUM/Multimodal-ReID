@@ -22,7 +22,7 @@ cudnn.enabled = True
 cudnn.deterministic = True
 
 from text_encoder import TextEncoder, TextEncoderAugmented
-from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
+from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop, PromptLearnerVeri as PromptLearnerCoopVeri
 from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC
 import clip_custom
 
@@ -46,7 +46,10 @@ def weights_init_kaiming(m):
 class CustomCLIPCoop(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = PromptLearnerCoop(classnames, clip_model)
+        if params.train_dataset == "veri":
+            self.prompt_learner = PromptLearnerCoopVeri(classnames, clip_model, car_types_train)
+        else:
+            self.prompt_learner = PromptLearnerCoop(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -68,7 +71,10 @@ class CustomCLIPCoop(nn.Module):
     def forward(self, image=None, label=None, get_image=False, get_texts=False):
         if get_texts:
             prompts = self.prompt_learner(label)
-            tokenized_prompts = self.tokenized_prompts
+            if params.train_dataset == "veri":
+                tokenized_prompts = self.tokenized_prompts[label]
+            else:
+                tokenized_prompts = self.tokenized_prompts
 
             text_features = self.text_encoder(prompts, tokenized_prompts)
             return text_features
@@ -96,7 +102,10 @@ class CustomCLIPCoop(nn.Module):
 
         if self.training:
             prompts = self.prompt_learner(label)
-            tokenized_prompts = self.tokenized_prompts
+            if params.train_dataset == "veri":
+                tokenized_prompts = self.tokenized_prompts[label]
+            else:
+                tokenized_prompts = self.tokenized_prompts
             text_features = self.text_encoder(prompts, tokenized_prompts)
             logits = image_features @ text_features.t()
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
@@ -339,7 +348,7 @@ def train_prompter(model,
                       .format(epoch, (i + 1), len(dataloader_train_val),
                               loss, scheduler._get_lr(epoch)[0]))
 
-        if epoch % 10 == 0 or epoch == params.epochs_stage1:
+        if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
 
@@ -513,8 +522,8 @@ def params_parser():
     args.add_argument("--amp", action="store_true")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp"])
     args.add_argument("--vpt_ctx", type=int, default=4)
-    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17"])
-    args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17"])
+    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17", "veri"])
+    args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17", "veri"])
     return args.parse_args()
 
 
@@ -557,7 +566,7 @@ if __name__ == "__main__":
 
     model = model.cuda()
 
-    _, loader_train_val, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
+    _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
                                            "vit" if "ViT" in params.model else "rn", True, params.train_dataset)
     loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
                                                        "vit" if "ViT" in params.model else "rn", params.train_dataset)

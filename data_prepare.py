@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from timm.data.random_erasing import RandomErasing
 
-from datasets import dataset_market, dataset_dukemtmc, dataset_msmt17
+from datasets import dataset_market, dataset_dukemtmc, dataset_msmt17, dataset_veri
 
 
 import copy
@@ -103,6 +103,8 @@ def get_dataset(root, dataset_name):
         dataset = dataset_dukemtmc.DukeMTMCreID(root="/".join((root, "DukeMTMC-reID")))
     elif dataset_name == "msmt17":
         dataset = dataset_msmt17.MSMT17(root=root)
+    elif dataset_name == "veri":
+        dataset = dataset_veri.VeRi(root=root)
     else:
         raise NotImplementedError
     return dataset
@@ -139,6 +141,10 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type, wi
     ])
     dataset = get_dataset(root, dataset_name)
     num_pids = dataset.num_train_pids
+    if dataset_name == "veri":
+        car_types_train = dataset.get_car_types_train()
+    else:
+        car_types_train = None
     reid_dataset_train = reidDataset(dataset.train, transform_train)
     loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
 
@@ -151,9 +157,9 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type, wi
         ])
         reid_dataset_val = reidDataset(dataset.train, transform_val)
         loader_val = DataLoader(reid_dataset_val, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
-        return loader_train, loader_val, num_pids
+        return loader_train, loader_val, num_pids, car_types_train
     else:
-        return loader_train, num_pids
+        return loader_train, num_pids, car_types_train
 
 
 def get_loader(root, batch_size, image_height, image_width, model_type, dataset_name="market1501"):

@@ -31,7 +31,7 @@ class VeRi(BaseImageDataset):
 
         self._check_before_run()
 
-        path_train = 'datasets/keypoint_train.txt'
+        path_train = osp.join(self.dataset_dir, 'keypoint_train.txt')
         with open(path_train, 'r') as txt:
             lines = txt.readlines()
         self.image_map_view_train = {}
@@ -40,7 +40,7 @@ class VeRi(BaseImageDataset):
             viewid = int(content[-1])
             self.image_map_view_train[osp.basename(content[0])] = viewid
 
-        path_test = 'datasets/keypoint_test.txt'
+        path_test = osp.join(self.dataset_dir, 'keypoint_test.txt')
         with open(path_test, 'r') as txt:
             lines = txt.readlines()
         self.image_map_view_test = {}
@@ -70,6 +70,14 @@ class VeRi(BaseImageDataset):
             vehicle_id = item.get("imageName")
             type_id = item.get("typeID")
             self.image_car_types_test[vehicle_id] = type_id
+
+        path_type_mapping = osp.join(self.dataset_dir, "list_type.txt")
+        with open(path_type_mapping, "r") as txt:
+            lines = txt.readlines()
+        self.type_mapping = {}
+        for type_info in lines:
+            content = type_info.split(' ')
+            self.type_mapping[content[0]] = content[1].rstrip("\n")
 
         train = self._process_dir(self.train_dir, relabel=True)
         query = self._process_dir(self.query_dir, relabel=False)
@@ -115,7 +123,7 @@ class VeRi(BaseImageDataset):
         view_container = set()
         dataset = []
         count = 0
-        for img_path in img_paths:
+        for idx, img_path in enumerate(img_paths):
             pid, camid = map(int, pattern.search(img_path).groups())
             if pid == -1: continue  # junk images are just ignored
             assert 0 <= pid <= 776  # pid == 0 means background
@@ -133,6 +141,29 @@ class VeRi(BaseImageDataset):
             else:
                 viewid = self.image_map_view_train[osp.basename(img_path)]
 
+            view_container.add(viewid)
+            dataset.append((img_path, pid, camid, viewid, idx))
+        print(count, 'samples without viewpoint annotations')
+        return dataset
+
+    def get_car_types_train(self):
+        img_paths = glob.glob(osp.join(self.train_dir, '*.jpg'))
+        pattern = re.compile(r'([-\d]+)_c(\d+)')
+
+        pid_container = set()
+        for img_path in img_paths:
+            pid, _ = map(int, pattern.search(img_path).groups())
+            if pid == -1: continue  # junk images are just ignored
+            pid_container.add(pid)
+        pid2label = {pid: label for label, pid in enumerate(pid_container)}
+        type_container = ["" for _ in range(len(pid_container))]
+        count = 0
+        for img_path in img_paths:
+            pid, _ = map(int, pattern.search(img_path).groups())
+            if pid == -1: continue  # junk images are just ignored
+            assert 0 <= pid <= 776  # pid == 0 means background
+
+            pid = pid2label[pid]
             if osp.basename(img_path) not in self.image_car_types_train.keys():
                 try:
                     typeid = self.image_car_types_test[osp.basename(img_path)]
@@ -142,8 +173,6 @@ class VeRi(BaseImageDataset):
                     continue
             else:
                 typeid = self.image_car_types_train[osp.basename(img_path)]
-            view_container.add(viewid)
-            dataset.append((img_path, pid, camid, viewid, typeid))
-        print(view_container, 'view_container')
-        print(count, 'samples without viewpoint annotations')
-        return dataset
+            if not type_container[pid]:
+                type_container[pid] = self.type_mapping[typeid]
+        return type_container
