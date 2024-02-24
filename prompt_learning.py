@@ -22,7 +22,7 @@ cudnn.enabled = True
 cudnn.deterministic = True
 
 from text_encoder import TextEncoder, TextEncoderAugmented
-from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
+from coop import build_model as build_model_coop, PromptLearnerMLM as PromptLearnerCoop
 from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC
 import clip_custom
 

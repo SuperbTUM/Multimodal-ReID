@@ -1,4 +1,5 @@
 import math
+import random
 import numpy as np
 from typing import Union, Tuple
 import torch
@@ -54,6 +55,83 @@ class PromptLearnerAugmented(nn.Module):
                 suffix,
             ],
             dim=2,
+        )
+
+        return prompts
+
+
+class PromptLearnerMLM(nn.Module):
+    def __init__(self, num_class, clip_model, dataset_name="market1501"):
+        super().__init__()
+        self.num_class = num_class
+        if dataset_name in ("market1501", "dukemtmc", "msmt17"):
+            ctx_init = "A photo of X X X X X person."
+        else:
+            ctx_init = "A photo of a X X X X vehicle."
+        ctx_init = ctx_init.replace("_", " ")
+        self.tokenized_prompts = clip.tokenize(ctx_init).cuda()
+        self.masked_token = clip.tokenize("X")[0, 1].cuda()
+        dtype = clip_model.dtype
+        token_embedding = clip_model.token_embedding
+        self.dtype = dtype
+        self.token_embedding = token_embedding
+
+        self.n_cls_ctx = 4
+        ctx_dim = 512
+        cls_vectors = torch.empty(self.num_class, self.n_cls_ctx, ctx_dim, dtype=self.dtype)
+        # cls_vectors = torch.empty(num_class, len(ctx_init), n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(cls_vectors, std=0.02)
+        self.cls_ctx = nn.Parameter(cls_vectors)
+
+        self.real_length_tokenized_prompts = 0
+        for token in self.tokenized_prompts[0]:
+            if token.item() != 0:
+                self.real_length_tokenized_prompts += 1
+
+        self.dataset_name = dataset_name
+
+    def get_mlm_prompts(self):
+        # use given words to initialize context vectors
+        n_ctx = 4
+
+        for i in range(1, self.real_length_tokenized_prompts - 1):
+            prob = random.random()
+            if prob < 0.15:
+                prob /= 0.15
+
+                if self.dataset_name == 'market1501':
+                    if prob < 0.8:
+                        self.tokenized_prompts[0, i] = self.masked_token
+                else:
+                    # 80% randomly change token to mask token
+                    if prob < 0.8:
+                        self.tokenized_prompts[0, i] = self.masked_token
+                    elif prob < 0.9:
+                        self.tokenized_prompts[0, i] = self.tokenized_prompts[0, random.randint(1, self.real_length_tokenized_prompts-2)]
+
+        with torch.no_grad():
+            embedding = self.token_embedding(self.tokenized_prompts).type(self.dtype)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
+        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + self.n_cls_ctx:, :])
+
+    def forward(self, label):
+        self.get_mlm_prompts()
+        cls_ctx = self.cls_ctx[label]
+        b = label.shape[0]
+        prefix = self.token_prefix.expand(b, -1, -1)
+        suffix = self.token_suffix.expand(b, -1, -1)
+
+        prompts = torch.cat(
+            [
+                prefix,  # (n_cls, 1, dim)
+                cls_ctx,  # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
+            ],
+            dim=1,
         )
 
         return prompts
