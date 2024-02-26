@@ -22,7 +22,7 @@ cudnn.enabled = True
 cudnn.deterministic = True
 
 from text_encoder import TextEncoder, TextEncoderAugmented
-from coop import build_model as build_model_coop, PromptLearnerMLM as PromptLearnerCoop
+from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
 from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC
 import clip_custom
 
@@ -551,7 +551,9 @@ if __name__ == "__main__":
         model_zero_shot = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot)
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
     elif params.training_mode == "coop":
-        model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
+        # model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
+        # olp
+        model = build_model_coop(state_dict or model.state_dict(), image_height // 12, image_width // 12, 12)
     else:
         raise NotImplementedError
 

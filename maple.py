@@ -549,7 +549,7 @@ class VisionTransformer(nn.Module):
         self.h_resolution = h_resolution
         self.w_resolution = w_resolution
         self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=12, bias=False)
         if design_details["vision_depth"] == 0:
             self.VPT_shallow = False
         else:
@@ -615,7 +615,7 @@ class VisionTransformer_MaPLe(nn.Module):
         self.h_resolution = h_resolution
         self.w_resolution = w_resolution
         self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=12, bias=False)
         self.VPT_shallow = True
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
@@ -871,7 +871,6 @@ def build_model(state_dict: dict, h_resolution, w_resolution, design_details):
             [k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
         vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
-        image_resolution = vision_patch_size * grid_size
     else:
         counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in
                         [1, 2, 3, 4]]
@@ -880,7 +879,6 @@ def build_model(state_dict: dict, h_resolution, w_resolution, design_details):
         output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
         vision_patch_size = None
         assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
-        image_resolution = output_width * 32
 
     embed_dim = state_dict["text_projection"].shape[1]
     context_length = state_dict["positional_embedding"].shape[0]
@@ -889,8 +887,8 @@ def build_model(state_dict: dict, h_resolution, w_resolution, design_details):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
-    h_resolution = h_resolution // 16
-    w_resolution = w_resolution // 16
+    h_resolution = h_resolution // 12
+    w_resolution = w_resolution // 12
 
     model = CLIP(
         embed_dim,
