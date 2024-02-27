@@ -512,7 +512,7 @@ def params_parser():
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp"])
-    args.add_argument("--vpt_ctx", type=int, default=4)
+    args.add_argument("--vpt_ctx", type=int, default=2)
     args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17"])
     args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17"])
     return args.parse_args()

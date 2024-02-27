@@ -60,4 +60,5 @@ MS->M
 | Method                         | Acc@1 | Acc@5 | Acc@10 | mAP   |
 |--------------------------------|-------|-------|--------|-------|
 | CoOp w/. tricks                | 74.2% | 86.6% | 91.0%  | 49.3% |
-| IVLP w/. text encoder unlocked | 74.2% | 87.3% | 91.1%  | 49.9% |
+| CoOp Enhanced                  | 75.6% | 88.1% | 91.9%  | 50.7% |
+| IVLP w/. text encoder unlocked | 75.4% | 87.7% | 91.3%  | 50.0% |
