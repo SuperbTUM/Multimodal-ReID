@@ -46,7 +46,7 @@ def weights_init_kaiming(m):
 class CustomCLIPCoop(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = PromptLearnerCoop(classnames, clip_model)
+        self.prompt_learner = PromptLearnerCoop(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -109,7 +109,7 @@ class CustomCLIPCoop(nn.Module):
 class CustomCLIPPromptSRC(nn.Module):
     def __init__(self, classnames, clip_model, zero_shot_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearnerSRC(classnames, clip_model, zero_shot_model)
+        self.prompt_learner = VLPromptLearnerSRC(classnames, clip_model, zero_shot_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -187,7 +187,7 @@ class CustomCLIPPromptSRC(nn.Module):
 class CustomCLIPIVLP(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearner(classnames, clip_model)
+        self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)

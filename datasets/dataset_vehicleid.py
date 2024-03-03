@@ -5,7 +5,6 @@ import random
 import os.path as osp
 from .base_dataset import BaseImageDataset
 from collections import defaultdict
-import pickle
 
 
 class VehicleID(BaseImageDataset):

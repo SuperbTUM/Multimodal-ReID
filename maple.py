@@ -19,12 +19,15 @@ def _get_clones(module, N):
 
 
 class VLPromptLearner(nn.Module):
-    def __init__(self, n_cls, clip_model):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501"):
         super().__init__()
 
         n_ctx = 4
         n_cls_ctx = 4
-        ctx_init = "A photo of X X X X X person."
+        if dataset_name in ("market1501", "dukemtmc", "msmt17"):
+            ctx_init = "A photo of X X X X X person."
+        else:
+            ctx_init = "A photo of X X X X X vehicle."
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
 
@@ -89,13 +92,16 @@ class VLPromptLearner(nn.Module):
 
 
 class VLPromptLearnerSRC(nn.Module):
-    def __init__(self, n_cls, clip_model, zero_shot_model):
+    def __init__(self, n_cls, clip_model, zero_shot_model, dataset_name="market1501"):
         super().__init__()
 
         n_ctx = 4
         n_cls_ctx = 4
         ctx_dim = 512
-        ctx_init = "A photo of X X X X X person."
+        if dataset_name in ("market1501", "dukemtmc", "msmt17"):
+            ctx_init = "A photo of X X X X X person."
+        else:
+            ctx_init = "A photo of X X X X X vehicle."
         dtype = clip_model.dtype
 
         # use given words to initialize context vectors

@@ -138,9 +138,12 @@ class PromptLearnerMLM(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, num_class, clip_model):
+    def __init__(self, num_class, clip_model, dataset_name="market1501"):
         super().__init__()
-        ctx_init = "A photo of X X X X X person."
+        if dataset_name in ("market1501", "dukemtmc", "msmt17"):
+            ctx_init = "A photo of X X X X X person."
+        else:
+            ctx_init = "A photo of X X X X X vehicle."
 
         dtype = clip_model.dtype
         token_embedding = clip_model.token_embedding
