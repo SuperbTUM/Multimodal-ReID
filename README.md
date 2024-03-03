@@ -16,12 +16,12 @@ thanks for the contribution of CLIP-ReID:
 [ViT_DukeMTMC](https://drive.google.com/file/d/1ldjSkj-7pXAWmx8on5x0EftlCaolU4dY/view)
 
 ```bash
-python3 zero_shot_learning.py --model ViT-B/16 --augmented_template --height 256
+python3 zero_shot_learning.py --model ViT-B/16 --augmented_template --height 256 --mm --clip_weights xxx
 ```
 
 Training Examples with Prompt Engineering
 ```bash
-python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --test_dataset dukemtmc --vpt_ctx 6
+python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --test_dataset dukemtmc --vpt_ctx 4
 python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --train_dataset dukemtmc --test_dataset market1501 --vpt_ctx 2
 ```
 Or
@@ -51,6 +51,7 @@ D->M
 |------------------------------------|-----------|-----------|-----------|-----------|
 | CoOp                               | 71.4%     | 84.7%     | 89.2%     | 44.6%     |
 | CoOp Enhanced                      | 71.6%     | 84.6%     | 89.5%     | 45.7%     |
+| CoOp Enhanced + Concrete Labels    | 72.5%     | 85.1%     | 89.7%     | 45.9%     |
 | IVLP w/. text encoder unlocked     | 73.1%     | 85.8%     | 89.9%     | 46.5%     |
 | ~~+ w/. masked language modeling~~ | ~~73.6%~~ | ~~85.4%~~ | ~~89.9%~~ | ~~46.1%~~ |
 
@@ -71,3 +72,10 @@ Veri776
 |--------------------------------------------|-------|-------|--------|-------|
 | CoOp (256 x 256)                           | 97.4% | 98.6% | 99.3%  | 83.3% |
 | IVLP w/. text encoder unlocked (224 x 224) | 97.6% | 98.9% | 99.5%  | 83.7% |
+
+Market1501: Concrete label in inference
+
+| Method        | Acc@1 | Acc@5 | Acc@10 | mAP   |
+|---------------|-------|-------|--------|-------|
+| CoOp          | 95.5% | 98.4% | 99.1%  | 90.1% |
+| CoOp Enhanced | 95.7% | 98.5% | 99.1%  | 90.5% |

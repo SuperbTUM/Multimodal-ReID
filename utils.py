@@ -166,7 +166,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def model_adaptor(model, height, width, weights=None, model_type="vit", training_mode="coop"):
+def model_adaptor(model, height, width, weights=None, model_type="vit", training_mode="coop", vision_stride_size=12):
     # if (height, width) != (224, 224):
     if weights is not None:
         try:
@@ -186,19 +186,19 @@ def model_adaptor(model, height, width, weights=None, model_type="vit", training
                 [k for k in weights.keys() if k.startswith("image_encoder.") and k.endswith(".attn.in_proj_weight")])
             vision_patch_size = weights["image_encoder.conv1.weight"].shape[-1]
             embed_dim = weights["text_encoder.text_projection"].shape[1]
-            h_resolution = height // vision_patch_size
-            w_resolution = width // vision_patch_size
+            h_resolution = height // vision_stride_size
+            w_resolution = width // vision_stride_size
 
             if training_mode == "coop":
-                model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, 16,
+                model.visual = custom_clip_model.VisionTransformer(h_resolution, w_resolution, vision_patch_size, vision_stride_size,
                                                                    vision_width, vision_layers, vision_width // 64,
                                                                    embed_dim)
             else:
                 design_details = {"trainer": 'IVLP',
                                   "vision_depth": 12,
                                   "language_depth": 12,
-                                  "vision_ctx": 4,
-                                  "language_ctx": 4}
+                                  "vision_ctx": 2,
+                                  "language_ctx": 2}
                 model.visual = maple.VisionTransformer(h_resolution, w_resolution, vision_patch_size,
                                                        vision_width, vision_layers, vision_width // 64,
                                                        embed_dim, design_details)
