@@ -9,22 +9,30 @@ from tqdm import tqdm
 from utils import model_adaptor
 from evaluate import R1_mAP_eval
 from data_prepare import get_prompts, get_loader, get_prompts_augmented
+from maple import build_model as build_model_maple
 
 
-def load_model(model_name, classnames, templates):
+def load_model(model_name, classnames, templates, weights):
     model, _ = clip.load(model_name)
     model.eval()
-    '''
+    if params.training_mode == "ivlp":
+        design_details = {"trainer": 'IVLP',
+                          "vision_depth": 12,
+                          "language_depth": 12,
+                          "vision_ctx": 2,
+                          "language_ctx": 2}
+        model = build_model_maple(model.state_dict(), image_height, image_width, design_details)
+        model = model.cuda()
+
     # text encoder not trained
     if weights is not None:
-    weights = torch.load(weights)
-    matched_weights = OrderedDict()
-    for key in weights:
-        if key.startswith("text_encoder"):
-            matched_key = ".".join(key.split(".")[1:])
-            matched_weights[matched_key] = weights[key].to(model.state_dict()[matched_key].dtype)
-    model.load_state_dict(matched_weights, strict=False)
-    '''
+        weights = torch.load(weights)
+        matched_weights = OrderedDict()
+        for key in weights:
+            if key.startswith("text_encoder"):
+                matched_key = ".".join(key.split(".")[1:])
+                matched_weights[matched_key] = weights[key].to(model.state_dict()[matched_key].dtype)
+        model.load_state_dict(matched_weights, strict=False)
 
     def zeroshot_classifier(classnames, templates: dict):
         with torch.no_grad():
@@ -173,7 +181,7 @@ if __name__ == "__main__":
         identity_list, template_dict = get_prompts_augmented("Market-1501_Attribute/market_attribute.mat")
     else:
         identity_list, template_dict = get_prompts("Market-1501_Attribute/market_attribute.mat")
-    zeroshot_weights, model = load_model(model_name, identity_list, template_dict)
+    zeroshot_weights, model = load_model(model_name, identity_list, template_dict, params.clip_weights)
     model, bottleneck, bottleneck_proj = model_adaptor(model, image_height, image_width, params.clip_weights, "vit" if "ViT" in params.model else "rn",
                                                        params.training_mode)
 
