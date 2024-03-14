@@ -648,7 +648,19 @@ if __name__ == "__main__":
                 state_dict_reseted[layer] = state_dict[layer]
         model = CustomCLIPIVLP(n_cls, model).cuda()
     elif params.training_mode == "promptsrc":
+        state_dict = torch.load("./clip_imagenet_pretrained_ivlp.pth.tar-5")["state_dict"]
+        # reset prompt learner and positional embedding
+        from collections import OrderedDict
+
+        state_dict_reseted = OrderedDict()
+        for layer in state_dict:
+            if "prompt_learner" in layer or "image_encoder.positional_embedding" in layer:
+                pass
+            else:
+                state_dict_reseted[layer] = state_dict[layer]
+
         model = CustomCLIPPromptSRC(n_cls, model, model_zero_shot).cuda()
+        model.load_state_dict(state_dict_reseted, strict=False)
     elif params.training_mode == "coop":
         model = CustomCLIPCoop(n_cls, model).cuda()
     elif params.training_mode == "adapter":
