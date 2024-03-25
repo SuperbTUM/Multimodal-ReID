@@ -91,6 +91,96 @@ class VLPromptLearner(nn.Module):
         return prompts
 
 
+class VLPromptLearnerVeri(nn.Module):
+
+    n_cls_ctx = 4
+
+    car_type_explanation = {
+        "sedan": "{} sedan, a type of passenger car that typically features four doors and a separate trunk compartment for cargo.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "suv": "{} SUV, a type of passenger car that typically features a taller body with a boxy shape, a high ground clearance, and a spacious interior capable of accommodating multiple passengers and cargo.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "van": "{} van, a spacious vehicle that features a boxy design, large cargo capacity, and multiple seating configurations, resembling a van.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "hatchback": "{} hatchback, a compact car that features a rear door opening upwards to access a cargo area, typically offering versatile storage options and a practical design.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "mpv": "{} MPV (Multi-Purpose Vehicle), a versatile automobile that features multiple seating configurations, ample interior space, and sliding doors, designed to accommodate passengers and cargo with flexibility and convenience.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "pickup": "{} pickup, a rugged vehicle that features an open cargo area at the rear, often equipped with towing capabilities and four-wheel drive, ideal for hauling goods and navigating diverse terrains.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "bus": "{} bus, a large vehicle that features multiple rows of seating, wide windows, and a distinctive boxy shape, designed to transport passengers efficiently along predetermined routes.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "truck": "{} truck, a robust vehicle that features a separate cabin and cargo area, often with a towing hitch, powerful engine, and sturdy chassis, designed for hauling goods and navigating various terrains with durability and reliability.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "estate": "{} estate, a versatile vehicle that features a spacious cargo area extending from the rear of the cabin, often with a sloping roofline and folding rear seats, providing ample storage capacity and flexibility for transporting goods or luggage.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+        "": "{} nothing.".format(" ".join(["X" for _ in range(n_cls_ctx)])),
+    }
+
+    def __init__(self, num_class, clip_model, car_types):
+        super().__init__()
+        ctx_inits = []
+        for car_type in car_types:
+            # ctx_init = "A photo of X X X {}, a type of vehicle.".format(car_type)
+            ctx_init = "A photo of X " + self.car_type_explanation[car_type]
+            ctx_init = ctx_init.replace("_", " ")
+            ctx_inits.append(ctx_init)
+
+        tokenized_prompts = torch.cat([clip.tokenize(ctx_init).cuda() for ctx_init in ctx_inits])
+
+        dtype = clip_model.dtype
+        token_embedding = clip_model.token_embedding
+        ctx_dim = 512
+        # use given words to initialize context vectors
+        n_ctx = 4
+
+        with torch.no_grad():
+            embedding = token_embedding(tokenized_prompts).type(dtype)
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+        cls_vectors = torch.empty(num_class, self.n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(cls_vectors, std=0.02)
+        prompt_prefix = ctx_init
+
+        print(f"Independent V-L design")
+        print(f'Initial text context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
+        self.ctx = nn.Parameter(cls_vectors)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
+        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + self.n_cls_ctx:, :])
+        self.num_class = num_class
+
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        # dim0 is either batch_size (during training) or n_cls (during testing)
+        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
+        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
+        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
+
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
+        else:
+            prefix = prefix.expand(ctx.size(0), -1, -1)
+            suffix = suffix.expand(ctx.size(0), -1, -1)
+
+        prompts = torch.cat(
+            [
+                prefix,  # (dim0, 1, dim)
+                ctx,  # (dim0, n_ctx, dim)
+                suffix,  # (dim0, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+    def forward(self, label):
+        ctx = self.ctx[label]
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+        prompts = self.construct_prompts(ctx, prefix, suffix, label)
+
+        return prompts
+
+
 class VLPromptLearnerSRC(nn.Module):
     def __init__(self, n_cls, clip_model, zero_shot_model, dataset_name="market1501"):
         super().__init__()

@@ -273,7 +273,7 @@ def train_prompter(model,
                       .format(epoch, (i + 1), len(dataloader),
                               loss, scheduler._get_lr(epoch)[0]))
 
-        if epoch % 10 == 0 or epoch == params.epochs_stage1:
+        if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
     model.eval()
@@ -380,7 +380,7 @@ def train_vision_model(model,
             iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
 
         ckpt_id = loss.item()
-        if epoch % 10 == 0 or epoch == params.epochs_stage2 - 1:
+        if epoch % 20 == 0 or epoch == params.epochs_stage2 - 1:
             model.save_checkpoint(os.path.join(saving_path, "clip_model_weight.pth"), ckpt_id)
 
     model.eval()
@@ -406,7 +406,7 @@ def params_parser():
 if __name__ == "__main__":
     params = params_parser()
     image_height, image_width = params.height, int(params.height * params.ratio)
-    _, loader_train_val, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
+    _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
                                                   "vit" if "ViT" in params.model else "rn",
                                                   True, params.train_dataset)
     loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,

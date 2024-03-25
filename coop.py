@@ -188,6 +188,80 @@ class PromptLearner(nn.Module):
         return prompts
 
 
+class PromptLearnerVeri(nn.Module):
+    n_cls_ctx = 3
+
+    car_type_explanation = {
+        "sedan": "{} sedan, a type of passenger car that typically features four doors and a separate trunk compartment for cargo.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "suv": "{} SUV, a type of passenger car that typically features a taller body with a boxy shape, a high ground clearance, and a spacious interior capable of accommodating multiple passengers and cargo.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "van": "{} van, a spacious vehicle that features a boxy design, large cargo capacity, and multiple seating configurations, resembling a van.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "hatchback": "{} hatchback, a compact car that features a rear door opening upwards to access a cargo area, typically offering versatile storage options and a practical design.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "mpv": "{} MPV (Multi-Purpose Vehicle), a versatile automobile that features multiple seating configurations, ample interior space, and sliding doors, designed to accommodate passengers and cargo with flexibility and convenience.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "pickup": "{} pickup, a rugged vehicle that features an open cargo area at the rear, often equipped with towing capabilities and four-wheel drive, ideal for hauling goods and navigating diverse terrains.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "bus": "{} bus, a large vehicle that features multiple rows of seating, wide windows, and a distinctive boxy shape, designed to transport passengers efficiently along predetermined routes.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "truck": "{} truck, a robust vehicle that features a separate cabin and cargo area, often with a towing hitch, powerful engine, and sturdy chassis, designed for hauling goods and navigating various terrains with durability and reliability.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "estate": "{} estate, a versatile vehicle that features a spacious cargo area extending from the rear of the cabin, often with a sloping roofline and folding rear seats, providing ample storage capacity and flexibility for transporting goods or luggage.".format(
+            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "": "{} nothing.".format(" ".join(["X" for _ in range(n_cls_ctx - 1)])),
+    }
+
+    def __init__(self, num_class, clip_model, car_types):
+        super().__init__()
+        ctx_inits = []
+        for car_type in car_types:
+            # ctx_init = "A photo of X X X {}, a type of vehicle.".format(car_type)
+            ctx_init = "A photo of X " + self.car_type_explanation[car_type]
+            ctx_init = ctx_init.replace("_", " ")
+            ctx_inits.append(ctx_init)
+
+        tokenized_prompts = torch.cat([clip.tokenize(ctx_init).cuda() for ctx_init in ctx_inits])
+
+        dtype = clip_model.dtype
+        token_embedding = clip_model.token_embedding
+        ctx_dim = 512
+        # use given words to initialize context vectors
+        n_ctx = 3
+
+        with torch.no_grad():
+            embedding = token_embedding(tokenized_prompts).type(dtype)
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+        cls_vectors = torch.empty(num_class, self.n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(cls_vectors, std=0.02)
+        self.cls_ctx = nn.Parameter(cls_vectors)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :n_ctx + 1, :])
+        self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + self.n_cls_ctx:, :])
+        self.num_class = num_class
+
+    def forward(self, label):
+        cls_ctx = self.cls_ctx[label]
+        prefix = self.token_prefix[label]
+        suffix = self.token_suffix[label]
+
+        prompts = torch.cat(
+            [
+                prefix,  # (n_cls, 1, dim)
+                cls_ctx,  # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+
 class VisionTransformer(nn.Module):
     def __init__(self, h_resolution: int, w_resolution: int, patch_size: int, stride_size: int, width: int, layers: int,
                  heads: int, output_dim: int):

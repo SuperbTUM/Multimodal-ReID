@@ -25,7 +25,7 @@ python3 zero_shot_learning.py --model ViT-B/16 --augmented_template --height 256
 
 Training Examples with Prompt Engineering
 ```bash
-python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --test_dataset dukemtmc --vpt_ctx 4
+python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --test_dataset dukemtmc
 python3 prompt_learning.py --model ViT-B/16 --height 256 --bs 64 --amp --epochs_stage1 120 --epochs_stage2 60 --training_mode ivlp  --train_dataset dukemtmc --test_dataset market1501 --vpt_ctx 2
 ```
 Or
@@ -45,7 +45,7 @@ M->D
 |------------------------------------|-----------|-----------|-----------|-----------|
 | CoOp                               | 69.9%     | 81.5%     | 85.4%     | 51.2%     |
 | CoOp Enhanced                      | 70.9%     | 82.4%     | 86.1%     | 52.5%     |
-| IVLP w/. text encoder unlocked     | 71.3%     | 82.9%     | 85.9%     | 53.0%     |
+| IVLP                               | 71.3%     | 82.9%     | 85.9%     | 53.0%     |
 | ~~+ w/. masked language modeling~~ | ~~71.3%~~ | ~~83.0%~~ | ~~86.4%~~ | ~~52.5%~~ |
 
 
@@ -56,26 +56,27 @@ D->M
 | CoOp                               | 71.4%     | 84.7%     | 89.2%     | 44.6%     |
 | CoOp Enhanced                      | 73.0%     | 86.1%     | 89.7%     | 46.3%     |
 | IVLP                               | 73.1%     | 85.8%     | 90.1%     | 46.5%     |
-| PromptSRC                          | 74.6%     | 87.6%     | 90.6%     | 47.7%     |
+| PromptSRC                          | 74.6%     | 87.0%     | 90.6%     | 47.7%     |
 | ~~+ w/. masked language modeling~~ | ~~73.6%~~ | ~~85.4%~~ | ~~89.9%~~ | ~~46.1%~~ |
 
 
 MS->M
 
-| Method                         | Acc@1 | Acc@5 | Acc@10 | mAP   |
-|--------------------------------|-------|-------|--------|-------|
-| CoOp w/. tricks                | 74.2% | 86.6% | 91.0%  | 49.3% |
-| CoOp Enhanced                  | 75.6% | 88.1% | 91.9%  | 50.7% |
-| IVLP w/. text encoder unlocked | 75.4% | 87.7% | 91.3%  | 50.0% |
+| Method          | Acc@1 | Acc@5 | Acc@10 | mAP   |
+|-----------------|-------|-------|--------|-------|
+| CoOp w/. tricks | 74.2% | 86.6% | 91.0%  | 49.3% |
+| CoOp Enhanced   | 75.6% | 88.1% | 91.9%  | 50.7% |
+| IVLP            | 76.4% | 89.1% | 92.5%  | 51.9% |
 
 **In-domain Evaluation**
 
 Veri776
 
-| Method                                     | Acc@1 | Acc@5 | Acc@10 | mAP   |
-|--------------------------------------------|-------|-------|--------|-------|
-| CoOp (256 x 256)                           | 97.4% | 98.6% | 99.3%  | 83.3% |
-| IVLP w/. text encoder unlocked (224 x 224) | 97.6% | 98.9% | 99.5%  | 83.7% |
+| Method           | Acc@1 | Acc@5 | Acc@10 | mAP   |
+|------------------|-------|-------|--------|-------|
+| CoOp (256 x 256) | 97.4% | 98.6% | 99.3%  | 83.3% |
+| IVLP (224 x 224) | 97.6% | 98.9% | 99.5%  | 83.7% |
+| + CuPL           | 97.2% | 98.6% | 99.3%  | 84.0% |
 
 DukeMTMC
 

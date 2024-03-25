@@ -24,8 +24,10 @@ cudnn.enabled = True
 cudnn.deterministic = True
 
 from text_encoder import TextEncoder, TextEncoderAugmented
-from coop import build_model as build_model_coop, PromptLearner as PromptLearnerCoop
-from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC
+from coop import (build_model as build_model_coop,
+                  PromptLearner as PromptLearnerCoop,
+                  PromptLearnerVeri as PromptLearnerCoopVeri)
+from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC, VLPromptLearnerVeri
 from clip_adapter import Adapter, build_model as build_model_adapter, PromptLearner as PromptLearnerAdapter
 import clip_custom
 
@@ -49,7 +51,10 @@ def weights_init_kaiming(m):
 class CustomCLIPCoop(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = PromptLearnerCoop(classnames, clip_model, params.train_dataset)
+        if params.train_dataset == "veri":
+            self.prompt_learner = PromptLearnerCoopVeri(classnames, clip_model, car_types_train)
+        else:
+            self.prompt_learner = PromptLearnerCoop(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -71,7 +76,10 @@ class CustomCLIPCoop(nn.Module):
     def forward(self, image=None, label=None, get_image=False, get_texts=False):
         if get_texts:
             prompts = self.prompt_learner(label)
-            tokenized_prompts = self.tokenized_prompts
+            if params.train_dataset == "veri":
+                tokenized_prompts = self.tokenized_prompts[label]
+            else:
+                tokenized_prompts = self.tokenized_prompts
 
             text_features = self.text_encoder(prompts, tokenized_prompts)
             return text_features
@@ -99,7 +107,10 @@ class CustomCLIPCoop(nn.Module):
 
         if self.training:
             prompts = self.prompt_learner(label)
-            tokenized_prompts = self.tokenized_prompts
+            if params.train_dataset == "veri":
+                tokenized_prompts = self.tokenized_prompts[label]
+            else:
+                tokenized_prompts = self.tokenized_prompts
             text_features = self.text_encoder(prompts, tokenized_prompts)
             logits = image_features @ text_features.t()
             return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
@@ -258,7 +269,10 @@ class CustomCLIPAdapter(nn.Module):
 class CustomCLIPIVLP(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
+        if params.train_dataset == "veri":
+            self.prompt_learner = VLPromptLearnerVeri(classnames, clip_model, car_types_train)
+        else:
+            self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -278,7 +292,10 @@ class CustomCLIPIVLP(nn.Module):
         self.vision_classifier_proj.apply(weights_init_classifier)
 
     def forward(self, image=None, label=None, get_image=False, get_texts=False):
-        tokenized_prompts = self.tokenized_prompts
+        if params.train_dataset == "veri":
+            tokenized_prompts = self.tokenized_prompts[label]
+        else:
+            tokenized_prompts = self.tokenized_prompts
 
         if get_texts:
             prompts = self.prompt_learner(label)
@@ -387,7 +404,7 @@ def train_prompter(model,
     learnable_params = [{"params": model.prompt_learner.parameters(), "lr": 0.00035, "weight_decay": 1e-4}]
     if params.training_mode in ("ivlp", "promptsrc"):
         for name, param in model.named_parameters():
-            if "VPT_shallow" in name:
+            if "VPT" in name:
                 learnable_params += [{"params": param, "lr": 0.00035, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=0.00035, weight_decay=1e-4)
@@ -437,7 +454,7 @@ def train_prompter(model,
                       .format(epoch, (i + 1), len(dataloader_train_val),
                               loss, scheduler._get_lr(epoch)[0]))
 
-        if epoch % 10 == 0 or epoch == params.epochs_stage1:
+        if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
 
@@ -500,7 +517,7 @@ def train_vision_model(model,
         # experimental
         if "prompt_learner" in name:
             param.requires_grad_(False)
-        elif "VPT_shallow" in name:
+        elif "VPT" in name:
             param.requires_grad_(False)
         elif not param.requires_grad:
             continue
@@ -558,7 +575,7 @@ def train_vision_model(model,
         if params.training_mode == "promptsrc" and epoch == params.epochs_stage2 - 1:
             model.load_state_dict(previous_model_gpa)
 
-        if epoch % 10 == 0 or epoch == params.epochs_stage2 - 1:
+        if epoch % 20 == 0 or epoch == params.epochs_stage2 - 1:
             checkpoint_path = "/".join((saving_path, "clip_model_weight_{}.pth".format(epoch)))
             torch.save(model.state_dict(), checkpoint_path)
 
@@ -673,7 +690,7 @@ if __name__ == "__main__":
 
     model = model.cuda()
 
-    _, loader_train_val, n_cls = get_loader_train(params.root, params.bs, image_height, image_width,
+    _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
                                            "vit" if "ViT" in params.model else "rn", True, params.train_dataset)
     loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
                                                        "vit" if "ViT" in params.model else "rn", params.train_dataset)
@@ -685,9 +702,7 @@ if __name__ == "__main__":
 
         state_dict_reseted = OrderedDict()
         for layer in state_dict:
-            if "prompt_learner" in layer or "image_encoder.positional_embedding" in layer:
-                pass
-            else:
+            if "VPT" in layer:
                 state_dict_reseted[layer] = state_dict[layer]
         model = CustomCLIPIVLP(n_cls, model).cuda()
     elif params.training_mode == "promptsrc":
@@ -697,9 +712,7 @@ if __name__ == "__main__":
 
         state_dict_reseted = OrderedDict()
         for layer in state_dict:
-            if "prompt_learner" in layer or "image_encoder.positional_embedding" in layer:
-                pass
-            else:
+            if "VPT" in layer:
                 state_dict_reseted[layer] = state_dict[layer]
 
         model = CustomCLIPPromptSRC(n_cls, model, model_zero_shot).cuda()
