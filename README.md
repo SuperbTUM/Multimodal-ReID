@@ -67,6 +67,7 @@ MS->M
 | CoOp w/. tricks | 74.2% | 86.6% | 91.0%  | 49.3% |
 | CoOp Enhanced   | 75.6% | 88.1% | 91.9%  | 50.7% |
 | IVLP            | 76.4% | 89.1% | 92.5%  | 51.9% |
+| PromptSRC       | 78.4% | 89.8% | 93.6%  | 53.8% |
 
 **In-domain Evaluation**
 
