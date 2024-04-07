@@ -2,6 +2,8 @@
 
 As multimodal models go viral these days, we make an attempt to apply CLIP in traditional ReID tasks.
 
+Manuscript [Only available to myself](https://docs.google.com/document/d/1ft2MQNn3WW9q-0OkF7IMNSRHTMHSGPO2zFXFr9hxtUQ/edit)
+
 **Installation**
 
 ```bash
@@ -35,8 +37,6 @@ deepspeed prompt_learning_deepspeed.py --height 256 --bs 64 --epochs_stage1 120 
 
 **Cross-domain Evaluation**
 
-Experimental logs [Only visible to myself atm](https://docs.google.com/document/d/1wBPoy53pGGp1bkmO97LpaA_eDzA4s0OPX8hgvXit8E4/edit?usp=sharing)
-
 Abbreviations: M: Market1501; D: DukeMTMC, MS: MSMT17_V2
 
 M->D
@@ -46,7 +46,6 @@ M->D
 | CoOp                               | 69.9%     | 81.5%     | 85.4%     | 51.2%     |
 | CoOp Enhanced                      | 70.9%     | 82.4%     | 86.1%     | 52.5%     |
 | IVLP                               | 71.3%     | 82.9%     | 85.9%     | 53.0%     |
-| ~~+ w/. masked language modeling~~ | ~~71.3%~~ | ~~83.0%~~ | ~~86.4%~~ | ~~52.5%~~ |
 
 
 D->M
@@ -56,8 +55,7 @@ D->M
 | CoOp                               | 71.4%     | 84.7%     | 89.2%     | 44.6%     |
 | CoOp Enhanced                      | 73.0%     | 86.1%     | 89.7%     | 46.3%     |
 | IVLP                               | 73.1%     | 85.8%     | 90.1%     | 46.5%     |
-| PromptSRC                          | 74.6%     | 87.0%     | 90.6%     | 47.7%     |
-| ~~+ w/. masked language modeling~~ | ~~73.6%~~ | ~~85.4%~~ | ~~89.9%~~ | ~~46.1%~~ |
+| PromptSRC                          | 75.2%     | 87.1%     | 90.9%     | 47.9%     |
 
 
 MS->M

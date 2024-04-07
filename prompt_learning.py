@@ -106,16 +106,9 @@ class CustomCLIPCoop(nn.Module):
         cls_score_proj = self.vision_classifier_proj(features.float())
 
         if self.training:
-            prompts = self.prompt_learner(label)
-            if params.train_dataset == "veri":
-                tokenized_prompts = self.tokenized_prompts[label]
-            else:
-                tokenized_prompts = self.tokenized_prompts
-            text_features = self.text_encoder(prompts, tokenized_prompts)
-            logits = image_features @ text_features.t()
-            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
-                                                                                        image_features_non_proj,
-                                                                                        image_features], image_features
+            return [cls_score, cls_score_proj], [image_features_last,
+                                                 image_features_non_proj,
+                                                 image_features], image_features
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
@@ -168,8 +161,6 @@ class CustomCLIPPromptSRC(nn.Module):
                     zero_shot_features = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))[-1]
                 zero_shot_features = zero_shot_features[:, 0]
 
-            prompts = self.prompt_learner(label)
-            text_features = self.text_encoder(prompts, tokenized_prompts)
             if params.amp:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
             else:
@@ -183,11 +174,9 @@ class CustomCLIPPromptSRC(nn.Module):
             cls_score = self.vision_classifier(features_non_proj.float())
             cls_score_proj = self.vision_classifier_proj(features.float())
 
-            logits = image_features @ text_features.t()
-
-            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
-                                                                                        image_features_non_proj,
-                                                                                        image_features], image_features, zero_shot_features
+            return [cls_score, cls_score_proj], [image_features_last,
+                                                 image_features_non_proj,
+                                                 image_features], image_features, zero_shot_features
         else:
             if params.amp:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
@@ -256,13 +245,9 @@ class CustomCLIPAdapter(nn.Module):
         cls_score_proj = self.vision_classifier_proj(features.float())
 
         if self.training:
-            prompts = self.prompt_learner(label)
-            tokenized_prompts = self.tokenized_prompts
-            text_features = self.text_encoder(prompts, tokenized_prompts)
-            logits = image_features @ text_features.t()
-            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
-                                                                                        image_features_non_proj,
-                                                                                        image_features], image_features
+            return [cls_score, cls_score_proj], [image_features_last,
+                                                 image_features_non_proj,
+                                                 image_features], image_features
         else:
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
@@ -312,8 +297,6 @@ class CustomCLIPIVLP(nn.Module):
             return image_features
 
         if self.training:
-            prompts = self.prompt_learner(label)
-            text_features = self.text_encoder(prompts, tokenized_prompts)
             if params.amp:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
             else:
@@ -327,11 +310,9 @@ class CustomCLIPIVLP(nn.Module):
             cls_score = self.vision_classifier(features_non_proj.float())
             cls_score_proj = self.vision_classifier_proj(features.float())
 
-            logits = image_features @ text_features.t()
-
-            return text_features, image_features, logits, [cls_score, cls_score_proj], [image_features_last,
-                                                                                        image_features_non_proj,
-                                                                                        image_features], image_features
+            return [cls_score, cls_score_proj], [image_features_last,
+                                                 image_features_non_proj,
+                                                 image_features], image_features
         else:
             if params.amp:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
@@ -421,6 +402,9 @@ def train_prompter(model,
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
+    gauss_weights = get_gauss(mu=60, sigma=45, max_epochs=params.epochs_stage1)
+    previous_model_gpa = None
+
     for epoch in range(1, epochs + 1):
         scheduler.step(epoch)
         model.train()
@@ -454,6 +438,17 @@ def train_prompter(model,
                       .format(epoch, (i + 1), len(dataloader_train_val),
                               loss, scheduler._get_lr(epoch)[0]))
 
+        current_epoch_gauss_weights = gauss_weights[epoch]
+        if params.training_mode == "promptsrc" and previous_model_gpa is None:
+            previous_model_gpa = state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights)
+        elif params.training_mode == "promptsrc":
+            previous_model_gpa = state_dict_add(
+                state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights),
+                previous_model_gpa)
+
+        if params.training_mode == "promptsrc" and epoch == params.epochs_stage1 - 1:
+            model.load_state_dict(previous_model_gpa)
+
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
             torch.save(model.prompt_learner.state_dict(), checkpoint_path)
@@ -471,21 +466,19 @@ def train_vision_model(model,
         label = label.cuda()
         loss = 0.
         if params.training_mode == "promptsrc":
-            cls_scores, image_features_list, image_features_proj, zero_shot_features = model(image, label)[3:]
+            cls_scores, image_features_list, image_features_proj, zero_shot_features = model(image, label)
             loss += F.smooth_l1_loss(image_features_proj, zero_shot_features, reduction="mean")
         else:
-            cls_scores, image_features_list, image_features_proj = model(image, label)[3:]
-        cls_score1, cls_score2 = cls_scores
+            cls_scores, image_features_list, image_features_proj = model(image, label)
         image_features_last, image_features_non_proj, image_features = image_features_list
 
-        loss += 0.25 * ce_loss(cls_score1, label) + \
-                0.25 * ce_loss(cls_score2, label)
+        for cls_score in cls_scores:
+            loss += 0.25 * ce_loss(cls_score, label)
         output = image_features_proj @ text_features.t()
         loss += ce_loss(output, label)
-        if params.bs >= 4:
-            loss += triplet_loss(image_features_last, label) + \
-                    triplet_loss(image_features_non_proj, label) + \
-                    triplet_loss(image_features, label)
+        loss += triplet_loss(image_features_last, label) + \
+                triplet_loss(image_features_non_proj, label) + \
+                triplet_loss(image_features, label)
         return loss
 
     print("Building custom CLIP")
