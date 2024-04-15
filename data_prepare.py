@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from timm.data.random_erasing import RandomErasing
 
-from datasets import dataset_market, dataset_dukemtmc, dataset_msmt17
+from datasets import dataset_market, dataset_dukemtmc, dataset_msmt17, dataset_veri, dataset_vehicleid
 
 
 import copy
@@ -96,6 +96,38 @@ class reidDataset(Dataset):
         return detailed_info
 
 
+class reidDatasetMerged(Dataset):
+    def __init__(self, dataset_images1, num_pids_1, dataset_images2, transform=None):
+        self.dataset_images1 = dataset_images1
+        self.num_pids_1 = num_pids_1
+        self.dataset_images2 = dataset_images2
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset_images1) + len(self.dataset_images2)
+
+    def __getitem__(self, item):
+        offset_dataset2 = len(self.dataset_images1)
+        offset_label_dataset2 = self.num_pids_1
+        if item < offset_dataset2:
+            detailed_info = list(self.dataset_images1[item])
+            detailed_info[0] = Image.open(detailed_info[0]).convert("RGB")
+            if self.transform:
+                detailed_info[0] = self.transform(detailed_info[0])
+            detailed_info[1] = torch.tensor(detailed_info[1])
+            for i in range(2, len(detailed_info)):
+                detailed_info[i] = torch.tensor(detailed_info[i], dtype=torch.long)
+        else:
+            detailed_info = list(self.dataset_images2[item - offset_dataset2])
+            detailed_info[0] = Image.open(detailed_info[0]).convert("RGB")
+            if self.transform:
+                detailed_info[0] = self.transform(detailed_info[0])
+            detailed_info[1] = torch.tensor(detailed_info[1] + offset_label_dataset2)
+            for i in range(2, len(detailed_info)):
+                detailed_info[i] = torch.tensor(detailed_info[i], dtype=torch.long)
+        return detailed_info
+
+
 def get_dataset(root, dataset_name):
     if dataset_name == "market1501":
         dataset = dataset_market.Market1501(root="/".join((root, "Market1501")))
@@ -103,9 +135,35 @@ def get_dataset(root, dataset_name):
         dataset = dataset_dukemtmc.DukeMTMCreID(root="/".join((root, "DukeMTMC-reID")))
     elif dataset_name == "msmt17":
         dataset = dataset_msmt17.MSMT17(root=root)
+    elif dataset_name == "veri":
+        dataset = dataset_veri.VeRi(root=root)
+    elif dataset_name == "vehicleid":
+        dataset = dataset_vehicleid.VehicleID(root=root)
     else:
         raise NotImplementedError
     return dataset
+
+
+def get_loader_train_sampled_multitask(root, batch_size, image_height, image_width, model_type, dataset_name1, dataset_name2):
+    transform_train = transforms.Compose([
+        transforms.Resize((image_height, image_width), interpolation=3),
+        transforms.RandomHorizontalFlip(),
+        transforms.Pad(10),
+        transforms.RandomCrop((image_height, image_width)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
+                             std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
+        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
+    ])
+    dataset1 = get_dataset(root, dataset_name1)
+    num_pids1 = dataset1.num_train_pids
+    dataset2 = get_dataset(root, dataset_name2)
+    num_pids2 = dataset2.num_train_pids
+    reid_dataset_train = reidDatasetMerged(dataset1.train, num_pids1, dataset2.train, transform_train)
+    num_pids = num_pids1 + num_pids2
+    custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 4)
+    loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=False, sampler=custom_sampler, pin_memory=True)
+    return loader_train, num_pids
 
 
 def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type, dataset_name="market1501"):
@@ -156,6 +214,39 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type, wi
         reid_dataset_val = reidDataset(dataset.train, transform_val)
         loader_val = DataLoader(reid_dataset_val, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
         return loader_train, loader_val, num_pids, car_types_train
+    else:
+        return loader_train, num_pids
+
+
+def get_loader_train_multitask(root, batch_size, image_height, image_width, model_type, with_val_transform=False, dataset_name1="market1501", dataset_name2="dukemtmc"):
+    transform_train = transforms.Compose([
+        transforms.Resize((image_height, image_width), interpolation=3),
+        transforms.RandomHorizontalFlip(),
+        transforms.Pad(10),
+        transforms.RandomCrop((image_height, image_width)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
+                             std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
+        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
+    ])
+    dataset1 = get_dataset(root, dataset_name1)
+    num_pids1 = dataset1.num_train_pids
+    dataset2 = get_dataset(root, dataset_name2)
+    num_pids2 = dataset2.num_train_pids
+    num_pids = num_pids1 + num_pids2
+    reid_dataset_train = reidDatasetMerged(dataset1.train, num_pids1, dataset2.train, transform_train)
+    loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
+
+    if with_val_transform:
+        transform_val = transforms.Compose([
+            transforms.Resize((image_height, image_width), interpolation=3),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
+                                 std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225))
+        ])
+        reid_dataset_val = reidDatasetMerged(dataset1.train, num_pids1, dataset2.train, transform_val)
+        loader_val = DataLoader(reid_dataset_val, batch_size=batch_size, num_workers=4, shuffle=True, pin_memory=True)
+        return loader_train, loader_val, num_pids, None
     else:
         return loader_train, num_pids
 

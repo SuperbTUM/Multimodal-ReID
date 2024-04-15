@@ -15,7 +15,7 @@ _tokenizer = _Tokenizer()
 from tqdm import tqdm
 
 from utils import load_pretrained_weights
-from data_prepare import get_loader_train, get_loader_train_sampled, get_loader
+from data_prepare import get_loader_train, get_loader_train_multitask, get_loader_train_sampled, get_loader_train_sampled_multitask, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import WarmupMultiStepLR, create_scheduler
 from losses import SupConLoss, WeightedRegularizedTriplet, CrossEntropyLabelSmooth
@@ -254,10 +254,10 @@ class CustomCLIPAdapter(nn.Module):
 class CustomCLIPIVLP(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        if params.train_dataset == "veri":
-            self.prompt_learner = VLPromptLearnerVeri(classnames, clip_model, car_types_train)
-        else:
-            self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
+        # if params.train_dataset == "veri":
+        #     self.prompt_learner = VLPromptLearnerVeri(classnames, clip_model, car_types_train)
+        # else:
+        self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -277,10 +277,10 @@ class CustomCLIPIVLP(nn.Module):
         self.vision_classifier_proj.apply(weights_init_classifier)
 
     def forward(self, image=None, label=None, get_image=False, get_texts=False):
-        if params.train_dataset == "veri":
-            tokenized_prompts = self.tokenized_prompts[label]
-        else:
-            tokenized_prompts = self.tokenized_prompts
+        # if params.train_dataset == "veri":
+        #     tokenized_prompts = self.tokenized_prompts[label]
+        # else:
+        tokenized_prompts = self.tokenized_prompts
 
         if get_texts:
             prompts = self.prompt_learner(label)
@@ -635,8 +635,9 @@ def params_parser():
     args.add_argument("--amp", action="store_true")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp", "adapter"])
     args.add_argument("--vpt_ctx", type=int, default=2)
-    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17"])
-    args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17"])
+    args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
+    args.add_argument("--train_dataset_multitask", type=str, default="", choices=["", "market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
+    args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     return args.parse_args()
 
 
@@ -683,10 +684,19 @@ if __name__ == "__main__":
 
     model = model.cuda()
 
-    _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
-                                           "vit" if "ViT" in params.model else "rn", True, params.train_dataset)
-    loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                       "vit" if "ViT" in params.model else "rn", params.train_dataset)
+    if not params.train_dataset_multitask:
+        _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
+                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset)
+        loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
+                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset)
+    else:
+        _, loader_train_val, n_cls, car_types_train = get_loader_train_multitask(params.root, params.bs, image_height,
+                                                                       image_width,
+                                                                       "vit" if "ViT" in params.model else "rn", True,
+                                                                       params.train_dataset, params.train_dataset_multitask)
+        loader_train_sampled, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
+                                                           "vit" if "ViT" in params.model else "rn",
+                                                           params.train_dataset, params.train_dataset_multitask)
     if params.training_mode == "ivlp":
         # this is from weights of multimodal-prompt-learning
         state_dict = torch.load("./clip_imagenet_pretrained_ivlp.pth.tar-5")["state_dict"]

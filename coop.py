@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 import clip
 from clip.model import LayerNorm, Transformer, ModifiedResNet
-
+from jpm import JPM
 
 class PromptLearnerAugmented(nn.Module):
     def __init__(self, num_class, clip_model):
@@ -192,25 +192,16 @@ class PromptLearnerVeri(nn.Module):
     n_cls_ctx = 3
 
     car_type_explanation = {
-        "sedan": "{} sedan, a type of passenger car that typically features four doors and a separate trunk compartment for cargo.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "suv": "{} SUV, a type of passenger car that typically features a taller body with a boxy shape, a high ground clearance, and a spacious interior capable of accommodating multiple passengers and cargo.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "van": "{} van, a spacious vehicle that features a boxy design, large cargo capacity, and multiple seating configurations, resembling a van.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "hatchback": "{} hatchback, a compact car that features a rear door opening upwards to access a cargo area, typically offering versatile storage options and a practical design.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "mpv": "{} MPV (Multi-Purpose Vehicle), a versatile automobile that features multiple seating configurations, ample interior space, and sliding doors, designed to accommodate passengers and cargo with flexibility and convenience.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "pickup": "{} pickup, a rugged vehicle that features an open cargo area at the rear, often equipped with towing capabilities and four-wheel drive, ideal for hauling goods and navigating diverse terrains.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "bus": "{} bus, a large vehicle that features multiple rows of seating, wide windows, and a distinctive boxy shape, designed to transport passengers efficiently along predetermined routes.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "truck": "{} truck, a robust vehicle that features a separate cabin and cargo area, often with a towing hitch, powerful engine, and sturdy chassis, designed for hauling goods and navigating various terrains with durability and reliability.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "estate": "{} estate, a versatile vehicle that features a spacious cargo area extending from the rear of the cabin, often with a sloping roofline and folding rear seats, providing ample storage capacity and flexibility for transporting goods or luggage.".format(
-            " ".join(["X" for _ in range(n_cls_ctx - 1)])),
-        "": "{} nothing.".format(" ".join(["X" for _ in range(n_cls_ctx - 1)])),
+        "sedan": "{} sedan, a type of passenger car that typically features a lower profile, sleeker lines, a fixed roof, four doors, and a separate trunk compartment for cargo.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "suv": "{} SUV, a type of passenger car that typically features a taller body with a boxy shape, a high ground clearance, and a spacious interior capable of accommodating multiple passengers and cargo.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "van": "{} van, a spacious vehicle that features a boxy design, large cargo capacity, and multiple seating configurations.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "hatchback": "{} hatchback, a compact car that features a rear door opening upwards to access a cargo area.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "mpv": "{} MPV (Multi-Purpose Vehicle), a versatile automobile that features multiple seating configurations, ample interior space, and sliding doors.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "pickup": "{} pickup, a rugged vehicle that features an open cargo area at the rear, often equipped with towing capabilities and four-wheel drive.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "bus": "{} bus, a large vehicle that features multiple rows of seating, wide windows, and a distinctive boxy shape.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "truck": "{} truck, a robust vehicle that features a separate cabin and cargo area, often with a towing hitch, powerful engine, and sturdy chassis.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "estate": "{} estate, a versatile vehicle that features a spacious cargo area extending from the rear of the cabin, often with a sloping roofline and folding rear seats.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
+        "": "{} background.".format(" ".join(["X" for _ in range(n_cls_ctx-1)])),
     }
 
     def __init__(self, num_class, clip_model, car_types):
@@ -218,7 +209,12 @@ class PromptLearnerVeri(nn.Module):
         ctx_inits = []
         for car_type in car_types:
             # ctx_init = "A photo of X X X {}, a type of vehicle.".format(car_type)
-            ctx_init = "A photo of X " + self.car_type_explanation[car_type]
+            car_type_desc = car_type.split(" ")
+            if isinstance(car_type_desc, list) and len(car_type_desc) == 2:
+                sentence = " ".join([self.car_type_explanation[car_type_desc[1]][:(self.n_cls_ctx-1)*2-1], car_type_desc[0], self.car_type_explanation[car_type_desc[1]][(self.n_cls_ctx-1)*2:]])
+                ctx_init = "A photo of X " + sentence
+            else:
+                ctx_init = "A photo of X " + self.car_type_explanation[car_type]
             ctx_init = ctx_init.replace("_", " ")
             ctx_inits.append(ctx_init)
 
@@ -308,6 +304,55 @@ class VisionTransformer(nn.Module):
 
         return x11, x12, xproj
 
+
+class VisionTransformerJPM(nn.Module):
+    def __init__(self, h_resolution: int, w_resolution: int, patch_size: int, stride_size: int, width: int, layers: int,
+                 heads: int, output_dim: int):
+        super().__init__()
+        self.h_resolution = h_resolution
+        self.w_resolution = w_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=stride_size,
+                               bias=False)
+
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn(h_resolution * w_resolution + 1, width))
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads)
+
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+        self.jp_module = JPM(self.transformer.resblocks[11], self.ln_post)
+
+    def forward(self, x: torch.Tensor, cv_emb=None):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat(
+            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        if cv_emb != None:
+            x[:, 0] = x[:, 0] + cv_emb
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+
+        x11 = self.transformer.resblocks[:11](x)
+        x12 = self.transformer.resblocks[11](x11)
+        x11 = x11.permute(1, 0, 2)  # LND -> NLD
+        x12 = x12.permute(1, 0, 2)  # LND -> NLD
+        x12_jp = self.jp_module(x12)
+
+        x12 = self.ln_post(x12)
+
+        if self.proj is not None:
+            xproj = x12 @ self.proj
+
+        return x11, x12, x12_jp, xproj
 
 class CLIP(nn.Module):
     def __init__(self,
