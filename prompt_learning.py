@@ -193,7 +193,7 @@ class CustomCLIPAdapter(nn.Module):
         self.prompt_learner = PromptLearnerAdapter(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        self.adapter = Adapter(512)
+        self.adapter = Adapter(768)
         self.adapter.apply(weights_init_classifier)
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
@@ -236,7 +236,7 @@ class CustomCLIPAdapter(nn.Module):
         image_features_non_proj = image_features_non_proj[:, 0]
         image_features = image_features[:, 0]
 
-        image_features_non_proj_adapter = self.adapter(image_features)
+        image_features_non_proj_adapter = self.adapter(image_features_non_proj)
         image_features_non_proj = self.ratio * image_features_non_proj_adapter + (1 - self.ratio) * image_features_non_proj
 
         features_non_proj = self.vision_bottleneck(image_features_non_proj)
