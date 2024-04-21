@@ -128,9 +128,10 @@ class CustomCLIPCoop(nn.Module):
 
 
 class CustomCLIPPromptSRC(nn.Module):
-    def __init__(self, classnames, clip_model, zero_shot_model):
+    def __init__(self, classnames, clip_model, ZS_image_encoder):
         super().__init__()
-        self.prompt_learner = VLPromptLearnerSRC(classnames, clip_model, zero_shot_model)
+        self.ZS_image_encoder = ZS_image_encoder
+        self.prompt_learner = VLPromptLearnerSRC(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -171,10 +172,10 @@ class CustomCLIPPromptSRC(nn.Module):
 
             with torch.no_grad():
                 if params.amp:
-                    zero_shot_features_last, zero_shot_featues_non_proj, zero_shot_features = self.prompt_learner.ZS_image_encoder(
+                    zero_shot_features_last, zero_shot_featues_non_proj, zero_shot_features = self.ZS_image_encoder(
                         image)
                 else:
-                    zero_shot_features_last, zero_shot_featues_non_proj, zero_shot_features = self.prompt_learner.ZS_image_encoder(
+                    zero_shot_features_last, zero_shot_featues_non_proj, zero_shot_features = self.ZS_image_encoder(
                         image.type(self.dtype))
                 zero_shot_features_last = zero_shot_features_last[:, 0]
                 zero_shot_featues_non_proj = zero_shot_featues_non_proj[:, 0]
@@ -814,7 +815,9 @@ if __name__ == "__main__":
             if "VPT" in layer:
                 state_dict_reseted[layer] = state_dict[layer]
 
-        model = CustomCLIPPromptSRC(n_cls, model, model_zero_shot).cuda()
+        with torch.no_grad():
+            ZS_image_encoder = model_zero_shot.visual
+        model = CustomCLIPPromptSRC(n_cls, model, ZS_image_encoder).cuda()
         model.load_state_dict(state_dict_reseted, strict=False)
     elif params.training_mode == "coop":
         model = CustomCLIPCoop(n_cls, model).cuda()

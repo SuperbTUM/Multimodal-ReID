@@ -1,12 +1,9 @@
 import os
 import argparse
-import numpy as np
-import copy
 from itertools import zip_longest
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.backends import cudnn
 from torch.cuda.amp import GradScaler, autocast
 import clip
@@ -16,11 +13,10 @@ _tokenizer = _Tokenizer()
 from tqdm import tqdm
 
 from utils import load_pretrained_weights
-from data_prepare import get_loader_train, get_loader_train_multitask, get_loader_train_sampled, \
-    get_loader_train_sampled_multitask, get_loader
+from data_prepare import get_loader_train, get_loader_train_sampled, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import WarmupMultiStepLR, create_scheduler
-from losses import SupConLoss, WeightedRegularizedTriplet, CrossEntropyLabelSmooth
+from losses import SupConLoss, WeightedRegularizedTriplet, WeightedRegularizedTripletXBM, CrossEntropyLabelSmooth
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -46,6 +42,35 @@ def weights_init_kaiming(m):
         if m.affine:
             nn.init.constant_(m.weight, 1.0)
             nn.init.constant_(m.bias, 0.0)
+
+
+class XBM:
+    def __init__(self, xbm_size, embed_dim):
+        self.K = xbm_size
+        self.feats = torch.zeros(self.K, embed_dim).cuda() * -1
+        self.targets = torch.zeros(self.K, dtype=torch.long).cuda() * -1
+        self.ptr = 0
+
+    @property
+    def is_full(self):
+        return self.targets[-1].item() != -1
+
+    def get(self):
+        if self.is_full:
+            return self.feats, self.targets
+        else:
+            return self.feats[:self.ptr], self.targets[:self.ptr]
+
+    def enqueue_dequeue(self, feats, targets):
+        q_size = len(targets)
+        if self.ptr + q_size > self.K:
+            self.feats[-q_size:] = feats
+            self.targets[-q_size:] = targets
+            self.ptr = 0
+        else:
+            self.feats[self.ptr: self.ptr + q_size] = feats
+            self.targets[self.ptr: self.ptr + q_size] = targets
+            self.ptr += q_size
 
 
 class Classifier(nn.Module):
@@ -324,8 +349,10 @@ def train_prompter(model,
                                       loss, scheduler._get_lr(epoch)[0]))
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
-            checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
-            torch.save(model_prompter1.state_dict() | model_prompter2.state_dict(), checkpoint_path)
+            checkpoint_path = "/".join((saving_path, "clip_model_prompter1_{}.pth".format(epoch - 1)))
+            torch.save(model_prompter1.state_dict(), checkpoint_path)
+            checkpoint_path = "/".join((saving_path, "clip_model_prompter2_{}.pth".format(epoch - 1)))
+            torch.save(model_prompter2.state_dict(), checkpoint_path)
 
     model.eval()
 
@@ -423,8 +450,12 @@ def train_vision_model(model,
     scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
     scaler = GradScaler()
     triplet_loss = WeightedRegularizedTriplet(0.3)
+    triplet_loss_xbm = WeightedRegularizedTripletXBM(0.3)
     ce_loss1 = CrossEntropyLabelSmooth(n_cls1)
     ce_loss2 = CrossEntropyLabelSmooth(n_cls2)
+
+    xbm1 = XBM(2 * params.bs, 512)
+    xbm2 = XBM(2 * params.bs, 512)
 
     saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
     if not os.path.exists(saving_path):
@@ -453,7 +484,15 @@ def train_vision_model(model,
                             0.25 * ce_loss1(cls_score2, label)
                     output = image_features_proj @ text_features1.t()
                     loss += ce_loss1(output, label)
-                    if params.bs >= 4:
+                    if epoch >= 10:
+                        xbm1.enqueue_dequeue(image_features.detach(), label.detach())
+                        image_features_xbm, label_xbm = xbm1.get()
+
+                        loss += triplet_loss(image_features_last, label) + \
+                                triplet_loss(image_features_non_proj, label) + \
+                                triplet_loss(image_features, label) + \
+                                0.2 * triplet_loss_xbm(image_features, label, image_features_xbm, label_xbm)
+                    else:
                         loss += triplet_loss(image_features_last, label) + \
                                 triplet_loss(image_features_non_proj, label) + \
                                 triplet_loss(image_features, label)
@@ -483,7 +522,14 @@ def train_vision_model(model,
                             0.25 * ce_loss2(cls_score2, label)
                     output = image_features_proj @ text_features2.t()
                     loss += ce_loss2(output, label)
-                    if params.bs >= 4:
+                    if epoch >= 10:
+                        xbm2.enqueue_dequeue(image_features.detach(), label.detach())
+                        image_features_xbm, label_xbm = xbm2.get()
+                        loss += triplet_loss(image_features_last, label) + \
+                                triplet_loss(image_features_non_proj, label) + \
+                                triplet_loss(image_features, label) + \
+                                0.2 * triplet_loss_xbm(image_features, label, image_features_xbm, label_xbm)
+                    else:
                         loss += triplet_loss(image_features_last, label) + \
                                 triplet_loss(image_features_non_proj, label) + \
                                 triplet_loss(image_features, label)

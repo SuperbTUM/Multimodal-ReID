@@ -186,7 +186,7 @@ class VLPromptLearnerVeri(nn.Module):
 
 
 class VLPromptLearnerSRC(nn.Module):
-    def __init__(self, n_cls, clip_model, zero_shot_model, dataset_name="market1501"):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501"):
         super().__init__()
 
         n_ctx = 4
@@ -209,10 +209,8 @@ class VLPromptLearnerSRC(nn.Module):
         self.ctx = nn.Parameter(ctx_vectors)
 
         # Also create frozen CLIP
-        clip_model_temp_image = zero_shot_model
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-            self.ZS_image_encoder = clip_model_temp_image.visual
 
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
