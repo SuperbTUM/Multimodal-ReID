@@ -1,6 +1,8 @@
 import os
 import argparse
 from itertools import zip_longest
+import numpy as np
+import copy
 
 import torch
 import torch.nn as nn
@@ -42,6 +44,35 @@ def weights_init_kaiming(m):
         if m.affine:
             nn.init.constant_(m.weight, 1.0)
             nn.init.constant_(m.bias, 0.0)
+
+
+def get_gauss(mu, sigma, max_epochs):
+    gauss = lambda x: (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+    gauss_weights = np.array([gauss(a) for a in range(1, max_epochs + 1)])
+    gauss_weights = gauss_weights / sum(gauss_weights)
+    return gauss_weights
+
+
+def state_dict_weighting(main_dict, weightage, prompt_only=False):
+    # Average all parameters
+    updated_dict = copy.deepcopy(main_dict)
+    if not prompt_only:
+        for key in main_dict:
+            updated_dict[key] = main_dict[key] * weightage
+        return updated_dict
+    else:
+        return main_dict * weightage
+
+
+def state_dict_add(dict1, dict2, prompt_only=False):
+    # Average all parameters
+    if not prompt_only:
+        modified_dict = dict2
+        for key in dict1:
+            modified_dict[key] = (modified_dict[key] + dict1[key])
+        return modified_dict
+    else:
+        return dict1 + dict2
 
 
 class XBM:
@@ -461,6 +492,9 @@ def train_vision_model(model,
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
+    gauss_weights = get_gauss(mu=30, sigma=30, max_epochs=params.epochs_stage2)
+    previous_model_gpa = None
+
     for epoch in range(epochs):
         scheduler.step()
         loss_sum = 0.
@@ -540,6 +574,17 @@ def train_vision_model(model,
                 scaler.step(optimizer)
                 scaler.update()
         print("epoch: {}, loss avg: {}".format(epoch, loss_sum / cnt))
+
+        current_epoch_gauss_weights = gauss_weights[epoch]
+        if previous_model_gpa is None:
+            previous_model_gpa = state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights)
+        else:
+            previous_model_gpa = state_dict_add(
+                state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights),
+                previous_model_gpa)
+
+        if epoch == params.epochs_stage2 - 1:
+            model.load_state_dict(previous_model_gpa)
 
         if epoch % 20 == 0 or epoch == params.epochs_stage2 - 1:
             checkpoint_path = "/".join((saving_path, "clip_model_weight_{}.pth".format(epoch)))

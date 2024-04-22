@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from timm.data.random_erasing import RandomErasing
 
-from datasets import dataset_market, dataset_dukemtmc, dataset_msmt17, dataset_veri, dataset_vehicleid
+from datasets import dataset_market, dataset_dukemtmc, dataset_msmt17, dataset_veri, dataset_vehicleid, dataset_personx
 
 
 import copy
@@ -139,6 +139,8 @@ def get_dataset(root, dataset_name):
         dataset = dataset_veri.VeRi(root=root)
     elif dataset_name == "vehicleid":
         dataset = dataset_vehicleid.VehicleID(root=root)
+    elif dataset_name == "personx":
+        dataset = dataset_personx.PersonX(root=root)
     else:
         raise NotImplementedError
     return dataset

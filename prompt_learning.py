@@ -439,7 +439,7 @@ def train_prompter(model,
                       .format(epoch, (i + 1), len(dataloader_train_val),
                               loss, scheduler._get_lr(epoch)[0]))
 
-        current_epoch_gauss_weights = gauss_weights[epoch]
+        current_epoch_gauss_weights = gauss_weights[epoch-1]
         if params.training_mode == "promptsrc" and previous_model_gpa is None:
             previous_model_gpa = state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights)
         elif params.training_mode == "promptsrc":
