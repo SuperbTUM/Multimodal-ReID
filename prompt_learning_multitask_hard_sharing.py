@@ -374,9 +374,9 @@ def train_prompter(model,
                     scaler.update()
 
                     torch.cuda.synchronize()
-                    if (i + 1) % 100 == 0:
+                    if (j + 1) % 100 == 0:
                         print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
-                              .format(epoch, (i + 1), len(dataloader_train_val1),
+                              .format(epoch, (j + 1), len(dataloader_train_val2),
                                       loss, scheduler._get_lr(epoch)[0]))
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
@@ -631,7 +631,7 @@ def get_cmc_map(
 ):
     gallery_embeddings = gallery_embeddings.cpu()
     query_embeddings = query_embeddings.cpu()
-    evaluator = R1_mAP_eval(len(query_labels), max_rank=50, feat_norm=True)
+    evaluator = R1_mAP_eval(len(query_labels), max_rank=20, feat_norm=True)
     evaluator.reset()
     evaluator.update((torch.cat((query_embeddings, gallery_embeddings), dim=0),
                       torch.cat((query_labels, gallery_labels), dim=0),
