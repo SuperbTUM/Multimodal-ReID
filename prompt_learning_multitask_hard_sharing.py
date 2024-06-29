@@ -239,40 +239,52 @@ def train_prompter(model,
         model_prompter1 = model_prompter1.float()
         model_prompter2 = model_prompter2.float()
 
-    labels1 = []
-    image_features1 = []
-    labels2 = []
-    image_features2 = []
-    with torch.no_grad():
-        for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val1):
-            img = img.cuda()
-            target = vid.cuda()
-            with autocast(enabled=True):
-                image_feature = model(img, target, get_image=True)
-                for i, img_feat in zip(target, image_feature):
-                    labels1.append(i)
-                    image_features1.append(img_feat.cpu())
-        labels_list1 = torch.stack(labels1, dim=0).cuda()  # N
-        image_features_list1 = torch.stack(image_features1, dim=0).cuda()
+    if params.training_mode not in ("ivlp", "promptsrc"):
+        labels1 = []
+        image_features1 = []
+        labels2 = []
+        image_features2 = []
+        with torch.no_grad():
+            for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val1):
+                img = img.cuda()
+                target = vid.cuda()
+                with autocast(enabled=True):
+                    image_feature = model(img, target, get_image=True)
+                    for i, img_feat in zip(target, image_feature):
+                        labels1.append(i)
+                        image_features1.append(img_feat.cpu())
+            labels_list1 = torch.stack(labels1, dim=0).cuda()  # N
+            image_features_list1 = torch.stack(image_features1, dim=0).cuda()
 
-        batch = params.bs
-        num_image1 = labels_list1.shape[0]
-        iter1 = num_image1 // batch
+            batch = params.bs
+            num_image = labels_list1.shape[0]
+            iter1 = num_image // batch
+            del labels1, image_features1
 
-        for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val2):
-            img = img.cuda()
-            target = vid.cuda()
-            with autocast(enabled=True):
-                image_feature = model(img, target, get_image=True)
-                for i, img_feat in zip(target, image_feature):
-                    labels2.append(i)
-                    image_features2.append(img_feat.cpu())
-        labels_list2 = torch.stack(labels2, dim=0).cuda()  # N
-        image_features_list2 = torch.stack(image_features2, dim=0).cuda()
+            for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val2):
+                img = img.cuda()
+                target = vid.cuda()
+                with autocast(enabled=True):
+                    image_feature = model(img, target, get_image=True)
+                    for i, img_feat in zip(target, image_feature):
+                        labels2.append(i)
+                        image_features2.append(img_feat.cpu())
+            labels_list2 = torch.stack(labels2, dim=0).cuda()  # N
+            image_features_list2 = torch.stack(image_features2, dim=0).cuda()
 
-        batch = params.bs
-        num_image2 = labels_list2.shape[0]
-        iter2 = num_image2 // batch
+            num_image2 = labels_list2.shape[0]
+            iter2 = num_image2 // batch
+            del labels2, image_features2
+    else:
+        with torch.no_grad():
+            num_image1 = num_image2 = 0
+            for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val1):
+                num_image1 += vid.size(0)
+            batch = params.bs
+            iter1 = num_image1 // batch
+            for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val2):
+                num_image2 += vid.size(0)
+            iter2 = num_image2 // batch
 
     if pretrained is not None:
         load_pretrained_weights(model_prompter1, pretrained)
@@ -299,6 +311,9 @@ def train_prompter(model,
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
+    # gauss_weights = get_gauss(mu=60, sigma=45, max_epochs=params.epochs_stage1)
+    # previous_model_gpa = None
+
     for epoch in range(1, epochs + 1):
         scheduler.step(epoch)
         model.train()
@@ -309,75 +324,148 @@ def train_prompter(model,
         cnt = 0
         iter_list1 = torch.randperm(num_image1).cuda()
         iter_list2 = torch.randperm(num_image2).cuda()
+        dataloader_train_val_iter1 = copy.copy(dataloader_train_val1)
+        dataloader_train_val_iter2 = copy.copy(dataloader_train_val2)
         while i <= iter1 or j <= iter2:
             optimizer.zero_grad()
 
-            if j > iter2 or cnt == 0:
-                cnt ^= 1
+            if params.training_mode in ("ivlp", "promptsrc"):
+                if j > iter2 or cnt == 0:
+                    cnt ^= 1
 
-                if i != iter1:
-                    b_list = iter_list1[i * batch:(i + 1) * batch]
+                    (img, vid, target_cam, target_view, indices) = next(iter(dataloader_train_val_iter1))
+                    img = img.cuda()
+                    target = vid.cuda()
+                    i += 1
+
+                    if target.size(0) > 0:
+                        with autocast(enabled=True):
+                            prompts = model_prompter1(target)
+                            tokenized_prompts = model_prompter1.tokenized_prompts
+                            text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
+                            image_features = model(img, target, get_image=True)
+                        loss_i2t = loss_func(image_features, text_features, target, target)
+                        loss_t2i = loss_func(text_features, image_features, target, target)
+
+                        loss = loss_i2t + loss_t2i
+
+                        scaler.scale(loss).backward()
+
+                        scaler.step(optimizer)
+                        scaler.update()
+
+                        torch.cuda.synchronize()
+                        if (i + 1) % 100 == 0:
+                            print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
+                                  .format(epoch, (i + 1), len(dataloader_train_val1),
+                                          loss, scheduler._get_lr(epoch)[0]))
                 else:
-                    b_list = iter_list1[i * batch:num_image1]
+                    cnt ^= 1
+                    (img, vid, target_cam, target_view, indices) = next(iter(dataloader_train_val_iter2))
+                    img = img.cuda()
+                    target = vid.cuda()
+                    j += 1
 
-                target = labels_list1[b_list]
-                image_features = image_features_list1[b_list]
+                    if target.size(0) > 0:
+                        with autocast(enabled=True):
+                            prompts = model_prompter2(target)
+                            tokenized_prompts = model_prompter2.tokenized_prompts
+                            text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
+                            image_features = model(img, target, get_image=True)
+                        loss_i2t = loss_func(image_features, text_features, target, target)
+                        loss_t2i = loss_func(text_features, image_features, target, target)
 
-                i += 1
+                        loss = loss_i2t + loss_t2i
 
-                if target.size(0) > 0:
-                    with autocast(enabled=True):
-                        prompts = model_prompter1(target)
-                        tokenized_prompts = model_prompter1.tokenized_prompts
-                        text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
-                    loss_i2t = loss_func(image_features, text_features, target, target)
-                    loss_t2i = loss_func(text_features, image_features, target, target)
+                        scaler.scale(loss).backward()
 
-                    loss = loss_i2t + loss_t2i
+                        scaler.step(optimizer)
+                        scaler.update()
 
-                    scaler.scale(loss).backward()
-
-                    scaler.step(optimizer)
-                    scaler.update()
-
-                    torch.cuda.synchronize()
-                    if (i + 1) % 100 == 0:
-                        print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
-                              .format(epoch, (i + 1), len(dataloader_train_val1),
-                                      loss, scheduler._get_lr(epoch)[0]))
+                        torch.cuda.synchronize()
+                        if (j + 1) % 100 == 0:
+                            print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
+                                  .format(epoch, (j + 1), len(dataloader_train_val2),
+                                          loss, scheduler._get_lr(epoch)[0]))
             else:
-                cnt ^= 1
 
-                if j != iter2:
-                    b_list = iter_list2[j * batch:(j + 1) * batch]
+                if j > iter2 or cnt == 0:
+                    cnt ^= 1
+
+                    if i != iter1:
+                        b_list = iter_list1[i * batch:(i + 1) * batch]
+                    else:
+                        b_list = iter_list1[i * batch:num_image1]
+
+                    target = labels_list1[b_list]
+                    image_features = image_features_list1[b_list]
+
+                    i += 1
+
+                    if target.size(0) > 0:
+                        with autocast(enabled=True):
+                            prompts = model_prompter1(target)
+                            tokenized_prompts = model_prompter1.tokenized_prompts
+                            text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
+                        loss_i2t = loss_func(image_features, text_features, target, target)
+                        loss_t2i = loss_func(text_features, image_features, target, target)
+
+                        loss = loss_i2t + loss_t2i
+
+                        scaler.scale(loss).backward()
+
+                        scaler.step(optimizer)
+                        scaler.update()
+
+                        torch.cuda.synchronize()
+                        if (i + 1) % 100 == 0:
+                            print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
+                                  .format(epoch, (i + 1), len(dataloader_train_val1),
+                                          loss, scheduler._get_lr(epoch)[0]))
                 else:
-                    b_list = iter_list2[j * batch:num_image2]
+                    cnt ^= 1
 
-                target = labels_list2[b_list]
-                image_features = image_features_list2[b_list]
+                    if j != iter2:
+                        b_list = iter_list2[j * batch:(j + 1) * batch]
+                    else:
+                        b_list = iter_list2[j * batch:num_image2]
 
-                j += 1
+                    target = labels_list2[b_list]
+                    image_features = image_features_list2[b_list]
 
-                if target.size(0) > 0:
-                    with autocast(enabled=True):
-                        prompts = model_prompter2(target)
-                        tokenized_prompts = model_prompter2.tokenized_prompts
-                        text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
-                    loss_i2t = loss_func(image_features, text_features, target, target)
-                    loss_t2i = loss_func(text_features, image_features, target, target)
+                    j += 1
 
-                    loss = loss_i2t + loss_t2i
+                    if target.size(0) > 0:
+                        with autocast(enabled=True):
+                            prompts = model_prompter2(target)
+                            tokenized_prompts = model_prompter2.tokenized_prompts
+                            text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
+                        loss_i2t = loss_func(image_features, text_features, target, target)
+                        loss_t2i = loss_func(text_features, image_features, target, target)
 
-                    scaler.scale(loss).backward()
+                        loss = loss_i2t + loss_t2i
 
-                    scaler.step(optimizer)
-                    scaler.update()
+                        scaler.scale(loss).backward()
 
-                    torch.cuda.synchronize()
-                    if (j + 1) % 100 == 0:
-                        print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
-                              .format(epoch, (j + 1), len(dataloader_train_val2),
-                                      loss, scheduler._get_lr(epoch)[0]))
+                        scaler.step(optimizer)
+                        scaler.update()
+
+                        torch.cuda.synchronize()
+                        if (j + 1) % 100 == 0:
+                            print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
+                                  .format(epoch, (j + 1), len(dataloader_train_val2),
+                                          loss, scheduler._get_lr(epoch)[0]))
+
+        # current_epoch_gauss_weights = gauss_weights[epoch - 1]
+        # if previous_model_gpa is None:
+        #     previous_model_gpa = state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights)
+        # else:
+        #     previous_model_gpa = state_dict_add(
+        #         state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights),
+        #         previous_model_gpa)
+        #
+        # if epoch == params.epochs_stage1 - 1:
+        #     model.load_state_dict(previous_model_gpa)
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter1_{}.pth".format(epoch - 1)))

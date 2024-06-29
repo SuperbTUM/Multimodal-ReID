@@ -360,23 +360,32 @@ def train_prompter(model,
     if params.amp:
         model = model.float()
 
-    labels = []
-    image_features = []
-    with torch.no_grad():
-        for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val):
-            img = img.cuda()
-            target = vid.cuda()
-            with autocast(enabled=True):
-                image_feature = model(img, target, get_image=True)
-                for i, img_feat in zip(target, image_feature):
-                    labels.append(i)
-                    image_features.append(img_feat.cpu())
-        labels_list = torch.stack(labels, dim=0).cuda()  # N
-        image_features_list = torch.stack(image_features, dim=0).cuda()
+    if params.training_mode not in ("ivlp", "promptsrc"):
+        labels = []
+        image_features = []
+        with torch.no_grad():
+            for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val):
+                img = img.cuda()
+                target = vid.cuda()
+                with autocast(enabled=True):
+                    image_feature = model(img, target, get_image=True)
+                    for i, img_feat in zip(target, image_feature):
+                        labels.append(i)
+                        image_features.append(img_feat.cpu())
+            labels_list = torch.stack(labels, dim=0).cuda()  # N
+            image_features_list = torch.stack(image_features, dim=0).cuda()
 
-        batch = params.bs
-        num_image = labels_list.shape[0]
-        i_ter = num_image // batch
+            batch = params.bs
+            num_image = labels_list.shape[0]
+            i_ter = num_image // batch
+            del labels, image_features
+    else:
+        with torch.no_grad():
+            num_image = 0
+            for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val):
+                num_image += vid.size(0)
+            batch = params.bs
+            i_ter = num_image // batch
 
     if pretrained is not None:
         load_pretrained_weights(model.prompt_learner, pretrained)
@@ -409,20 +418,28 @@ def train_prompter(model,
     for epoch in range(1, epochs + 1):
         scheduler.step(epoch)
         model.train()
-
         iter_list = torch.randperm(num_image).cuda()
+        dataloader_train_val_iter = copy.copy(dataloader_train_val)
         for i in range(i_ter + 1):
             optimizer.zero_grad()
-            if i != i_ter:
-                b_list = iter_list[i * batch:(i + 1) * batch]
+            if params.training_mode in ("ivlp", "promptsrc"):
+                (img, vid, target_cam, target_view, indices) = next(iter(dataloader_train_val_iter))
+                img = img.cuda()
+                target = vid.cuda()
+                with autocast(enabled=True):
+                    image_features = model(img, target, get_image=True)  # the model is changing with ivlp
+                    text_features = model(label=target, get_texts=True)
             else:
-                b_list = iter_list[i * batch:num_image]
+                if i != i_ter:
+                    b_list = iter_list[i * batch:(i + 1) * batch]
+                else:
+                    b_list = iter_list[i * batch:num_image]
 
-            target = labels_list[b_list]
-            image_features = image_features_list[b_list]
+                target = labels_list[b_list]
+                image_features = image_features_list[b_list]
 
-            with autocast(enabled=True):
-                text_features = model(label=target, get_texts=True)
+                with autocast(enabled=True):
+                    text_features = model(label=target, get_texts=True)
             loss_i2t = loss_func(image_features, text_features, target, target)
             loss_t2i = loss_func(text_features, image_features, target, target)
 
@@ -434,7 +451,7 @@ def train_prompter(model,
             scaler.update()
 
             torch.cuda.synchronize()
-            if (i + 1) % 100 == 0:
+            if (i + 1) % 200 == 0:
                 print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
                       .format(epoch, (i + 1), len(dataloader_train_val),
                               loss, scheduler._get_lr(epoch)[0]))
@@ -614,7 +631,7 @@ def get_cmc_map(
 ):
     gallery_embeddings = gallery_embeddings.cpu()
     query_embeddings = query_embeddings.cpu()
-    evaluator = R1_mAP_eval(len(query_labels), max_rank=50, feat_norm=True)
+    evaluator = R1_mAP_eval(len(query_labels), max_rank=10, feat_norm=True)
     evaluator.reset()
     evaluator.update((torch.cat((query_embeddings, gallery_embeddings), dim=0),
                       torch.cat((query_labels, gallery_labels), dim=0),
