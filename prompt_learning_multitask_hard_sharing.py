@@ -257,8 +257,8 @@ def train_prompter(model,
             image_features_list1 = torch.stack(image_features1, dim=0).cuda()
 
             batch = params.bs
-            num_image = labels_list1.shape[0]
-            iter1 = num_image // batch
+            num_image1 = labels_list1.shape[0]
+            iter1 = num_image1 // batch
             del labels1, image_features1
 
             for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val2):
