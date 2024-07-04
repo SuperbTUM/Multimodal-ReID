@@ -326,6 +326,8 @@ def train_prompter(model,
         iter_list2 = torch.randperm(num_image2).cuda()
         dataloader_train_val_iter1 = copy.copy(dataloader_train_val1)
         dataloader_train_val_iter2 = copy.copy(dataloader_train_val2)
+        dataloader_train_val_iter1 = iter(dataloader_train_val_iter1)
+        dataloader_train_val_iter2 = iter(dataloader_train_val_iter2)
         while i <= iter1 or j <= iter2:
             optimizer.zero_grad()
 
@@ -333,7 +335,7 @@ def train_prompter(model,
                 if j > iter2 or cnt == 0:
                     cnt ^= 1
 
-                    (img, vid, target_cam, target_view, indices) = next(iter(dataloader_train_val_iter1))
+                    (img, vid, target_cam, target_view, indices) = next(dataloader_train_val_iter1)
                     img = img.cuda()
                     target = vid.cuda()
                     i += 1
@@ -361,7 +363,7 @@ def train_prompter(model,
                                           loss, scheduler._get_lr(epoch)[0]))
                 else:
                     cnt ^= 1
-                    (img, vid, target_cam, target_view, indices) = next(iter(dataloader_train_val_iter2))
+                    (img, vid, target_cam, target_view, indices) = next(dataloader_train_val_iter2)
                     img = img.cuda()
                     target = vid.cuda()
                     j += 1

@@ -420,10 +420,11 @@ def train_prompter(model,
         model.train()
         iter_list = torch.randperm(num_image).cuda()
         dataloader_train_val_iter = copy.copy(dataloader_train_val)
+        dataloader_train_val_iter = iter(dataloader_train_val_iter)
         for i in range(i_ter + 1):
             optimizer.zero_grad()
             if params.training_mode in ("ivlp", "promptsrc"):
-                (img, vid, target_cam, target_view, indices) = next(iter(dataloader_train_val_iter))
+                (img, vid, target_cam, target_view, indices) = next(dataloader_train_val_iter)
                 img = img.cuda()
                 target = vid.cuda()
                 with autocast(enabled=True):
