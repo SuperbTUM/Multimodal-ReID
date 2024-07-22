@@ -690,7 +690,7 @@ if __name__ == "__main__":
                           "language_depth": 12,
                           "vision_ctx": params.vpt_ctx,
                           "language_ctx": params.vpt_ctx}
-        model_zero_shot = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16) # build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot)
+        model_zero_shot = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot, 16)
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
     elif params.training_mode == "coop":
         # model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)

@@ -642,12 +642,12 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
 
 class VisionTransformer(nn.Module):
     def __init__(self, h_resolution: int, w_resolution: int, patch_size: int, width: int, layers: int, heads: int,
-                 output_dim: int, design_details):
+                 output_dim: int, design_details, stride_size):
         super().__init__()
         self.h_resolution = h_resolution
         self.w_resolution = w_resolution
         self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=12, bias=False)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=stride_size, bias=False)
         if design_details["vision_depth"] == 0:
             self.VPT_shallow = False
         else:
@@ -780,7 +780,8 @@ class CLIP(nn.Module):
                  transformer_width: int,
                  transformer_heads: int,
                  transformer_layers: int,
-                 design_details
+                 design_details,
+                 stride_size: int = 12
                  ):
         super().__init__()
 
@@ -818,7 +819,8 @@ class CLIP(nn.Module):
                     layers=vision_layers,
                     heads=vision_heads,
                     output_dim=embed_dim,
-                    design_details=design_details
+                    design_details=design_details,
+                    stride_size=stride_size
                 )
         # hyper-parameter if need to add prompt embeddings inside to the input
         # of transformer block or not:
@@ -960,7 +962,7 @@ def resize_pos_embed(posemb, posemb_new, height, width):
     return posemb
 
 
-def build_model(state_dict: dict, h_resolution, w_resolution, design_details):
+def build_model(state_dict: dict, h_resolution, w_resolution, design_details, stride_size=12):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -985,13 +987,14 @@ def build_model(state_dict: dict, h_resolution, w_resolution, design_details):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
-    h_resolution = h_resolution // 12
-    w_resolution = w_resolution // 12
+    h_resolution = h_resolution // stride_size
+    w_resolution = w_resolution // stride_size
 
     model = CLIP(
         embed_dim,
         h_resolution, w_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, design_details
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, design_details,
+        stride_size
     )
 
     if vit:
