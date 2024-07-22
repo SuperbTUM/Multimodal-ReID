@@ -681,10 +681,10 @@ if __name__ == "__main__":
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
     elif params.training_mode == "promptsrc":
         design_details_zero_shot = {"trainer": 'IVLP',
-                          "vision_depth": 0,
-                          "language_depth": 0,
-                          "vision_ctx": 0,
-                          "language_ctx": 0}
+                          "vision_depth": 12,
+                          "language_depth": 12,
+                          "vision_ctx": 2,
+                          "language_ctx": 2}
         design_details = {"trainer": 'IVLP',
                           "vision_depth": 12,
                           "language_depth": 12,
