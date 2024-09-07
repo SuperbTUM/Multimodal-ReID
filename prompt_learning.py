@@ -30,6 +30,7 @@ from coop import (build_model as build_model_coop,
 from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC, VLPromptLearnerVeri
 from clip_adapter import Adapter, build_model as build_model_adapter, PromptLearner as PromptLearnerAdapter
 import clip_custom
+from metaclip import build_model_from_openai_state_dict
 
 
 def weights_init_classifier(m):
@@ -690,7 +691,8 @@ if __name__ == "__main__":
                           "language_depth": 12,
                           "vision_ctx": params.vpt_ctx,
                           "language_ctx": params.vpt_ctx}
-        model_zero_shot = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot, 16)
+        # model_zero_shot = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot, 16)
+        model_zero_shot = build_model_from_openai_state_dict(torch.load("./metaclip_b16_fullcc2.5b.bin")) # This comes from Huggingface
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
     elif params.training_mode == "coop":
         # model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
