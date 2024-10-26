@@ -4,6 +4,8 @@ As multimodal models go viral these days, we make an attempt to apply CLIP varia
 
 This work has been accepted by [ISVC](https://www.isvc.net/) 24' and will be published on [Advances in Visual Computing](https://link.springer.com/conference/isvc) by the end of 2024.
 
+[Slides](https://drive.google.com/file/d/156Mi89qjdezJEjDvI6fqkOv1ZzhFdUJt/view?usp=sharing) are now available.
+
 **Installation**
 
 ```bash
