@@ -158,10 +158,10 @@ class CustomCLIPPromptSRC(nn.Module):
 
             with torch.no_grad():
                 if params.amp:
-                    zero_shot_features = self.ZS_image_encoder(image)[-1]
+                    zero_shot_features_non_proj = self.ZS_image_encoder(image)[1]
                 else:
-                    zero_shot_features = self.ZS_image_encoder(image.type(self.dtype))[-1]
-                zero_shot_features = zero_shot_features[:, 0]
+                    zero_shot_features_non_proj = self.ZS_image_encoder(image.type(self.dtype))[1]
+                zero_shot_features_non_proj = zero_shot_features_non_proj[:, 0]
 
             if params.amp:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
@@ -178,7 +178,7 @@ class CustomCLIPPromptSRC(nn.Module):
 
             return [cls_score, cls_score_proj], [image_features_last,
                                                  image_features_non_proj,
-                                                 image_features], image_features, zero_shot_features
+                                                 image_features], image_features, zero_shot_features_non_proj
         else:
             if params.amp:
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image)
@@ -486,8 +486,8 @@ def train_vision_model(model,
         label = label.cuda()
         loss = 0.
         if params.training_mode == "promptsrc":
-            cls_scores, image_features_list, image_features_proj, zero_shot_features = model(image, label)
-            loss += F.smooth_l1_loss(image_features_proj, zero_shot_features, reduction="mean")
+            cls_scores, image_features_list, image_features_proj, zero_shot_features_non_proj = model(image, label)
+            loss += F.smooth_l1_loss(image_features_list[1], zero_shot_features_non_proj, reduction="mean")
         else:
             cls_scores, image_features_list, image_features_proj = model(image, label)
         image_features_last, image_features_non_proj, image_features = image_features_list
