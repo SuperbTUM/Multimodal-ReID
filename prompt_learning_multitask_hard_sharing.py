@@ -26,7 +26,7 @@ cudnn.deterministic = True
 from text_encoder import TextEncoder
 from coop import build_model as build_model_coop, \
     PromptLearner as PromptLearnerCoop
-from maple import build_model as build_model_maple, VLPromptLearner
+from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerCSC
 import clip_custom
 
 
@@ -226,6 +226,159 @@ class CustomCLIPIVLP(nn.Module):
             return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
+class CustomCLIPCSC(nn.Module):
+    def __init__(self, clip_model):
+        super().__init__()
+        # Import VLPromptLearnerCSC from maple if not already visible
+        from maple import TextEncoder as TextEncoderCSC
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoderCSC(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+    def forward(self, image=None, label=None, get_image=False, get_texts=False, prompts=None, tokenized_prompts=None):
+        deeper_text = deeper_vision = shared_vision = None
+        if get_image:
+            if isinstance(prompts, (list, tuple)):
+                prompts, deeper_text, deeper_vision, shared_vision = prompts
+            
+            if params.amp:
+                _, _, image_features = self.image_encoder(image, shared_vision, deeper_vision)
+            else:
+                _, _, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
+            return image_features[:, 0]
+
+        if get_texts:
+            if isinstance(prompts, (list, tuple)):
+                prompts, deeper_text, deeper_vision, shared_vision = prompts
+            
+            text_features = self.text_encoder(prompts, tokenized_prompts, deeper_text)
+            return text_features
+
+        if isinstance(prompts, (list, tuple)):
+            prompts, deeper_text, deeper_vision, shared_vision = prompts
+
+        if params.amp:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image, shared_vision, deeper_vision)
+        else:
+            image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
+
+        image_features_last = image_features_last[:, 0]
+        image_features_non_proj = image_features_non_proj[:, 0]
+        image_features = image_features[:, 0]
+
+        if self.training:
+            text_features = self.text_encoder(prompts, tokenized_prompts, deeper_text)
+            logits = image_features @ text_features.t()
+            return text_features, image_features, logits, [image_features_last,
+                                                            image_features_non_proj,
+                                                            image_features], image_features
+        else:
+            return torch.cat((image_features_non_proj, image_features), dim=1)
+
+
+def train_prompter_maple(model,
+                         model_prompter1,
+                         model_prompter2,
+                         dataloader_train_val1,
+                         dataloader_train_val2,
+                         epochs,
+                         pretrained=None):
+    print("Building custom CLIP for MaPLe")
+    if params.amp:
+        model = model.float()
+        model_prompter1 = model_prompter1.float()
+        model_prompter2 = model_prompter2.float()
+
+    with torch.no_grad():
+        num_image1 = num_image2 = 0
+        for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val1):
+            num_image1 += vid.size(0)
+        batch = params.bs
+        iter1 = num_image1 // batch
+        for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val2):
+            num_image2 += vid.size(0)
+        iter2 = num_image2 // batch
+
+    if pretrained is not None:
+        load_pretrained_weights(model_prompter1, pretrained)
+        load_pretrained_weights(model_prompter2, pretrained)
+
+    print("Turning off gradients in CLIP backbone")
+    # Unique parameters across both prompters (MaPLe shared + ID specific)
+    params_to_train = list(set(model_prompter1.parameters()) | set(model_prompter2.parameters()))
+    learnable_params = [{"params": params_to_train, "lr": 0.00035, "weight_decay": 1e-4}]
+
+    optimizer = torch.optim.Adam(learnable_params, lr=0.00035, weight_decay=1e-4)
+    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
+    scaler = GradScaler()
+    loss_func = SupConLoss("cuda")
+
+    if not os.path.exists(params.save_path):
+        os.mkdir(params.save_path)
+    saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
+    if not os.path.exists(saving_path):
+        os.mkdir(saving_path)
+
+    for epoch in range(1, epochs + 1):
+        scheduler.step(epoch)
+        model.train()
+        model_prompter1.train()
+        model_prompter2.train()
+
+        i = j = 0
+        cnt = 0
+        dataloader_train_val_iter1 = iter(dataloader_train_val1)
+        dataloader_train_val_iter2 = iter(dataloader_train_val2)
+        while i <= iter1 and j <= iter2:
+            optimizer.zero_grad()
+
+            if j > iter2 or cnt == 0:
+                cnt ^= 1
+                try:
+                    (img, vid, target_cam, target_view, indices) = next(dataloader_train_val_iter1)
+                except StopIteration:
+                    break
+                img = img.cuda()
+                target = vid.cuda()
+                i += 1
+                if target.size(0) > 0:
+                    with autocast(enabled=True):
+                        prompts = model_prompter1(target)
+                        image_features = model(img, target, get_image=True, prompts=prompts)
+                        text_features = model(label=target, get_texts=True, prompts=prompts)
+            else:
+                cnt ^= 1
+                try:
+                    (img, vid, target_cam, target_view, indices) = next(dataloader_train_val_iter2)
+                except StopIteration:
+                    break
+                img = img.cuda()
+                target = vid.cuda()
+                j += 1
+                if target.size(0) > 0:
+                    with autocast(enabled=True):
+                        prompts = model_prompter2(target)
+                        image_features = model(img, target, get_image=True, prompts=prompts)
+                        text_features = model(label=target, get_texts=True, prompts=prompts)
+
+            loss_i2t = loss_func(image_features, text_features, target, target)
+            loss_t2i = loss_func(text_features, image_features, target, target)
+            loss = loss_i2t + loss_t2i
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            if (i + j) % 100 == 0:
+                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
+                      .format(epoch, (i + j), iter1 + iter2,
+                              loss, scheduler._get_lr(epoch)[0]))
+
+        torch.save(model_prompter1.state_dict(), os.path.join(saving_path, "clip_model_prompter1_{}.pth".format(epoch)))
+        torch.save(model_prompter2.state_dict(), os.path.join(saving_path, "clip_model_prompter2_{}.pth".format(epoch)))
+
+
 def train_prompter(model,
                    model_prompter1,
                    model_prompter2,
@@ -239,7 +392,7 @@ def train_prompter(model,
         model_prompter1 = model_prompter1.float()
         model_prompter2 = model_prompter2.float()
 
-    if params.training_mode not in ("ivlp", "promptsrc"):
+    if params.training_mode not in ("ivlp", "promptsrc", "csc-maple"):
         labels1 = []
         image_features1 = []
         labels2 = []
@@ -345,7 +498,7 @@ def train_prompter(model,
                             prompts = model_prompter1(target)
                             tokenized_prompts = model_prompter1.tokenized_prompts
                             text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
-                            image_features = model(img, target, get_image=True)
+                            image_features = model(img, target, get_image=True, prompts=prompts)
                         loss_i2t = loss_func(image_features, text_features, target, target)
                         loss_t2i = loss_func(text_features, image_features, target, target)
 
@@ -373,7 +526,7 @@ def train_prompter(model,
                             prompts = model_prompter2(target)
                             tokenized_prompts = model_prompter2.tokenized_prompts
                             text_features = model(get_texts=True, prompts=prompts, tokenized_prompts=tokenized_prompts)
-                            image_features = model(img, target, get_image=True)
+                            image_features = model(img, target, get_image=True, prompts=prompts)
                         loss_i2t = loss_func(image_features, text_features, target, target)
                         loss_t2i = loss_func(text_features, image_features, target, target)
 
@@ -636,8 +789,12 @@ def train_vision_model(model,
                     loss = 0.
                     prompts = model_prompter2(label)
                     tokenized_prompts = model_prompter2.tokenized_prompts
-                    image_features_list, image_features_proj = model(image, prompts=prompts,
-                                                                     tokenized_prompts=tokenized_prompts)[3:]
+                    if params.training_mode == "csc-maple":
+                        cls_scores, image_features_list, image_features_proj = model(image, prompts=prompts,
+                                                                         tokenized_prompts=tokenized_prompts)[3:]
+                    else:
+                        image_features_list, image_features_proj = model(image, prompts=prompts,
+                                                                         tokenized_prompts=tokenized_prompts)[3:]
                     image_features_last, image_features_non_proj, image_features = image_features_list
                     cls_score = classifier2(image_features_non_proj, image_features)
                     cls_score1, cls_score2 = cls_score
@@ -741,7 +898,7 @@ def params_parser():
     args.add_argument("--height", default=224, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
-    args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp", "adapter"])
+    args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp", "adapter", "csc-maple"])
     args.add_argument("--train_dataset", type=str, default="market1501",
                       choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--train_dataset_multitask", type=str, default="dukemtmc",
@@ -774,6 +931,11 @@ if __name__ == "__main__":
         # model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
         # olp
         model = build_model_coop(state_dict or model.state_dict(), image_height // 12, image_width // 12, 12)
+    elif params.training_mode == "csc-maple":
+        design_details = {"trainer": 'MaPLe',
+                          "vision_depth": 9,
+                          "language_depth": 9}
+        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details, n_ctx_s=4, maple_length=4)
     else:
         raise NotImplementedError
 
@@ -791,25 +953,34 @@ if __name__ == "__main__":
     loader_train_sampled2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
                                                         "vit" if "ViT" in params.model else "rn",
                                                         params.train_dataset_multitask)
-    if params.training_mode == "ivlp":
-        state_dict = torch.load("./clip_imagenet_pretrained_ivlp.pth.tar-5")["state_dict"]
-        # reset prompt learner and positional embedding
-        from collections import OrderedDict
+    if params.training_mode in ("ivlp", "csc-maple"):
+        if params.training_mode == "csc-maple":
+            from maple import load_pretrained_maple_weights
+            weight_path = "./clip_imagenet_pretrained_ivlp.pth.tar-5"
+            prompter1 = VLPromptLearnerCSC(n_cls1, model, params.train_dataset, prompt_depth=9).cuda()
+            prompter2 = VLPromptLearnerCSC(n_cls2, model, params.train_dataset_multitask, prompt_depth=9).cuda()
+            prompter2.ctx_m = prompter1.ctx_m
+            prompter2.coupling_layers = prompter1.coupling_layers
+            model = CustomCLIPCSC(model).cuda()
+            load_pretrained_maple_weights(model, weight_path, learners=[prompter1, prompter2])
+        else:
+            state_dict_pretrained = torch.load("./clip_imagenet_pretrained_ivlp.pth.tar-5")["state_dict"]
+            # reset prompt learner and positional embedding
+            from collections import OrderedDict
 
-        state_dict_reseted = OrderedDict()
-        for layer in state_dict:
-            if "VPT" in layer:
-                state_dict_reseted[layer] = state_dict[layer]
-        prompter1 = VLPromptLearner(n_cls1, model, params.train_dataset).cuda()
-        prompter2 = VLPromptLearner(n_cls2, model, params.train_dataset_multitask).cuda()
-        model = CustomCLIPIVLP(model).cuda()
-        model.load_state_dict(state_dict_reseted, strict=False)
+            state_dict_reseted = OrderedDict()
+            for layer in state_dict_pretrained:
+                if "VPT" in layer:
+                    state_dict_reseted[layer] = state_dict_pretrained[layer]
+
+            prompter1 = VLPromptLearner(n_cls1, model, params.train_dataset).cuda()
+            prompter2 = VLPromptLearner(n_cls2, model, params.train_dataset_multitask).cuda()
+            model = CustomCLIPIVLP(model).cuda()
+            model.load_state_dict(state_dict_reseted, strict=False)
     elif params.training_mode == "coop":
         prompter1 = PromptLearnerCoop(n_cls1, model, params.train_dataset).cuda()
         prompter2 = PromptLearnerCoop(n_cls2, model, params.train_dataset_multitask).cuda()
         model = CustomCLIPCoop(model).cuda()
-    else:
-        raise NotImplementedError
 
     loader_gallery, loader_query, loader_gallery_augmented, loader_query_augmented = get_loader(params.root, params.bs,
                                                                                                 image_height,
@@ -820,12 +991,20 @@ if __name__ == "__main__":
     classifier1 = Classifier(n_cls1).cuda()
     classifier2 = Classifier(n_cls2).cuda()
 
-    train_prompter(model,
-                   prompter1,
-                   prompter2,
-                   loader_train_val1,
-                   loader_train_val2,
-                   params.epochs_stage1)
+    if params.training_mode == "csc-maple":
+        train_prompter_maple(model,
+                             prompter1,
+                             prompter2,
+                             loader_train_val1,
+                             loader_train_val2,
+                             params.epochs_stage1)
+    else:
+        train_prompter(model,
+                       prompter1,
+                       prompter2,
+                       loader_train_val1,
+                       loader_train_val2,
+                       params.epochs_stage1)
 
     train_vision_model(model,
                        prompter1,

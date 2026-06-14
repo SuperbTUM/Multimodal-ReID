@@ -341,6 +341,63 @@ class VLPromptLearnerSRC(nn.Module):
         return prompts
 
 
+class VLPromptLearnerCSC(nn.Module):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=9):
+        super().__init__()
+        n_ctx = 4  # fixed prefix length consistent with VLPromptLearnerSRC
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+
+        n_placeholders = 1 + n_ctx_s + n_ctx_m
+        placeholders = " ".join(["X"] * n_placeholders)
+
+        if dataset_name in ("market1501", "dukemtmc", "msmt17"):
+            ctx_init = f"A photo of {placeholders} person."
+        else:
+            ctx_init = f"A photo of {placeholders} vehicle."
+
+        ctx_init = ctx_init.replace("_", " ")
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        self.register_buffer("token_prefix", embedding[:, :1 + n_ctx, :])  # SOS + 4 tokens
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx + n_ctx_s + n_ctx_m:, :])
+
+        self.ctx_s = nn.Parameter(torch.empty(n_cls, n_ctx_s, ctx_dim, dtype=dtype))
+        nn.init.normal_(self.ctx_s, std=0.02)
+        self.ctx_m = nn.Parameter(torch.empty(prompt_depth, n_ctx_m, ctx_dim, dtype=dtype))
+        nn.init.normal_(self.ctx_m, std=0.02)
+
+        self.coupling_layers = nn.ModuleList([
+            nn.Linear(ctx_dim, ctx_dim).to(dtype) for _ in range(prompt_depth)
+        ])
+        for layer in self.coupling_layers:
+            nn.init.normal_(layer.weight, std=0.02)
+            nn.init.zeros_(layer.bias)
+
+        self.n_cls = n_cls
+        self.n_ctx_s = n_ctx_s
+        self.n_ctx_m = n_ctx_m
+        self.prompt_depth = prompt_depth
+        self.register_buffer("tokenized_prompts", tokenized_prompts)
+
+    def forward(self, label):
+        s_c = self.ctx_s[label]
+        m_0 = self.ctx_m[0].expand(s_c.shape[0], -1, -1)
+
+        prefix = self.token_prefix.expand(s_c.shape[0], -1, -1)
+        suffix = self.token_suffix.expand(s_c.shape[0], -1, -1)
+
+        prompts = torch.cat([prefix, s_c, m_0, suffix], dim=1)
+
+        deeper_text_prompts = [self.ctx_m[i] for i in range(1, self.prompt_depth)]
+        deeper_vision_prompts = [self.coupling_layers[i](self.ctx_m[i]) for i in range(1, self.prompt_depth)]
+        shared_ctx_vision = self.coupling_layers[0](self.ctx_m[0])
+
+        return prompts, deeper_text_prompts, deeper_vision_prompts, shared_ctx_vision
+
+
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
@@ -350,11 +407,14 @@ class TextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
-    def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text):
+    def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text=None):
+        if isinstance(prompts, (list, tuple)):
+            prompts, compound_prompts_deeper_text, _, _ = prompts
+        
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         # Pass as the list, as nn.sequential cannot process multiple arguments in the forward pass
-        combined = [x, compound_prompts_deeper_text, 0]  # third argument is the counter which denotes depth of prompt
+        combined = [x, compound_prompts_deeper_text if compound_prompts_deeper_text is not None else [], 0]  # third argument is the counter which denotes depth of prompt
         outputs = self.transformer(combined)
         x = outputs[0]  # extract the x back from here
         x = x.permute(1, 0, 2)  # LND -> NLD
@@ -662,7 +722,9 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
         self.text_layer = text_layer
         self.attn_mask = attn_mask
         # This must be consistent with the config file prompt
-        self.compound_prompt_nctx = design_details['maple_length']
+        self.compound_prompt_nctx = design_details.get('maple_length', 4)
+        self.n_ctx_s = design_details.get('n_ctx_s', 0)
+        self.n_ctx = design_details.get('n_ctx', 4) if self.n_ctx_s > 0 else 0
         if i == 0:
             self.first_layer = True
         else:
@@ -684,36 +746,25 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                 # Here it behaves differently for text and visual side
                 # Forward function is same for both
 
-                if not self.text_layer:
-                    # First check if the ith layer needs compound prompts or not
-                    if not (counter > len(compound_prompts_deeper) - 1):
-                        # Remove the outputs produced by learnable tokens of previous layer
-                        prefix = x[0:x.shape[0] - self.compound_prompt_nctx, :, :]
-                        # Create/configure learnable tokens of this layer
-                        visual_context = compound_prompts_deeper[counter]  # extract the correct index
-                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
-                        # Add the learnable tokens of this layer with the input, by replacing previous
-                        # layer learnable tokens
-                        x = torch.cat([prefix, visual_context], dim=0)
-
-                        # Once done, update the counter, so that the next time, it does not use same learnable tokens
-                        counter += 1
-                else:
-                    # First check if the ith layer needs compound prompts or not
-                    if not (counter > len(compound_prompts_deeper) - 1):
-                        # Appending the learnable tokens in different way
-                        # x -> [77, NCLS, DIM]
-                        # First remove the learnable tokens from previous layer
+                if not (counter > len(compound_prompts_deeper) - 1):
+                    if not self.text_layer:
+                        # Vision side: prompts after CLS
                         prefix = x[:1, :, :]
                         suffix = x[1 + self.compound_prompt_nctx:, :, :]
-                        # Create/configure learnable tokens of this layer
+                        visual_context = compound_prompts_deeper[counter]  # extract the correct index
+                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                        x = torch.cat([prefix, visual_context, suffix], dim=0)
+                    else:
+                        # Text side: SOS + n_ctx + n_ctx_s + ctx_m + suffix
+                        prefix_len = 1 + self.n_ctx + self.n_ctx_s
+                        prefix = x[:prefix_len, :, :]
+                        suffix = x[prefix_len + self.compound_prompt_nctx:, :, :]
                         textual_context = compound_prompts_deeper[counter]
                         textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
-                        # Add the learnable tokens of this layer with the input, replaced by previous
-                        # layer learnable tokens
                         x = torch.cat([prefix, textual_context, suffix], dim=0)
-                        # Once done, update the counter, so that the next time, it does not use same learnable tokens
-                        counter += 1
+                    
+                    # Once done, update the counter, so that the next time, it does not use same learnable tokens
+                    counter += 1
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return [x, compound_prompts_deeper, counter]  # return again as a list, so that nn.seq can work
@@ -819,7 +870,7 @@ class VisionTransformer_MaPLe(nn.Module):
         # are trainable parameters here in whole image encoder.
         if self.VPT_shallow:
             visual_ctx = shared_ctx.expand(x.shape[0], -1, -1).half()
-            x = torch.cat([x, visual_ctx], dim=1)
+            x = torch.cat([x[:, 0:1, :], visual_ctx, x[:, 1:, :]], dim=1)
         else:
             assert self.prompt_till_layer_visual == 0
 
@@ -1041,7 +1092,67 @@ def resize_pos_embed(posemb, posemb_new, height, width):
     return posemb
 
 
-def build_model(state_dict: dict, h_resolution, w_resolution, design_details, stride_size=12):
+def load_pretrained_maple_weights(model, weight_path, learners=None):
+    print(f"Loading specialized MaPLe weights from {weight_path}")
+    checkpoint = torch.load(weight_path, map_location="cuda")
+    state_dict = checkpoint.get("state_dict", checkpoint)
+
+    # 1. Map Learner Parameters
+    target_learners = []
+    if learners is not None:
+        if isinstance(learners, (list, tuple)):
+            target_learners.extend(learners)
+        else:
+            target_learners.append(learners)
+    elif hasattr(model, 'prompt_learner'):
+        target_learners.append(model.prompt_learner)
+
+    for learner in target_learners:
+        if isinstance(learner, VLPromptLearnerCSC):
+            if "prompt_learner.ctx" in state_dict:
+                learner.ctx_m[0].data.copy_(state_dict["prompt_learner.ctx"])
+
+            for i in range(learner.prompt_depth - 1):
+                key = f"prompt_learner.compound_prompts_text.{i}"
+                if key in state_dict:
+                    learner.ctx_m[i + 1].data.copy_(state_dict[key])
+
+            if "prompt_learner.proj.weight" in state_dict:
+                learner.coupling_layers[0].weight.data.copy_(state_dict["prompt_learner.proj.weight"])
+                learner.coupling_layers[0].bias.data.copy_(state_dict["prompt_learner.proj.bias"])
+
+            for i in range(learner.prompt_depth - 1):
+                key_w = f"prompt_learner.compound_prompt_projections.{i}.weight"
+                key_b = f"prompt_learner.compound_prompt_projections.{i}.bias"
+                if key_w in state_dict:
+                    learner.coupling_layers[i + 1].weight.data.copy_(state_dict[key_w])
+                    learner.coupling_layers[i + 1].bias.data.copy_(state_dict[key_b])
+
+            if "prompt_learner.token_prefix" in state_dict:
+                learner.token_prefix.data.copy_(state_dict["prompt_learner.token_prefix"])
+            if "prompt_learner.token_suffix" in state_dict:
+                learner.token_suffix.data.copy_(state_dict["prompt_learner.token_suffix"])
+
+    # 2. Map Encoders
+    # ... rest of logic ...
+    if hasattr(model, 'image_encoder'):
+        vis_dict = {k.replace("image_encoder.", ""): v for k, v in state_dict.items() if k.startswith("image_encoder.")}
+        model.image_encoder.load_state_dict(vis_dict, strict=False)
+
+    # 3. Map Text Encoder
+    if hasattr(model, 'text_encoder'):
+        txt_dict = {k.replace("text_encoder.", ""): v for k, v in state_dict.items() if k.startswith("text_encoder.")}
+        model.text_encoder.load_state_dict(txt_dict, strict=False)
+
+    # 4. Logit Scale
+    if "logit_scale" in state_dict:
+        model.logit_scale.data.copy_(state_dict["logit_scale"])
+    
+    print("CSC-MaPLe weights loaded successfully (identity-specific prompts preserved)")
+
+
+def build_model(state_dict: dict, h_resolution, w_resolution, design_details, stride_size=12, **kwargs):
+    design_details.update(kwargs)
     vit = "visual.proj" in state_dict
 
     if vit:
