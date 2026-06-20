@@ -342,7 +342,7 @@ class VLPromptLearnerSRC(nn.Module):
 
 
 class VLPromptLearnerCSC(nn.Module):
-    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=9):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=9, unified_context=False):
         super().__init__()
         n_ctx = 4  # fixed prefix length consistent with VLPromptLearnerSRC
         dtype = clip_model.dtype
@@ -352,9 +352,19 @@ class VLPromptLearnerCSC(nn.Module):
         placeholders = " ".join(["X"] * n_placeholders)
 
         if dataset_name in ("market1501", "dukemtmc", "msmt17"):
-            ctx_init = f"A photo of {placeholders} person."
+            ctx_init = (
+                f"A photo of {placeholders} person. Note: The overall clothing structure, "
+                f"accessory attachments, and bodily geometry are strictly consistent across views, "
+                f"while absolute colors, ambient illumination angles, and spatial resolution "
+                f"are expected to undergo severe camera-specific distortions."
+            )
         else:
-            ctx_init = f"A photo of {placeholders} vehicle."
+            ctx_init = (
+                f"A photo of {placeholders} vehicle. Note: The structural body shell geometry, "
+                f"model-specific contours, and wheel alignment remain perfectly consistent across viewpoints, "
+                f"while paint surface reflections, headlight glare, and perspective illumination "
+                f"will undergo severe distortions."
+            )
 
         ctx_init = ctx_init.replace("_", " ")
         tokenized_prompts = clip.tokenize(ctx_init).cuda()
@@ -364,7 +374,7 @@ class VLPromptLearnerCSC(nn.Module):
         self.register_buffer("token_prefix", embedding[:, :1 + n_ctx, :])  # SOS + 4 tokens
         self.register_buffer("token_suffix", embedding[:, 1 + n_ctx + n_ctx_s + n_ctx_m:, :])
 
-        self.ctx_s = nn.Parameter(torch.empty(n_cls, n_ctx_s, ctx_dim, dtype=dtype))
+        self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_s, std=0.02)
         self.ctx_m = nn.Parameter(torch.empty(prompt_depth, n_ctx_m, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_m, std=0.02)
@@ -380,10 +390,11 @@ class VLPromptLearnerCSC(nn.Module):
         self.n_ctx_s = n_ctx_s
         self.n_ctx_m = n_ctx_m
         self.prompt_depth = prompt_depth
+        self.unified_context = unified_context
         self.register_buffer("tokenized_prompts", tokenized_prompts)
 
     def forward(self, label):
-        s_c = self.ctx_s[label]
+        s_c = self.ctx_s.expand(label.shape[0], -1, -1) if self.unified_context else self.ctx_s[label]
         m_0 = self.ctx_m[0].expand(s_c.shape[0], -1, -1)
 
         prefix = self.token_prefix.expand(s_c.shape[0], -1, -1)
