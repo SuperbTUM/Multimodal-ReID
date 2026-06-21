@@ -342,7 +342,7 @@ class VLPromptLearnerSRC(nn.Module):
 
 
 class VLPromptLearnerCSC(nn.Module):
-    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=9, unified_context=False):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=9, unified_context=True):
         super().__init__()
         n_ctx = 4  # fixed prefix length consistent with VLPromptLearnerSRC
         dtype = clip_model.dtype
@@ -353,17 +353,11 @@ class VLPromptLearnerCSC(nn.Module):
 
         if dataset_name in ("market1501", "dukemtmc", "msmt17"):
             ctx_init = (
-                f"A photo of {placeholders} person. Note: The overall clothing structure, "
-                f"accessory attachments, and bodily geometry are strictly consistent across views, "
-                f"while absolute colors, ambient illumination angles, and spatial resolution "
-                f"are expected to undergo severe camera-specific distortions."
+                f"A photo of a {placeholders} person. Find the same person. Ignore clothing and illumination changes."
             )
         else:
             ctx_init = (
-                f"A photo of {placeholders} vehicle. Note: The structural body shell geometry, "
-                f"model-specific contours, and wheel alignment remain perfectly consistent across viewpoints, "
-                f"while paint surface reflections, headlight glare, and perspective illumination "
-                f"will undergo severe distortions."
+                f"A photo of a {placeholders} vehicle. Find the identical car by analyzing grille geometry, windshield layouts, and unique markers."
             )
 
         ctx_init = ctx_init.replace("_", " ")
@@ -393,18 +387,49 @@ class VLPromptLearnerCSC(nn.Module):
         self.unified_context = unified_context
         self.register_buffer("tokenized_prompts", tokenized_prompts)
 
+        # Dynamic Instruct Meta Net
+        self.meta_net = nn.Sequential(
+            nn.Linear(ctx_dim, ctx_dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(ctx_dim // 4, prompt_depth * n_ctx_m * ctx_dim)
+        ).to(dtype)
+
+        # Initialize weights with minor perturbations
+        for m in self.meta_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
+
     def forward(self, label):
         s_c = self.ctx_s.expand(label.shape[0], -1, -1) if self.unified_context else self.ctx_s[label]
-        m_0 = self.ctx_m[0].expand(s_c.shape[0], -1, -1)
+
+        # Dynamic Instruct: pool token_suffix (instruction text representation) to get the instruction embedding
+        instruction_emb = self.token_suffix.mean(dim=1)  # shape: [self.ctx_s.shape[0], ctx_dim]
+        
+        # Pass the instruction embedding through meta_net to get the dynamic prompt offset
+        delta_ctx = self.meta_net(instruction_emb)  # shape: [self.ctx_s.shape[0], prompt_depth * n_ctx_m * ctx_dim]
+        delta_ctx = delta_ctx.view(self.ctx_s.shape[0], self.prompt_depth, self.n_ctx_m, -1)
+
+        # Apply context prompts according to context type (unified vs. class-specific)
+        if self.unified_context:
+            delta_c = delta_ctx[0]  # shape: [prompt_depth, n_ctx_m, ctx_dim]
+            dynamic_ctx = self.ctx_m + delta_c  # shape: [prompt_depth, n_ctx_m, ctx_dim]
+            m_0 = dynamic_ctx[0].expand(s_c.shape[0], -1, -1)
+            deeper_text_prompts = [dynamic_ctx[i] for i in range(1, self.prompt_depth)]
+            deeper_vision_prompts = [self.coupling_layers[i](dynamic_ctx[i]) for i in range(1, self.prompt_depth)]
+            shared_ctx_vision = self.coupling_layers[0](dynamic_ctx[0])
+        else:
+            delta_c = delta_ctx[label]  # shape: [batch_size, prompt_depth, n_ctx_m, ctx_dim]
+            dynamic_ctx = self.ctx_m.unsqueeze(0) + delta_c  # shape: [batch_size, prompt_depth, n_ctx_m, ctx_dim]
+            m_0 = dynamic_ctx[:, 0]
+            deeper_text_prompts = [dynamic_ctx[:, i] for i in range(1, self.prompt_depth)]
+            deeper_vision_prompts = [self.coupling_layers[i](dynamic_ctx[:, i]) for i in range(1, self.prompt_depth)]
+            shared_ctx_vision = self.coupling_layers[0](dynamic_ctx[:, 0])
 
         prefix = self.token_prefix.expand(s_c.shape[0], -1, -1)
         suffix = self.token_suffix.expand(s_c.shape[0], -1, -1)
 
         prompts = torch.cat([prefix, s_c, m_0, suffix], dim=1)
-
-        deeper_text_prompts = [self.ctx_m[i] for i in range(1, self.prompt_depth)]
-        deeper_vision_prompts = [self.coupling_layers[i](self.ctx_m[i]) for i in range(1, self.prompt_depth)]
-        shared_ctx_vision = self.coupling_layers[0](self.ctx_m[0])
 
         return prompts, deeper_text_prompts, deeper_vision_prompts, shared_ctx_vision
 
