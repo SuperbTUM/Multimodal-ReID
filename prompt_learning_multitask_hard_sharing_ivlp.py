@@ -249,7 +249,7 @@ def train_prompter_maple(model,
     learnable_params = [{"params": params_to_train, "lr": 0.00035, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=0.00035, weight_decay=1e-4)
-    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
+    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 1)
     scaler = GradScaler()
     loss_func = SupConLoss("cuda")
 

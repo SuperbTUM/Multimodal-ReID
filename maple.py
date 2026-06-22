@@ -344,28 +344,24 @@ class VLPromptLearnerSRC(nn.Module):
 class VLPromptLearnerCSC(nn.Module):
     def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=9, unified_context=True):
         super().__init__()
-        n_ctx = 4  # fixed prefix length consistent with VLPromptLearnerSRC
+        n_ctx = 4  
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
 
-        n_placeholders = 1 + n_ctx_s + n_ctx_m
+        n_placeholders = n_ctx_s + n_ctx_m
         placeholders = " ".join(["X"] * n_placeholders)
 
         if dataset_name in ("market1501", "dukemtmc", "msmt17"):
-            ctx_init = (
-                f"A photo of a {placeholders} person. Find the same person. Ignore clothing and illumination changes."
-            )
+            ctx_init = f"A photo of a {placeholders} person. Find the same person. Ignore clothing and illumination changes."
         else:
-            ctx_init = (
-                f"A photo of a {placeholders} vehicle. Find the identical car by analyzing grille geometry, windshield layouts, and unique markers."
-            )
+            ctx_init = f"A photo of a {placeholders} vehicle. Find the identical car by analyzing grille geometry, windshield layouts, and unique markers."
 
         ctx_init = ctx_init.replace("_", " ")
         tokenized_prompts = clip.tokenize(ctx_init).cuda()
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        self.register_buffer("token_prefix", embedding[:, :1 + n_ctx, :])  # SOS + 4 tokens
+        self.register_buffer("token_prefix", embedding[:, :1 + n_ctx, :])  
         self.register_buffer("token_suffix", embedding[:, 1 + n_ctx + n_ctx_s + n_ctx_m:, :])
 
         self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
@@ -373,8 +369,15 @@ class VLPromptLearnerCSC(nn.Module):
         self.ctx_m = nn.Parameter(torch.empty(prompt_depth, n_ctx_m, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_m, std=0.02)
 
+        if hasattr(clip_model.visual, "class_embedding") and clip_model.visual.class_embedding is not None:
+            vis_dim = clip_model.visual.class_embedding.shape[0]
+        elif hasattr(clip_model.visual, "positional_embedding") and clip_model.visual.positional_embedding is not None:
+            vis_dim = clip_model.visual.positional_embedding.shape[-1]
+        else:
+            vis_dim = clip_model.visual.conv1.out_channels
+
         self.coupling_layers = nn.ModuleList([
-            nn.Linear(ctx_dim, ctx_dim).to(dtype) for _ in range(prompt_depth)
+            nn.Linear(ctx_dim, vis_dim).to(dtype) for _ in range(prompt_depth)
         ])
         for layer in self.coupling_layers:
             nn.init.normal_(layer.weight, std=0.02)
@@ -387,14 +390,15 @@ class VLPromptLearnerCSC(nn.Module):
         self.unified_context = unified_context
         self.register_buffer("tokenized_prompts", tokenized_prompts)
 
-        # Dynamic Instruct Meta Net
         self.meta_net = nn.Sequential(
             nn.Linear(ctx_dim, ctx_dim // 4),
             nn.ReLU(inplace=True),
-            nn.Linear(ctx_dim // 4, prompt_depth * n_ctx_m * ctx_dim)
+            nn.Linear(ctx_dim // 4, prompt_depth * n_ctx_m * ctx_dim),
+            nn.LayerNorm(prompt_depth * n_ctx_m * ctx_dim) 
         ).to(dtype)
 
-        # Initialize weights with minor perturbations
+        self.meta_gates = nn.Parameter(torch.zeros(prompt_depth, 1, 1, dtype=dtype))
+
         for m in self.meta_net.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
@@ -403,24 +407,26 @@ class VLPromptLearnerCSC(nn.Module):
     def forward(self, label):
         s_c = self.ctx_s.expand(label.shape[0], -1, -1) if self.unified_context else self.ctx_s[label]
 
-        # Dynamic Instruct: pool token_suffix (instruction text representation) to get the instruction embedding
-        instruction_emb = self.token_suffix.mean(dim=1)  # shape: [self.ctx_s.shape[0], ctx_dim]
+        instruction_emb = self.token_suffix.mean(dim=1)  # [1, ctx_dim]
         
-        # Pass the instruction embedding through meta_net to get the dynamic prompt offset
-        delta_ctx = self.meta_net(instruction_emb)  # shape: [self.ctx_s.shape[0], prompt_depth * n_ctx_m * ctx_dim]
+        delta_ctx = self.meta_net(instruction_emb)  
         delta_ctx = delta_ctx.view(self.ctx_s.shape[0], self.prompt_depth, self.n_ctx_m, -1)
 
-        # Apply context prompts according to context type (unified vs. class-specific)
         if self.unified_context:
-            delta_c = delta_ctx[0]  # shape: [prompt_depth, n_ctx_m, ctx_dim]
-            dynamic_ctx = self.ctx_m + delta_c  # shape: [prompt_depth, n_ctx_m, ctx_dim]
+            delta_c = delta_ctx[0]  # [prompt_depth, n_ctx_m, ctx_dim]
+            gated_delta = torch.tanh(self.meta_gates) * delta_c
+            dynamic_ctx = self.ctx_m + gated_delta  
+            
             m_0 = dynamic_ctx[0].expand(s_c.shape[0], -1, -1)
             deeper_text_prompts = [dynamic_ctx[i] for i in range(1, self.prompt_depth)]
             deeper_vision_prompts = [self.coupling_layers[i](dynamic_ctx[i]) for i in range(1, self.prompt_depth)]
             shared_ctx_vision = self.coupling_layers[0](dynamic_ctx[0])
         else:
-            delta_c = delta_ctx[label]  # shape: [batch_size, prompt_depth, n_ctx_m, ctx_dim]
-            dynamic_ctx = self.ctx_m.unsqueeze(0) + delta_c  # shape: [batch_size, prompt_depth, n_ctx_m, ctx_dim]
+            delta_c = delta_ctx[label]  # [batch_size, prompt_depth, n_ctx_m, ctx_dim]
+            
+            gated_delta = torch.tanh(self.meta_gates).unsqueeze(0) * delta_c
+            dynamic_ctx = self.ctx_m.unsqueeze(0) + gated_delta  
+            
             m_0 = dynamic_ctx[:, 0]
             deeper_text_prompts = [dynamic_ctx[:, i] for i in range(1, self.prompt_depth)]
             deeper_vision_prompts = [self.coupling_layers[i](dynamic_ctx[:, i]) for i in range(1, self.prompt_depth)]

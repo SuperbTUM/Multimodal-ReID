@@ -370,9 +370,10 @@ class CustomCLIPIVLP(nn.Module):
 class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
+        from maple import TextEncoder as TextEncoderCSC
         self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9)
         self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
+        self.text_encoder = TextEncoderCSC(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -483,7 +484,7 @@ def train_prompter_maple(model,
     learnable_params = [{"params": model.prompt_learner.parameters(), "lr": 0.00035, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=0.00035, weight_decay=1e-4)
-    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
+    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 1)
     scaler = GradScaler()
     loss_func = SupConLoss("cuda")
 

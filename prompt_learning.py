@@ -52,9 +52,10 @@ def weights_init_kaiming(m):
 class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
+        from maple import TextEncoder as TextEncoderCSC
         self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9, unified_context=True)
         self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
+        self.text_encoder = TextEncoderCSC(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -456,7 +457,7 @@ def train_prompter_maple(model,
         learnable_params.append({"params": classifier_params, "lr": 3.5e-4, "weight_decay": 1e-4})
 
     optimizer = torch.optim.Adam(learnable_params, lr=3.5e-4, weight_decay=1e-4)
-    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
+    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 1)
     scaler = GradScaler()
 
     # Loss functions
@@ -955,8 +956,8 @@ def params_parser():
     args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--train_dataset_multitask", type=str, default="", choices=["", "market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
-    args.add_argument("--beta", default=1.0, type=float, help="Stage 1 alignment loss weight")
-    args.add_argument("--gamma", default=0.1, type=float, help="Stage 2 alignment loss weight")
+    args.add_argument("--beta", default=0.0, type=float, help="Stage 1 alignment loss weight")
+    args.add_argument("--gamma", default=0.0, type=float, help="Stage 2 alignment loss weight")
     return args.parse_args()
 
 
@@ -1027,9 +1028,9 @@ if __name__ == "__main__":
         # this is from weights of multimodal-prompt-learning
         weight_path = "./clip_imagenet_pretrained_ivlp.pth.tar-5"
         if params.training_mode == "csc-maple":
-            from maple import load_pretrained_maple_weights
+            # from maple import load_pretrained_maple_weights
             model = CustomCLIPCSC(n_cls, model).cuda()
-            load_pretrained_maple_weights(model, weight_path)
+            # load_pretrained_maple_weights(model, weight_path)
         else:
             state_dict_pretrained = torch.load(weight_path)["state_dict"]
             # reset prompt learner and positional embedding
