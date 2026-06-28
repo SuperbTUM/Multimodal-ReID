@@ -341,28 +341,45 @@ class VLPromptLearnerSRC(nn.Module):
         return prompts
 
 
+import random
 class VLPromptLearnerCSC(nn.Module):
-    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=9, unified_context=True):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=12, unified_context=True):
         super().__init__()
-        n_ctx = 4  
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
+        n_ctx = 4
+        self.n_placeholders = n_ctx_s + n_ctx_m
+        placeholders = " ".join(["X"] * self.n_placeholders)
 
-        n_placeholders = n_ctx_s + n_ctx_m
-        placeholders = " ".join(["X"] * n_placeholders)
-
-        if dataset_name in ("market1501", "dukemtmc", "msmt17"):
-            ctx_init = f"A photo of a {placeholders} person. Find the same person. Ignore clothing and illumination changes."
+        is_vehicle = dataset_name not in ("market1501", "dukemtmc", "msmt17")
+        if not is_vehicle:
+            self.INSTRUCTION_POOL = [
+                f"A photo of a {placeholders} person. Find the same person. Ignore clothing and illumination changes.",
+                f"Capture the image of a {placeholders} pedestrian. Match the same individual under various surveillance cameras.",
+                f"Look at this {placeholders} person. Track their identity across distinct multi-camera networks.",
+                f"A snapshot of a {placeholders} individual. Find the matching target while disregarding clothes variations."
+            ]
         else:
-            ctx_init = f"A photo of a {placeholders} vehicle. Find the identical car by analyzing grille geometry, windshield layouts, and unique markers."
+            self.INSTRUCTION_POOL = [
+                f"A photo of a {placeholders} vehicle. Find the identical car by analyzing grille geometry and unique markers.",
+                f"An automobile captured on camera. Track this same vehicle across distinct traffic surveillance views.",
+                f"Look at this {placeholders} vehicle. Identify the matching car based on body shapes and window layouts.",
+                f"A snapshot of a {placeholders} car. Find this identical target across different traffic camera networks."
+            ]
 
-        ctx_init = ctx_init.replace("_", " ")
-        tokenized_prompts = clip.tokenize(ctx_init).cuda()
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-
-        self.register_buffer("token_prefix", embedding[:, :1 + n_ctx, :])  
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx + n_ctx_s + n_ctx_m:, :])
+        for i, instruct in enumerate(self.INSTRUCTION_POOL):
+            tokens = clip.tokenize(instruct).cuda()
+            with torch.no_grad():
+                emb = clip_model.token_embedding(tokens).type(dtype)
+            
+            prefix_slice = emb[:, :1 + n_ctx, :]
+            suffix_slice = emb[:, 1 + n_ctx + self.n_placeholders:, :]
+            instruct_emb_slice = suffix_slice.mean(dim=1) # [1, ctx_dim]
+            
+            self.register_buffer(f"token_prefix_{i}", prefix_slice)
+            self.register_buffer(f"token_suffix_{i}", suffix_slice)
+            self.register_buffer(f"instruction_emb_{i}", instruct_emb_slice)
+            self.register_buffer(f"tokenized_prompts_{i}", tokens)
 
         self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_s, std=0.02)
@@ -388,7 +405,6 @@ class VLPromptLearnerCSC(nn.Module):
         self.n_ctx_m = n_ctx_m
         self.prompt_depth = prompt_depth
         self.unified_context = unified_context
-        self.register_buffer("tokenized_prompts", tokenized_prompts)
 
         self.meta_net = nn.Sequential(
             nn.Linear(ctx_dim, ctx_dim // 4),
@@ -404,37 +420,69 @@ class VLPromptLearnerCSC(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, label):
-        s_c = self.ctx_s.expand(label.shape[0], -1, -1) if self.unified_context else self.ctx_s[label]
+    @property
+    def tokenized_prompts(self):
+        return self.tokenized_prompts_0
 
-        instruction_emb = self.token_suffix.mean(dim=1)  # [1, ctx_dim]
-        
-        delta_ctx = self.meta_net(instruction_emb)  
-        delta_ctx = delta_ctx.view(self.ctx_s.shape[0], self.prompt_depth, self.n_ctx_m, -1)
+    def forward(self, label, is_stage2=False, ensemble=False):
+        batch_size = label.shape[0]
 
-        if self.unified_context:
-            delta_c = delta_ctx[0]  # [prompt_depth, n_ctx_m, ctx_dim]
-            gated_delta = torch.tanh(self.meta_gates) * delta_c
-            dynamic_ctx = self.ctx_m + gated_delta  
-            
-            m_0 = dynamic_ctx[0].expand(s_c.shape[0], -1, -1)
-            deeper_text_prompts = [dynamic_ctx[i] for i in range(1, self.prompt_depth)]
+        if ensemble:
+            # Prompt-level ensemble: run MetaNet for all instructions,
+            # average vision prompts, single ViT forward downstream.
+            all_shared = []
+            all_deeper = []
+            for idx in range(len(self.INSTRUCTION_POOL)):
+                instruction_emb = getattr(self, f"instruction_emb_{idx}")
+                delta_ctx = self.meta_net(instruction_emb)
+                delta_ctx = delta_ctx.view(self.prompt_depth, self.n_ctx_m, -1)
+                gated_delta = torch.tanh(self.meta_gates) * delta_ctx
+                dynamic_ctx = self.ctx_m + gated_delta
+                all_shared.append(self.coupling_layers[0](dynamic_ctx[0]))
+                all_deeper.append([self.coupling_layers[i](dynamic_ctx[i]) for i in range(1, self.prompt_depth)])
+            shared_ctx_vision = torch.stack(all_shared, dim=0).mean(dim=0)
+            depth = len(all_deeper[0])
+            deeper_vision_prompts = [
+                torch.stack([all_deeper[k][d] for k in range(len(self.INSTRUCTION_POOL))], dim=0).mean(dim=0)
+                for d in range(depth)
+            ]
+            # Text prompts fall back to instruction 0 (unused in image-only path)
+            idx = 0
+            instruction_emb = getattr(self, f"instruction_emb_{idx}")
+            delta_ctx = self.meta_net(instruction_emb)
+            delta_ctx = delta_ctx.view(self.prompt_depth, self.n_ctx_m, -1)
+            gated_delta = torch.tanh(self.meta_gates) * delta_ctx
+            dynamic_ctx = self.ctx_m + gated_delta
+        else:
+            if not is_stage2:
+                idx = 0
+            else:
+                idx = random.randint(0, len(self.INSTRUCTION_POOL) - 1)
+
+            instruction_emb = getattr(self, f"instruction_emb_{idx}")
+            delta_ctx = self.meta_net(instruction_emb)
+            delta_ctx = delta_ctx.view(self.prompt_depth, self.n_ctx_m, -1)
+            gated_delta = torch.tanh(self.meta_gates) * delta_ctx
+            dynamic_ctx = self.ctx_m + gated_delta
             deeper_vision_prompts = [self.coupling_layers[i](dynamic_ctx[i]) for i in range(1, self.prompt_depth)]
             shared_ctx_vision = self.coupling_layers[0](dynamic_ctx[0])
+
+        current_prefix = getattr(self, f"token_prefix_{idx}")
+        current_suffix = getattr(self, f"token_suffix_{idx}")
+
+        m_0 = dynamic_ctx[0].expand(batch_size, -1, -1)
+        deeper_text_prompts = [dynamic_ctx[i] for i in range(1, self.prompt_depth)]
+
+        if self.unified_context:
+            s_c = self.ctx_s.expand(batch_size, -1, -1)
         else:
-            delta_c = delta_ctx[label]  # [batch_size, prompt_depth, n_ctx_m, ctx_dim]
-            
-            gated_delta = torch.tanh(self.meta_gates).unsqueeze(0) * delta_c
-            dynamic_ctx = self.ctx_m.unsqueeze(0) + gated_delta  
-            
-            m_0 = dynamic_ctx[:, 0]
-            deeper_text_prompts = [dynamic_ctx[:, i] for i in range(1, self.prompt_depth)]
-            deeper_vision_prompts = [self.coupling_layers[i](dynamic_ctx[:, i]) for i in range(1, self.prompt_depth)]
-            shared_ctx_vision = self.coupling_layers[0](dynamic_ctx[:, 0])
+            if label is None:
+                s_c = self.ctx_s[0].unsqueeze(0).expand(batch_size, -1, -1)
+            else:
+                s_c = self.ctx_s[label]
 
-        prefix = self.token_prefix.expand(s_c.shape[0], -1, -1)
-        suffix = self.token_suffix.expand(s_c.shape[0], -1, -1)
-
+        prefix = current_prefix.expand(batch_size, -1, -1)
+        suffix = current_suffix.expand(batch_size, -1, -1)
         prompts = torch.cat([prefix, s_c, m_0, suffix], dim=1)
 
         return prompts, deeper_text_prompts, deeper_vision_prompts, shared_ctx_vision
@@ -1182,7 +1230,7 @@ def load_pretrained_maple_weights(model, weight_path, learners=None):
         model.image_encoder.load_state_dict(vis_dict, strict=False)
 
     # 3. Map Text Encoder
-    if hasattr(model, 'text_encoder'):
+    if hasattr(model, 'text_encoder') and model.text_encoder is not None:
         txt_dict = {k.replace("text_encoder.", ""): v for k, v in state_dict.items() if k.startswith("text_encoder.")}
         model.text_encoder.load_state_dict(txt_dict, strict=False)
 

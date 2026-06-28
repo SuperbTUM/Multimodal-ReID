@@ -52,10 +52,9 @@ def weights_init_kaiming(m):
 class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
-        from maple import TextEncoder as TextEncoderCSC
-        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9, unified_context=True)
+        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=6, unified_context=True)
         self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoderCSC(clip_model)
+        self.text_encoder = None  # Completely exclude text encoder to save VRAM and avoid feature space drift
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -71,15 +70,15 @@ class CustomCLIPCSC(nn.Module):
         self.vision_classifier_proj = nn.Linear(512, n_cls, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
 
-    def forward(self, image=None, label=None, get_image=False, get_texts=False):
+    def forward(self, image=None, label=None, get_image=False, get_texts=False, is_stage2=False):
         if get_image:
-            # For inference or image feature extraction
-            # In CSC-MaPLe, the learner forward is usually called with a dummy/batch label
-            # But during inference (test_prompter), images are passed alone.
-            # We use a dummy label if one isn't provided to get the shared vision prompts.
             if label is None:
                 label = torch.zeros(image.shape[0], dtype=torch.long).cuda()
-            prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(label)
+            # Prompt-level ensemble: prompt_learner internally averages vision
+            # prompts from all instructions, then we run a single ViT forward.
+            prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(
+                label=label, is_stage2=True, ensemble=True
+            )
             if params.amp:
                 _, _, image_features = self.image_encoder(image, shared_vision, deeper_vision)
             else:
@@ -88,14 +87,12 @@ class CustomCLIPCSC(nn.Module):
             return image_features
 
         if get_texts:
-            prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(label)
-            text_features = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts, deeper_text)
-            return text_features
+            raise RuntimeError("text_encoder is excluded in csc-maple mode.")
 
-        # Standard forward for test_prompter
         if label is None:
             label = torch.zeros(image.shape[0], dtype=torch.long).cuda()
-        prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(label)
+        prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(label=label, is_stage2=is_stage2)
+  
         if params.amp:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image, shared_vision, deeper_vision)
         else:
@@ -436,8 +433,9 @@ def train_prompter_maple(model,
     # Freeze Image and Text Encoders
     for param in model.image_encoder.parameters():
         param.requires_grad = False
-    for param in model.text_encoder.parameters():
-        param.requires_grad = False
+    if model.text_encoder is not None:
+        for param in model.text_encoder.parameters():
+            param.requires_grad = False
 
     # Unfreeze prompt learner and classifier heads
     for name, param in model.named_parameters():
@@ -495,22 +493,17 @@ def train_prompter_maple(model,
                            triplet_loss(image_features_non_proj, target) + \
                            triplet_loss(image_features, target)
                 
-                # 3. Image-to-Text Alignment Loss (L_i2t)
-                text_features = model(label=target, get_texts=True)
-                loss_i2t = loss_func(image_features_proj, text_features, target, target) + \
-                           loss_func(text_features, image_features_proj, target, target)
-                
                 # Combined Loss
-                loss = loss_id + loss_tri + params.beta * loss_i2t
+                loss = loss_id + loss_tri
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             if (i + 1) % 100 == 0:
-                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_tri: {:.3f}, L_i2t: {:.3f}), Base Lr: {:.2e}"
+                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_tri: {:.3f}), Base Lr: {:.2e}"
                       .format(epoch, (i + 1), len(dataloader_train_val),
-                              loss, loss_id, loss_tri, loss_i2t, scheduler._get_lr(epoch)[0]))
+                              loss, loss_id, loss_tri, scheduler._get_lr(epoch)[0]))
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
@@ -776,11 +769,6 @@ def train_vision_model_maple(model,
 
         for cls_score in cls_scores:
             loss += 0.25 * ce_loss(cls_score, label)
-        
-        # Image-to-Text Alignment Loss (L_i2t, scaled by gamma)
-        if params.gamma > 0:
-            output = image_features_proj @ text_features.t()
-            loss += params.gamma * ce_loss(output, label)
             
         loss += triplet_loss(image_features_last, label) + \
                 triplet_loss(image_features_non_proj, label) + \
@@ -842,17 +830,6 @@ def train_vision_model_maple(model,
     previous_model_gpa = None
 
     for epoch in range(epochs):
-        # Update text features dynamically at the beginning of each epoch (as prompt_learner is trainable in csc-maple)
-        with torch.no_grad():
-            model.eval()
-            text_features = []
-            for i in range(n_cls):
-                label = torch.tensor([i]).cuda()
-                with autocast():
-                    text_feature = model(label=label, get_texts=True)
-                text_features.append(text_feature)
-            text_features = torch.cat(text_features, dim=0).cuda()
-
         model.train()
         iterator = tqdm(dataloader)
         scheduler.step()
@@ -956,8 +933,6 @@ def params_parser():
     args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--train_dataset_multitask", type=str, default="", choices=["", "market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
-    args.add_argument("--beta", default=0.0, type=float, help="Stage 1 alignment loss weight")
-    args.add_argument("--gamma", default=0.0, type=float, help="Stage 2 alignment loss weight")
     return args.parse_args()
 
 
@@ -1002,8 +977,8 @@ if __name__ == "__main__":
         model = build_model_adapter(state_dict or model.state_dict(), image_height // 12, image_width // 12, 12)
     elif params.training_mode == "csc-maple":
         design_details = {"trainer": 'MaPLe',
-                          "vision_depth": 9,
-                          "language_depth": 9}
+                          "vision_depth": 6,
+                          "language_depth": 6}
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details,
                                   n_ctx_s=4, maple_length=4)
     else:

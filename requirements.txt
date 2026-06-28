@@ -3,3 +3,5 @@ deepspeed
 mpi4py
 timm
 beautifulsoup4
+gdown
+scipy
