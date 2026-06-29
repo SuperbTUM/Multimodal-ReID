@@ -27,7 +27,7 @@ from text_encoder import TextEncoder, TextEncoderAugmented
 from coop import (build_model as build_model_coop,
                   PromptLearner as PromptLearnerCoop,
                   PromptLearnerVeri as PromptLearnerCoopVeri)
-from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC, VLPromptLearnerVeri, VLPromptLearnerCSC
+from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC, VLPromptLearnerVeri, VLPromptLearnerCSC, TextEncoder as MaPLeTextEncoder
 from clip_adapter import Adapter, build_model as build_model_adapter, PromptLearner as PromptLearnerAdapter
 import clip_custom
 from metaclip import build_model_from_openai_state_dict
@@ -52,9 +52,9 @@ def weights_init_kaiming(m):
 class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=6, unified_context=True)
+        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=6, unified_context=False)
         self.image_encoder = clip_model.visual
-        self.text_encoder = None  # Completely exclude text encoder to save VRAM and avoid feature space drift
+        self.text_encoder = MaPLeTextEncoder(clip_model)  # Frozen: generates text_features for loss + cross-attn context
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -87,7 +87,10 @@ class CustomCLIPCSC(nn.Module):
             return image_features
 
         if get_texts:
-            raise RuntimeError("text_encoder is excluded in csc-maple mode.")
+            prompts, deeper_text, _, _ = self.prompt_learner(label=label, is_stage2=is_stage2)
+            tokenized_prompts = self.prompt_learner.tokenized_prompts
+            text_features = self.text_encoder(prompts, tokenized_prompts, deeper_text)
+            return text_features
 
         if label is None:
             label = torch.zeros(image.shape[0], dtype=torch.long).cuda()
@@ -493,17 +496,23 @@ def train_prompter_maple(model,
                            triplet_loss(image_features_non_proj, target) + \
                            triplet_loss(image_features, target)
                 
+                # 3. Cross-Modal ITC Loss
+                # Text encoder is frozen; gradients flow through prompt_learner only
+                text_features = model(label=target, get_texts=True)
+                loss_i2t = loss_func(image_features, text_features, target, target)
+                loss_t2i = loss_func(text_features, image_features, target, target)
+                
                 # Combined Loss
-                loss = loss_id + loss_tri
+                loss = loss_id + loss_tri + loss_i2t + loss_t2i
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             if (i + 1) % 100 == 0:
-                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_tri: {:.3f}), Base Lr: {:.2e}"
+                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_tri: {:.3f}, L_itc: {:.3f}), Base Lr: {:.2e}"
                       .format(epoch, (i + 1), len(dataloader_train_val),
-                              loss, loss_id, loss_tri, scheduler._get_lr(epoch)[0]))
+                              loss, loss_id, loss_tri, loss_i2t + loss_t2i, scheduler._get_lr(epoch)[0]))
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
@@ -769,13 +778,53 @@ def train_vision_model_maple(model,
 
         for cls_score in cls_scores:
             loss += 0.25 * ce_loss(cls_score, label)
-            
+
+        # Get unique labels in this batch (usually ~16 identities for PK sampler)
+        unique_labels = torch.unique(label)
+
+        # Dynamically compute text features for ONLY the classes in the batch
+        # This prevents OOM while allowing gradients to flow back to the text-side prompts
+        with autocast(enabled=True):
+            text_features_batch = model(label=unique_labels, get_texts=True)
+
+        # Update the persistent cache with the fresh batch prototypes (no grad)
+        with torch.no_grad():
+            text_features_all[unique_labels] = text_features_batch.detach()
+
+        # Compute base logits against all classes (no text-side gradients yet)
+        output = image_features_proj @ text_features_all.t()
+
+        # Compute dynamic logits for the batch classes (WITH text-side gradients)
+        output_dynamic = image_features_proj @ text_features_batch.t()
+
+        # Overwrite the specific columns in the logits matrix with the dynamic logits.
+        # By doing this on a cloned output matrix, PyTorch cleanly routes the gradients 
+        # for those columns back to output_dynamic (and thus to prompt_learner), 
+        # while keeping the VRAM footprint extremely low!
+        output = output.clone()
+        for i, cls_id in enumerate(unique_labels):
+            output[:, cls_id] = output_dynamic[:, i]
+
+        loss += ce_loss(output, label)
         loss += triplet_loss(image_features_last, label) + \
                 triplet_loss(image_features_non_proj, label) + \
                 triplet_loss(image_features, label)
         return loss
 
     print("Building custom CLIP for MaPLe (Stage 2)")
+
+    # Pre-compute persistent cache of text features for all classes.
+    # We will dynamically update the batch-specific rows during training to save VRAM 
+    # while still allowing gradients to flow to the prompt learner.
+    with torch.no_grad():
+        model.eval()
+        text_features_all = []
+        for i in range(n_cls):
+            label_t = torch.tensor([i]).cuda()
+            with autocast(enabled=True):
+                text_feature = model(label=label_t, get_texts=True)
+            text_features_all.append(text_feature)
+        text_features_all = torch.cat(text_features_all, dim=0).cuda()
 
     if pretrained is not None:
         load_pretrained_weights(model.image_encoder, pretrained)

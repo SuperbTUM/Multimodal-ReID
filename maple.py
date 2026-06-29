@@ -18,6 +18,83 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 
+class CrossAttentionCoupling(nn.Module):
+    """Cross-attention block for text-to-vision prompt coupling.
+
+    Vision prompt tokens (Query) attend to encoded instruction tokens
+    (Key/Value) so the vision branch can dynamically pull the exact
+    visual-semantic cues it needs at every depth.
+    """
+
+    def __init__(self, vis_dim: int, text_dim: int, n_heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = vis_dim // n_heads
+        assert vis_dim % n_heads == 0, f"vis_dim ({vis_dim}) must be divisible by n_heads ({n_heads})"
+
+        # Query projection: operates on vision prompt tokens (vis_dim)
+        self.q_proj = nn.Linear(vis_dim, vis_dim)
+        # Key/Value projections: operate on instruction tokens (text_dim)
+        self.k_proj = nn.Linear(text_dim, vis_dim)
+        self.v_proj = nn.Linear(text_dim, vis_dim)
+        # Output projection
+        self.out_proj = nn.Linear(vis_dim, vis_dim)
+
+        self.ln_q = LayerNorm(vis_dim)
+        self.ln_kv = LayerNorm(text_dim)
+
+        self.scale = self.head_dim ** -0.5
+        self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Q, K, V projections: normal init for expressivity
+        for proj in [self.q_proj, self.k_proj, self.v_proj]:
+            nn.init.normal_(proj.weight, std=0.02)
+            nn.init.zeros_(proj.bias)
+        # Output projection: ZERO init (ControlNet / Flamingo technique).
+        # At Step 0 out_proj produces zeros, so the residual connection
+        # passes vision_queries through unchanged — preserving pre-trained
+        # CLIP representations until the cross-attention slowly learns.
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, vision_queries: torch.Tensor, instruction_tokens: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            vision_queries:     [n_ctx_m, vis_dim] — current vision prompt tokens.
+            instruction_tokens: [T, text_dim]      — encoded instruction token sequence.
+
+        Returns:
+            Updated vision prompts: [n_ctx_m, vis_dim]
+        """
+        # Layer-norm inputs
+        q = self.ln_q(vision_queries)   # [n_ctx_m, vis_dim]
+        kv = self.ln_kv(instruction_tokens)  # [T, text_dim]
+
+        n_q = q.shape[0]
+        n_kv = kv.shape[0]
+
+        # Project
+        Q = self.q_proj(q).view(n_q, self.n_heads, self.head_dim).transpose(0, 1)   # [H, n_q, d_h]
+        K = self.k_proj(kv).view(n_kv, self.n_heads, self.head_dim).transpose(0, 1) # [H, n_kv, d_h]
+        V = self.v_proj(kv).view(n_kv, self.n_heads, self.head_dim).transpose(0, 1) # [H, n_kv, d_h]
+
+        # Scaled dot-product attention
+        attn = (Q @ K.transpose(-2, -1)) * self.scale  # [H, n_q, n_kv]
+        attn = attn.float().softmax(dim=-1).type_as(Q)
+        attn = self.dropout(attn)
+
+        out = attn @ V  # [H, n_q, d_h]
+        out = out.transpose(0, 1).contiguous().view(n_q, -1)  # [n_q, vis_dim]
+        out = self.out_proj(out)
+
+        # Residual connection
+        return vision_queries + out
+
+
 class VLPromptLearner(nn.Module):
     def __init__(self, n_cls, clip_model, dataset_name="market1501"):
         super().__init__()
@@ -374,11 +451,30 @@ class VLPromptLearnerCSC(nn.Module):
             
             prefix_slice = emb[:, :1 + n_ctx, :]
             suffix_slice = emb[:, 1 + n_ctx + self.n_placeholders:, :]
-            instruct_emb_slice = suffix_slice.mean(dim=1) # [1, ctx_dim]
-            
+
+            # Run full instruction through the frozen Text Transformer to get
+            # contextualized hidden states. Raw token_embedding outputs lack
+            # inter-word context (e.g. "red" has not attended to "backpack").
+            # The resulting contextualized suffix tokens serve as Keys/Values
+            # in the Cross-Attention layers of the vision branch.
+            with torch.no_grad():
+                x_full = emb + clip_model.positional_embedding.type(dtype)
+                x_full = x_full.permute(1, 0, 2)  # NLD -> LND
+                x_ctx = clip_model.transformer([x_full, [], 0])
+                if isinstance(x_ctx, (list, tuple)):
+                    x_ctx = x_ctx[0]
+                x_ctx = x_ctx.permute(1, 0, 2)  # LND -> NLD
+                x_ctx = clip_model.ln_final(x_ctx).type(dtype)
+
+            # Extract contextualized suffix (instruction) tokens for Cross-Attention K/V
+            ctx_suffix = x_ctx[:, 1 + n_ctx + self.n_placeholders:, :]  # [1, T, ctx_dim]
+            instruct_emb_slice = ctx_suffix.mean(dim=1)  # [1, ctx_dim]
+            instruct_tokens_full = ctx_suffix  # [1, T, ctx_dim]
+
             self.register_buffer(f"token_prefix_{i}", prefix_slice)
             self.register_buffer(f"token_suffix_{i}", suffix_slice)
             self.register_buffer(f"instruction_emb_{i}", instruct_emb_slice)
+            self.register_buffer(f"instruction_tokens_{i}", instruct_tokens_full)
             self.register_buffer(f"tokenized_prompts_{i}", tokens)
 
         self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
@@ -393,12 +489,55 @@ class VLPromptLearnerCSC(nn.Module):
         else:
             vis_dim = clip_model.visual.conv1.out_channels
 
-        self.coupling_layers = nn.ModuleList([
-            nn.Linear(ctx_dim, vis_dim).to(dtype) for _ in range(prompt_depth)
+        # ── Change 1: Meta-Network for Layer-0 Vision Context ──
+        # Instead of projecting a static shared_ctx through nn.Linear,
+        # pass the instruction embedding through a lightweight MLP to
+        # generate the Layer-0 vision context vectors directly in vis_dim.
+        # Flow: instruction_emb [1, ctx_dim] → MLP → [n_ctx_m, vis_dim]
+        self.meta_net_layer0 = nn.Sequential(
+            nn.Linear(ctx_dim, ctx_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(ctx_dim, n_ctx_m * vis_dim),
+        ).to(dtype)
+        self.ln_layer0 = LayerNorm(vis_dim).to(dtype)
+        self.layer0_gate = nn.Parameter(torch.zeros(1, dtype=dtype))
+
+        for m in self.meta_net_layer0.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
+        # Zero-init the LAST linear layer of meta_net_layer0 so its output
+        # is zero at Step 0. Combined with layer0_gate (init=0, tanh(0)=0),
+        # this is belt-and-suspenders: the MLP contributes nothing initially,
+        # letting base_vision_ctx_layer0 pass through and preserving CLIP.
+        nn.init.zeros_(self.meta_net_layer0[-1].weight)
+        nn.init.zeros_(self.meta_net_layer0[-1].bias)
+
+        # Learnable base vision context for Layer 0 (residual target)
+        self.base_vision_ctx_layer0 = nn.Parameter(
+            torch.empty(n_ctx_m, vis_dim, dtype=dtype)
+        )
+        nn.init.normal_(self.base_vision_ctx_layer0, std=0.02)
+
+        # ── Change 2: Cross-Attention for Deep Layers ──
+        # Instead of nn.Linear(ctx_dim, vis_dim) per layer, use cross-attention
+        # blocks where vision prompt tokens (Query) attend to instruction tokens
+        # (Key/Value). This bypasses the linear bottleneck.
+        n_heads_xattn = max(1, vis_dim // 64)  # e.g., 768 // 64 = 12 heads
+        self.cross_attn_layers = nn.ModuleList([
+            CrossAttentionCoupling(
+                vis_dim=vis_dim, text_dim=ctx_dim,
+                n_heads=n_heads_xattn, dropout=0.0
+            ).to(dtype) for _ in range(prompt_depth - 1)  # layers 1..N
         ])
-        for layer in self.coupling_layers:
-            nn.init.normal_(layer.weight, std=0.02)
-            nn.init.zeros_(layer.bias)
+
+        # Learnable base vision prompts for each deep layer (query seeds)
+        self.base_vision_ctx_deep = nn.Parameter(
+            torch.empty(prompt_depth - 1, n_ctx_m, vis_dim, dtype=dtype)
+        )
+        nn.init.normal_(self.base_vision_ctx_deep, std=0.02)
+
+        self.vis_dim = vis_dim
 
         self.n_cls = n_cls
         self.n_ctx_s = n_ctx_s
@@ -406,6 +545,7 @@ class VLPromptLearnerCSC(nn.Module):
         self.prompt_depth = prompt_depth
         self.unified_context = unified_context
 
+        # Meta-net for text-side dynamic context conditioning (unchanged)
         self.meta_net = nn.Sequential(
             nn.Linear(ctx_dim, ctx_dim // 4),
             nn.ReLU(inplace=True),
@@ -424,22 +564,50 @@ class VLPromptLearnerCSC(nn.Module):
     def tokenized_prompts(self):
         return self.tokenized_prompts_0
 
+    def _generate_vision_prompts(self, idx):
+        """Generate vision prompts (Layer 0 + deeper) for a single instruction.
+
+        Change 1: Layer-0 vision context is generated by the Meta-Network MLP,
+        conditioned on the instruction embedding, producing context directly
+        in the vision space.
+
+        Change 2: Deeper vision prompts are produced by cross-attention blocks
+        where learnable vision query seeds attend to instruction tokens (K/V).
+        """
+        instruction_emb = getattr(self, f"instruction_emb_{idx}")    # [1, ctx_dim]
+        instruction_tokens = getattr(self, f"instruction_tokens_{idx}")  # [1, T, ctx_dim]
+        inst_tok = instruction_tokens.squeeze(0)  # [T, ctx_dim]
+
+        # ── Layer 0: Meta-Network → Dynamic Vision Context ──
+        # instruction_emb → MLP → [n_ctx_m, vis_dim]
+        layer0_delta = self.meta_net_layer0(instruction_emb)  # [1, n_ctx_m * vis_dim]
+        layer0_delta = layer0_delta.view(self.n_ctx_m, self.vis_dim)  # [n_ctx_m, vis_dim]
+        layer0_delta = self.ln_layer0(layer0_delta)
+        gate = torch.tanh(self.layer0_gate)
+        shared_ctx_vision = self.base_vision_ctx_layer0 + gate * layer0_delta  # [n_ctx_m, vis_dim]
+
+        # ── Deeper Layers: Cross-Attention Injection ──
+        # Vision prompt seeds (Query) attend to instruction tokens (Key/Value)
+        deeper_vision_prompts = []
+        for i in range(self.prompt_depth - 1):
+            query_seed = self.base_vision_ctx_deep[i]  # [n_ctx_m, vis_dim]
+            vision_prompt = self.cross_attn_layers[i](query_seed, inst_tok)  # [n_ctx_m, vis_dim]
+            deeper_vision_prompts.append(vision_prompt)
+
+        return shared_ctx_vision, deeper_vision_prompts
+
     def forward(self, label, is_stage2=False, ensemble=False):
         batch_size = label.shape[0]
 
         if ensemble:
-            # Prompt-level ensemble: run MetaNet for all instructions,
+            # Prompt-level ensemble: run new pipeline for all instructions,
             # average vision prompts, single ViT forward downstream.
             all_shared = []
             all_deeper = []
             for idx in range(len(self.INSTRUCTION_POOL)):
-                instruction_emb = getattr(self, f"instruction_emb_{idx}")
-                delta_ctx = self.meta_net(instruction_emb)
-                delta_ctx = delta_ctx.view(self.prompt_depth, self.n_ctx_m, -1)
-                gated_delta = torch.tanh(self.meta_gates) * delta_ctx
-                dynamic_ctx = self.ctx_m + gated_delta
-                all_shared.append(self.coupling_layers[0](dynamic_ctx[0]))
-                all_deeper.append([self.coupling_layers[i](dynamic_ctx[i]) for i in range(1, self.prompt_depth)])
+                shared_v, deeper_v = self._generate_vision_prompts(idx)
+                all_shared.append(shared_v)
+                all_deeper.append(deeper_v)
             shared_ctx_vision = torch.stack(all_shared, dim=0).mean(dim=0)
             depth = len(all_deeper[0])
             deeper_vision_prompts = [
@@ -460,12 +628,13 @@ class VLPromptLearnerCSC(nn.Module):
                 idx = random.randint(0, len(self.INSTRUCTION_POOL) - 1)
 
             instruction_emb = getattr(self, f"instruction_emb_{idx}")
+            # Text-side dynamic context (unchanged)
             delta_ctx = self.meta_net(instruction_emb)
             delta_ctx = delta_ctx.view(self.prompt_depth, self.n_ctx_m, -1)
             gated_delta = torch.tanh(self.meta_gates) * delta_ctx
             dynamic_ctx = self.ctx_m + gated_delta
-            deeper_vision_prompts = [self.coupling_layers[i](dynamic_ctx[i]) for i in range(1, self.prompt_depth)]
-            shared_ctx_vision = self.coupling_layers[0](dynamic_ctx[0])
+            # Vision-side: use new Meta-Network (Layer 0) + Cross-Attention (deeper)
+            shared_ctx_vision, deeper_vision_prompts = self._generate_vision_prompts(idx)
 
         current_prefix = getattr(self, f"token_prefix_{idx}")
         current_suffix = getattr(self, f"token_suffix_{idx}")
@@ -1207,16 +1376,15 @@ def load_pretrained_maple_weights(model, weight_path, learners=None):
                 if key in state_dict:
                     learner.ctx_m[i + 1].data.copy_(state_dict[key])
 
+            # Old coupling_layers (nn.Linear projections) no longer exist.
+            # meta_net_layer0 and cross_attn_layers use new architectures
+            # and will be trained from scratch. Skip old proj/projection weights.
             if "prompt_learner.proj.weight" in state_dict:
-                learner.coupling_layers[0].weight.data.copy_(state_dict["prompt_learner.proj.weight"])
-                learner.coupling_layers[0].bias.data.copy_(state_dict["prompt_learner.proj.bias"])
-
+                print("  [INFO] Skipping old proj weights (replaced by meta_net_layer0)")
             for i in range(learner.prompt_depth - 1):
                 key_w = f"prompt_learner.compound_prompt_projections.{i}.weight"
-                key_b = f"prompt_learner.compound_prompt_projections.{i}.bias"
                 if key_w in state_dict:
-                    learner.coupling_layers[i + 1].weight.data.copy_(state_dict[key_w])
-                    learner.coupling_layers[i + 1].bias.data.copy_(state_dict[key_b])
+                    print(f"  [INFO] Skipping old compound_prompt_projections.{i} (replaced by cross_attn_layers)")
 
             if "prompt_learner.token_prefix" in state_dict:
                 learner.token_prefix.data.copy_(state_dict["prompt_learner.token_prefix"])

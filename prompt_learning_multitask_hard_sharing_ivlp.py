@@ -818,7 +818,10 @@ if __name__ == "__main__":
         prompter1 = VLPromptLearnerCSC(n_cls1, model, params.train_dataset, prompt_depth=9).cuda()
         prompter2 = VLPromptLearnerCSC(n_cls2, model, params.train_dataset_multitask, prompt_depth=9).cuda()
         prompter2.ctx_m = prompter1.ctx_m
-        prompter2.coupling_layers = prompter1.coupling_layers
+        prompter2.cross_attn_layers = prompter1.cross_attn_layers
+        prompter2.meta_net_layer0 = prompter1.meta_net_layer0
+        prompter2.base_vision_ctx_layer0 = prompter1.base_vision_ctx_layer0
+        prompter2.base_vision_ctx_deep = prompter1.base_vision_ctx_deep
         from maple import TextEncoder as TextEncoderCSC
         text_encoder1 = TextEncoderCSC(model).cuda()
         text_encoder2 = TextEncoderCSC(model).cuda()
