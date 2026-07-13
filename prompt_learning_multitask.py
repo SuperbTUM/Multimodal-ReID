@@ -747,10 +747,16 @@ def train_vision_model(model,
     base_lr = 5e-6
     learnable_params = []
     for name, param in model.named_parameters():
-        # if "text_encoder" in name or "prompt_learner" in name:
-        # experimental
         if "prompt_learner" in name:
-            param.requires_grad_(False)
+            if "vision" in name or "layer0" in name or "cross_attn" in name:
+                param.requires_grad_(True)
+                if "bias" in name:
+                    lr = base_lr * 2
+                    learnable_params += [{"params": [param], "lr": lr, "weight_decay": 1e-4}]
+                else:
+                    learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
+            else:
+                param.requires_grad_(False)
         elif "VPT" in name:
             param.requires_grad_(False)
         elif not param.requires_grad:

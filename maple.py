@@ -425,7 +425,8 @@ class VLPromptLearnerCSC(nn.Module):
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         n_ctx = 4
-        self.n_placeholders = n_ctx_s + n_ctx_m
+        # We only use ctx_s for placeholders now. No deep text prompts.
+        self.n_placeholders = n_ctx_s
         placeholders = " ".join(["X"] * self.n_placeholders)
 
         is_vehicle = dataset_name not in ("market1501", "dukemtmc", "msmt17")
@@ -434,14 +435,26 @@ class VLPromptLearnerCSC(nn.Module):
                 f"A photo of a {placeholders} person. Find the same person. Ignore clothing and illumination changes.",
                 f"Capture the image of a {placeholders} pedestrian. Match the same individual under various surveillance cameras.",
                 f"Look at this {placeholders} person. Track their identity across distinct multi-camera networks.",
-                f"A snapshot of a {placeholders} individual. Find the matching target while disregarding clothes variations."
+                f"A snapshot of a {placeholders} individual. Find the matching target while disregarding clothes variations.",
+                # Semantic Swapping
+                f"Find this {placeholders} person, ignoring transient clothing colors.",
+                f"Search for this {placeholders} pedestrian focusing only on invariant physical traits.",
+                f"Retrieve the identity matching this {placeholders} subject regardless of their outfit.",
+                # Instruction Dropout (Unconditional Fallback)
+                f"A photo of a {placeholders} person."
             ]
         else:
             self.INSTRUCTION_POOL = [
                 f"A photo of a {placeholders} vehicle. Find the identical car by analyzing grille geometry and unique markers.",
-                f"An automobile captured on camera. Track this same vehicle across distinct traffic surveillance views.",
+                f"An automobile captured on camera. Track this same {placeholders} vehicle across distinct traffic surveillance views.",
                 f"Look at this {placeholders} vehicle. Identify the matching car based on body shapes and window layouts.",
-                f"A snapshot of a {placeholders} car. Find this identical target across different traffic camera networks."
+                f"A snapshot of a {placeholders} car. Find this identical target across different traffic camera networks.",
+                # Semantic Swapping
+                f"Find this identical {placeholders} vehicle, ignoring lighting and camera differences.",
+                f"Search for this {placeholders} car focusing only on invariant structural traits.",
+                f"Retrieve the vehicle matching this {placeholders} target regardless of viewpoint.",
+                # Instruction Dropout (Unconditional Fallback)
+                f"A photo of a {placeholders} vehicle."
             ]
 
         for i, instruct in enumerate(self.INSTRUCTION_POOL):
@@ -479,8 +492,6 @@ class VLPromptLearnerCSC(nn.Module):
 
         self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_s, std=0.02)
-        self.ctx_m = nn.Parameter(torch.empty(prompt_depth, n_ctx_m, ctx_dim, dtype=dtype))
-        nn.init.normal_(self.ctx_m, std=0.02)
 
         if hasattr(clip_model.visual, "class_embedding") and clip_model.visual.class_embedding is not None:
             vis_dim = clip_model.visual.class_embedding.shape[0]
@@ -545,23 +556,12 @@ class VLPromptLearnerCSC(nn.Module):
         self.prompt_depth = prompt_depth
         self.unified_context = unified_context
 
-        # Meta-net for text-side dynamic context conditioning (unchanged)
-        self.meta_net = nn.Sequential(
-            nn.Linear(ctx_dim, ctx_dim // 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(ctx_dim // 4, prompt_depth * n_ctx_m * ctx_dim),
-            nn.LayerNorm(prompt_depth * n_ctx_m * ctx_dim) 
-        ).to(dtype)
-
-        self.meta_gates = nn.Parameter(torch.zeros(prompt_depth, 1, 1, dtype=dtype))
-
-        for m in self.meta_net.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-                nn.init.zeros_(m.bias)
+        # Deep text prompts (meta_net, meta_gates) completely removed for CLIP-ReID style shallow text identity tracking.
 
     @property
     def tokenized_prompts(self):
+        if hasattr(self, 'current_tokenized_prompts'):
+            return self.current_tokenized_prompts
         return self.tokenized_prompts_0
 
     def _generate_vision_prompts(self, idx):
@@ -614,33 +614,27 @@ class VLPromptLearnerCSC(nn.Module):
                 torch.stack([all_deeper[k][d] for k in range(len(self.INSTRUCTION_POOL))], dim=0).mean(dim=0)
                 for d in range(depth)
             ]
-            # Text prompts fall back to instruction 0 (unused in image-only path)
+            # Text prompts fall back to instruction 0
             idx = 0
             instruction_emb = getattr(self, f"instruction_emb_{idx}")
-            delta_ctx = self.meta_net(instruction_emb)
-            delta_ctx = delta_ctx.view(self.prompt_depth, self.n_ctx_m, -1)
-            gated_delta = torch.tanh(self.meta_gates) * delta_ctx
-            dynamic_ctx = self.ctx_m + gated_delta
         else:
-            if not is_stage2:
-                idx = 0
-            else:
+            if self.training:
                 idx = random.randint(0, len(self.INSTRUCTION_POOL) - 1)
+            else:
+                idx = 0
 
             instruction_emb = getattr(self, f"instruction_emb_{idx}")
-            # Text-side dynamic context (unchanged)
-            delta_ctx = self.meta_net(instruction_emb)
-            delta_ctx = delta_ctx.view(self.prompt_depth, self.n_ctx_m, -1)
-            gated_delta = torch.tanh(self.meta_gates) * delta_ctx
-            dynamic_ctx = self.ctx_m + gated_delta
+            # Text-side dynamic context (removed)
+
             # Vision-side: use new Meta-Network (Layer 0) + Cross-Attention (deeper)
             shared_ctx_vision, deeper_vision_prompts = self._generate_vision_prompts(idx)
 
+        self.current_tokenized_prompts = getattr(self, f"tokenized_prompts_{idx}")
         current_prefix = getattr(self, f"token_prefix_{idx}")
         current_suffix = getattr(self, f"token_suffix_{idx}")
 
-        m_0 = dynamic_ctx[0].expand(batch_size, -1, -1)
-        deeper_text_prompts = [dynamic_ctx[i] for i in range(1, self.prompt_depth)]
+        # No deeper text prompts
+        deeper_text_prompts = None
 
         if self.unified_context:
             s_c = self.ctx_s.expand(batch_size, -1, -1)
@@ -652,7 +646,7 @@ class VLPromptLearnerCSC(nn.Module):
 
         prefix = current_prefix.expand(batch_size, -1, -1)
         suffix = current_suffix.expand(batch_size, -1, -1)
-        prompts = torch.cat([prefix, s_c, m_0, suffix], dim=1)
+        prompts = torch.cat([prefix, s_c, suffix], dim=1)
 
         return prompts, deeper_text_prompts, deeper_vision_prompts, shared_ctx_vision
 
@@ -999,13 +993,14 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
         x = inputs[0]
         compound_prompts_deeper = inputs[1]
         counter = inputs[2]
+        
+        injecting_deep_prompts = False
+
         if not self.first_layer:
             if len(compound_prompts_deeper) > 0:
                 # This means that deeper compound prompts are turned on
-                # Here it behaves differently for text and visual side
-                # Forward function is same for both
-
                 if not (counter > len(compound_prompts_deeper) - 1):
+                    injecting_deep_prompts = True
                     if not self.text_layer:
                         # Vision side: prompts after CLS
                         prefix = x[:1, :, :]
@@ -1022,9 +1017,20 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                         textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
                         x = torch.cat([prefix, textual_context, suffix], dim=0)
                     
-                    # Once done, update the counter, so that the next time, it does not use same learnable tokens
+                    # Once done, update the counter
                     counter += 1
-        x = x + self.attention(self.ln_1(x))
+
+        # Isolate the [CLS] token during the text-vision attention phase.
+        # This prevents the text from overwhelming the identity-carrying [CLS] token,
+        # forcing the text to act strictly as a spatial filter on the image patches.
+        if not self.text_layer and (self.first_layer or injecting_deep_prompts):
+            cls_token = x[:1, :, :]
+            patch_tokens = x[1:, :, :]
+            patch_tokens = patch_tokens + self.attention(self.ln_1(patch_tokens))
+            x = torch.cat([cls_token, patch_tokens], dim=0)
+        else:
+            x = x + self.attention(self.ln_1(x))
+
         x = x + self.mlp(self.ln_2(x))
         return [x, compound_prompts_deeper, counter]  # return again as a list, so that nn.seq can work
 
@@ -1097,12 +1103,12 @@ class VisionTransformer(nn.Module):
 
 class VisionTransformer_MaPLe(nn.Module):
     def __init__(self, h_resolution: int, w_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,
-                 design_details):
+                 design_details, stride_size: int):
         super().__init__()
         self.h_resolution = h_resolution
         self.w_resolution = w_resolution
         self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=12, bias=False)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=stride_size, bias=False)
         self.VPT_shallow = True
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
@@ -1170,7 +1176,7 @@ class CLIP(nn.Module):
                  transformer_heads: int,
                  transformer_layers: int,
                  design_details,
-                 stride_size: int = 12
+                 stride_size: int = 16
                  ):
         super().__init__()
 
@@ -1197,7 +1203,8 @@ class CLIP(nn.Module):
                     layers=vision_layers,
                     heads=vision_heads,
                     output_dim=embed_dim,
-                    design_details=design_details
+                    design_details=design_details,
+                    stride_size=stride_size
                 )
             else:
                 self.visual = VisionTransformer(
@@ -1368,13 +1375,8 @@ def load_pretrained_maple_weights(model, weight_path, learners=None):
 
     for learner in target_learners:
         if isinstance(learner, VLPromptLearnerCSC):
-            if "prompt_learner.ctx" in state_dict:
-                learner.ctx_m[0].data.copy_(state_dict["prompt_learner.ctx"])
-
-            for i in range(learner.prompt_depth - 1):
-                key = f"prompt_learner.compound_prompts_text.{i}"
-                if key in state_dict:
-                    learner.ctx_m[i + 1].data.copy_(state_dict[key])
+            if "prompt_learner.ctx_s" in state_dict:
+                learner.ctx_s.data.copy_(state_dict["prompt_learner.ctx_s"])
 
             # Old coupling_layers (nn.Linear projections) no longer exist.
             # meta_net_layer0 and cross_attn_layers use new architectures
@@ -1409,7 +1411,7 @@ def load_pretrained_maple_weights(model, weight_path, learners=None):
     print("CSC-MaPLe weights loaded successfully (identity-specific prompts preserved)")
 
 
-def build_model(state_dict: dict, h_resolution, w_resolution, design_details, stride_size=12, **kwargs):
+def build_model(state_dict: dict, h_resolution, w_resolution, design_details, stride_size=16, **kwargs):
     design_details.update(kwargs)
     vit = "visual.proj" in state_dict
 

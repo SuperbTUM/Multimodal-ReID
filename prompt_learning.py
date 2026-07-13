@@ -52,7 +52,7 @@ def weights_init_kaiming(m):
 class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=6, unified_context=False)
+        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9, unified_context=False)
         self.image_encoder = clip_model.visual
         self.text_encoder = MaPLeTextEncoder(clip_model)  # Frozen: generates text_features for loss + cross-attn context
         self.logit_scale = clip_model.logit_scale
@@ -440,29 +440,34 @@ def train_prompter_maple(model,
         for param in model.text_encoder.parameters():
             param.requires_grad = False
 
-    # Unfreeze prompt learner and classifier heads
+    # Freeze vision backbone and vision prompts (prevent distortion)
+    # ONLY unfreeze ctx_s (text identities) and classifiers for Stage 1
+    learnable_params = []
     for name, param in model.named_parameters():
-        if "prompt_learner" in name or "vision_classifier" in name or "vision_bottleneck" in name:
+        if "vision_classifier" in name or "vision_bottleneck" in name:
             param.requires_grad = True
+        elif "prompt_learner" in name and "ctx_s" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
     # Group learnable parameters for the optimizer
-    learnable_params = []
-    # 1. Prompt Learner parameters
-    learnable_params.append({"params": model.prompt_learner.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4})
-    # 2. Classifier Head parameters
-    classifier_params = []
-    for name, param in model.named_parameters():
-        if ("vision_classifier" in name or "vision_bottleneck" in name) and param.requires_grad:
-            classifier_params.append(param)
-    if len(classifier_params) > 0:
-        learnable_params.append({"params": classifier_params, "lr": 3.5e-4, "weight_decay": 1e-4})
+    if hasattr(model, "vision_classifier"):
+        learnable_params += [{"params": model.vision_classifier.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "vision_classifier_proj"):
+        learnable_params += [{"params": model.vision_classifier_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "vision_bottleneck"):
+        learnable_params += [{"params": model.vision_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "vision_bottleneck_proj"):
+        learnable_params += [{"params": model.vision_bottleneck_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "prompt_learner") and hasattr(model.prompt_learner, "ctx_s"):
+        learnable_params += [{"params": [model.prompt_learner.ctx_s], "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=3.5e-4, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 1)
     scaler = GradScaler()
 
     # Loss functions
-    triplet_loss = WeightedRegularizedTriplet(0.3)
     ce_loss = CrossEntropyLabelSmooth(model.vision_classifier.out_features)
     loss_func = SupConLoss("cuda")
 
@@ -486,33 +491,31 @@ def train_prompter_maple(model,
                 cls_scores, image_features_list, image_features_proj = model(img, target)
                 image_features_last, image_features_non_proj, image_features = image_features_list
                 
-                # 1. Classification Loss (L_id)
-                loss_id = 0.
+                # 1. Classification Loss (L_id) - Restored for Stage 1
+                loss_id = 0.0
                 for cls_score in cls_scores:
                     loss_id += 0.25 * ce_loss(cls_score, target)
-                
-                # 2. Triplet Loss (L_tri)
-                loss_tri = triplet_loss(image_features_last, target) + \
-                           triplet_loss(image_features_non_proj, target) + \
-                           triplet_loss(image_features, target)
-                
-                # 3. Cross-Modal ITC Loss
+
+                # 2. Cross-Modal ITC Loss
                 # Text encoder is frozen; gradients flow through prompt_learner only
-                text_features = model(label=target, get_texts=True)
-                loss_i2t = loss_func(image_features, text_features, target, target)
-                loss_t2i = loss_func(text_features, image_features, target, target)
+                unique_labels = torch.unique(target)
+                text_features_unique = model(label=unique_labels, get_texts=True)
+                logit_scale = model.logit_scale.exp()
+                loss_i2t = loss_func(image_features, text_features_unique, target, unique_labels, logit_scale=logit_scale)
+                loss_t2i = loss_func(text_features_unique, image_features, unique_labels, target, logit_scale=logit_scale)
+                loss_itc = (loss_i2t + loss_t2i) / 2
                 
                 # Combined Loss
-                loss = loss_id + loss_tri + loss_i2t + loss_t2i
+                loss = loss_id + loss_itc
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             if (i + 1) % 100 == 0:
-                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_tri: {:.3f}, L_itc: {:.3f}), Base Lr: {:.2e}"
+                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_itc: {:.3f}), Base Lr: {:.2e}"
                       .format(epoch, (i + 1), len(dataloader_train_val),
-                              loss, loss_id, loss_tri, loss_i2t + loss_t2i, scheduler._get_lr(epoch)[0]))
+                              loss, loss_id, loss_itc, scheduler._get_lr(epoch)[0]))
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
@@ -599,7 +602,8 @@ def train_prompter(model,
                 target = vid.cuda()
                 with autocast(enabled=True):
                     image_features = model(img, target, get_image=True)  # the model is changing with ivlp
-                    text_features = model(label=target, get_texts=True)
+                    unique_labels = torch.unique(target)
+                    text_features_unique = model(label=unique_labels, get_texts=True)
             else:
                 if i != i_ter:
                     b_list = iter_list[i * batch:(i + 1) * batch]
@@ -610,9 +614,11 @@ def train_prompter(model,
                 image_features = image_features_list[b_list]
 
                 with autocast(enabled=True):
-                    text_features = model(label=target, get_texts=True)
-            loss_i2t = loss_func(image_features, text_features, target, target)
-            loss_t2i = loss_func(text_features, image_features, target, target)
+                    unique_labels = torch.unique(target)
+                    text_features_unique = model(label=unique_labels, get_texts=True)
+            logit_scale = model.logit_scale.exp()
+            loss_i2t = loss_func(image_features, text_features_unique, target, unique_labels, logit_scale=logit_scale)
+            loss_t2i = loss_func(text_features_unique, image_features, unique_labels, target, logit_scale=logit_scale)
 
             loss = loss_i2t + loss_t2i
 
@@ -783,8 +789,7 @@ def train_vision_model_maple(model,
         unique_labels = torch.unique(label)
 
         # Dynamically compute text features for ONLY the classes in the batch
-        # This prevents OOM while allowing gradients to flow back to the text-side prompts
-        with autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             text_features_batch = model(label=unique_labels, get_texts=True)
 
         # Update the persistent cache with the fresh batch prototypes (no grad)
@@ -798,9 +803,6 @@ def train_vision_model_maple(model,
         output_dynamic = image_features_proj @ text_features_batch.t()
 
         # Overwrite the specific columns in the logits matrix with the dynamic logits.
-        # By doing this on a cloned output matrix, PyTorch cleanly routes the gradients 
-        # for those columns back to output_dynamic (and thus to prompt_learner), 
-        # while keeping the VRAM footprint extremely low!
         output = output.clone()
         for i, cls_id in enumerate(unique_labels):
             output[:, cls_id] = output_dynamic[:, i]
@@ -812,16 +814,16 @@ def train_vision_model_maple(model,
         return loss
 
     print("Building custom CLIP for MaPLe (Stage 2)")
+    if params.amp:
+        model = model.float()
 
     # Pre-compute persistent cache of text features for all classes.
-    # We will dynamically update the batch-specific rows during training to save VRAM 
-    # while still allowing gradients to flow to the prompt learner.
     with torch.no_grad():
         model.eval()
         text_features_all = []
         for i in range(n_cls):
             label_t = torch.tensor([i]).cuda()
-            with autocast(enabled=True):
+            with torch.amp.autocast('cuda', enabled=True):
                 text_feature = model(label=label_t, get_texts=True)
             text_features_all.append(text_feature)
         text_features_all = torch.cat(text_features_all, dim=0).cuda()
@@ -839,11 +841,11 @@ def train_vision_model_maple(model,
 
     print("Building custom CLIP for MaPLe (Stage 2) with Differential LR:")
     print(f"  - Vision Encoder learning rate: {lr_vision}")
-    print(f"  - New Components (Prompt Learner, Classifiers) learning rate: {lr_new_components}")
+    print(f"  - New Components (Classifiers) learning rate: {lr_new_components}")
 
     # Set up parameter gradients and group parameters for the optimizer:
-    # Freezes: text_encoder
-    # Unfreezes: image_encoder (Visual Encoder), prompt_learner, classifiers
+    # Freezes: text_encoder, prompt_learner
+    # Unfreezes: image_encoder (Visual Encoder), classifiers
     learnable_params = []
     vision_params = []
     new_component_params = []
@@ -851,10 +853,16 @@ def train_vision_model_maple(model,
     for name, param in model.named_parameters():
         if "text_encoder" in name:
             param.requires_grad_(False)
+        elif "prompt_learner" in name:
+            if "vision" in name or "layer0" in name or "cross_attn" in name or "ctx_s" in name:
+                param.requires_grad_(True)
+                new_component_params.append(param)
+            else:
+                param.requires_grad_(False)
         elif "image_encoder" in name:
             param.requires_grad_(True)
             vision_params.append(param)
-        elif "prompt_learner" in name or "vision_classifier" in name or "vision_bottleneck" in name:
+        elif "vision_classifier" in name or "vision_bottleneck" in name:
             param.requires_grad_(True)
             new_component_params.append(param)
         else:
@@ -881,11 +889,10 @@ def train_vision_model_maple(model,
     for epoch in range(epochs):
         model.train()
         iterator = tqdm(dataloader)
-        scheduler.step()
         if params.amp:
             for images, target, cams, seqs, indices in iterator:
                 batch = images, target
-                with autocast():
+                with torch.amp.autocast('cuda'):
                     loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -900,6 +907,8 @@ def train_vision_model_maple(model,
                 loss.backward()
                 optimizer.step()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
+        
+        scheduler.step()
 
         current_epoch_gauss_weights = gauss_weights[epoch]
         if params.training_mode == "promptsrc" and previous_model_gpa is None:
@@ -1026,8 +1035,8 @@ if __name__ == "__main__":
         model = build_model_adapter(state_dict or model.state_dict(), image_height // 12, image_width // 12, 12)
     elif params.training_mode == "csc-maple":
         design_details = {"trainer": 'MaPLe',
-                          "vision_depth": 6,
-                          "language_depth": 6}
+                          "vision_depth": 9,
+                          "language_depth": 9}
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details,
                                   n_ctx_s=4, maple_length=4)
     else:
@@ -1092,14 +1101,15 @@ if __name__ == "__main__":
                                                                                                 "vit" if "ViT" in params.model else "rn",
                                                                                                 params.test_dataset)
 
-    if params.training_mode == "csc-maple":
-        train_prompter_maple(model,
-                             loader_train_sampled,
-                             params.epochs_stage1)
-    else:
-        train_prompter(model,
-                       loader_train_val,
-                       params.epochs_stage1)
+    if params.epochs_stage1 > 0:
+        if params.training_mode == "csc-maple":
+            train_prompter_maple(model,
+                                 loader_train_sampled,
+                                 params.epochs_stage1)
+        else:
+            train_prompter(model,
+                           loader_train_val,
+                           params.epochs_stage1)
     if params.training_mode == "csc-maple":
         train_vision_model_maple(model,
                                  loader_train_sampled,
@@ -1114,10 +1124,10 @@ if __name__ == "__main__":
         test_prompter(model, None, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \
         test_prompter(model, None, loader_query)
-    embeddings_gallery_augmented, _, _, _ = \
-        test_prompter(model, None, loader_gallery_augmented)
-    embeddings_query_augmented, _, _, _ = \
-        test_prompter(model, None, loader_query_augmented)
-    embeddings_gallery = (embeddings_gallery + embeddings_gallery_augmented) / 2
-    embeddings_query = (embeddings_query + embeddings_query_augmented) / 2
+    # embeddings_gallery_augmented, _, _, _ = \
+    #     test_prompter(model, None, loader_gallery_augmented)
+    # embeddings_query_augmented, _, _, _ = \
+    #     test_prompter(model, None, loader_query_augmented)
+    # embeddings_gallery = (embeddings_gallery + embeddings_gallery_augmented) / 2
+    # embeddings_query = (embeddings_query + embeddings_query_augmented) / 2
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

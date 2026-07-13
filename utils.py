@@ -166,7 +166,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def model_adaptor(model, height, width, weights=None, model_type="vit", training_mode="coop", vision_stride_size=12):
+def model_adaptor(model, height, width, weights=None, model_type="vit", training_mode="coop", vision_stride_size=16):
     # if (height, width) != (224, 224):
     if weights is not None:
         try:

@@ -681,9 +681,17 @@ def train_vision_model(model,
     learnable_params = []
 
     for name, param in prompter1.named_parameters():
-        param.requires_grad_(False)
+        if "vision" in name or "layer0" in name or "cross_attn" in name:
+            param.requires_grad_(True)
+            learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
+        else:
+            param.requires_grad_(False)
     for name, param in prompter2.named_parameters():
-        param.requires_grad_(False)
+        if "vision" in name or "layer0" in name or "cross_attn" in name:
+            param.requires_grad_(True)
+            learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
+        else:
+            param.requires_grad_(False)
 
     for name, param in model.named_parameters():
         # if "text_encoder" in name or "prompt_learner" in name:
