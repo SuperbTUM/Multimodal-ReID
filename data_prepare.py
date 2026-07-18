@@ -146,8 +146,8 @@ def get_dataset(root, dataset_name):
     return dataset
 
 
-def get_loader_train_sampled_multitask(root, batch_size, image_height, image_width, model_type, dataset_name1, dataset_name2):
-    transform_train = transforms.Compose([
+def get_loader_train_sampled_multitask(root, batch_size, image_height, image_width, model_type, dataset_name1, dataset_name2, use_re=False):
+    transform_list = [
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
         transforms.Pad(10),
@@ -155,8 +155,10 @@ def get_loader_train_sampled_multitask(root, batch_size, image_height, image_wid
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
                              std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
-        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
-    ])
+    ]
+    if use_re:
+        transform_list.append(RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu"))
+    transform_train = transforms.Compose(transform_list)
     dataset1 = get_dataset(root, dataset_name1)
     num_pids1 = dataset1.num_train_pids
     dataset2 = get_dataset(root, dataset_name2)
@@ -168,16 +170,18 @@ def get_loader_train_sampled_multitask(root, batch_size, image_height, image_wid
     return loader_train, num_pids
 
 
-def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type, dataset_name="market1501"):
-    transform_train = transforms.Compose([
+def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type, dataset_name="market1501", use_re=False):
+    transform_list = [
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
         transforms.Pad(10),
         transforms.RandomCrop((image_height, image_width)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
-        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
-    ])
+    ]
+    if use_re:
+        transform_list.append(RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu"))
+    transform_train = transforms.Compose(transform_list)
     dataset = get_dataset(root, dataset_name)
     num_pids = dataset.num_train_pids
     reid_dataset_train = reidDataset(dataset.train, transform_train)
@@ -186,8 +190,8 @@ def get_loader_train_sampled(root, batch_size, image_height, image_width, model_
     return loader_train, num_pids
 
 
-def get_loader_train(root, batch_size, image_height, image_width, model_type, with_val_transform=False, dataset_name="market1501"):
-    transform_train = transforms.Compose([
+def get_loader_train(root, batch_size, image_height, image_width, model_type, with_val_transform=False, dataset_name="market1501", use_re=False):
+    transform_list = [
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
         transforms.Pad((10, 5)),
@@ -195,8 +199,10 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type, wi
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
                              std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
-        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
-    ])
+    ]
+    if use_re:
+        transform_list.append(RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu"))
+    transform_train = transforms.Compose(transform_list)
     dataset = get_dataset(root, dataset_name)
     num_pids = dataset.num_train_pids
     if dataset_name == "veri":
@@ -220,8 +226,8 @@ def get_loader_train(root, batch_size, image_height, image_width, model_type, wi
         return loader_train, num_pids
 
 
-def get_loader_train_multitask(root, batch_size, image_height, image_width, model_type, with_val_transform=False, dataset_name1="market1501", dataset_name2="dukemtmc"):
-    transform_train = transforms.Compose([
+def get_loader_train_multitask(root, batch_size, image_height, image_width, model_type, with_val_transform=False, dataset_name1="market1501", dataset_name2="dukemtmc", use_re=False):
+    transform_list = [
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
         transforms.Pad(10),
@@ -229,8 +235,10 @@ def get_loader_train_multitask(root, batch_size, image_height, image_width, mode
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406),
                              std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
-        RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu")
-    ])
+    ]
+    if use_re:
+        transform_list.append(RandomErasing(probability=0.5, mode="pixel", max_count=1, device="cpu"))
+    transform_train = transforms.Compose(transform_list)
     dataset1 = get_dataset(root, dataset_name1)
     num_pids1 = dataset1.num_train_pids
     dataset2 = get_dataset(root, dataset_name2)

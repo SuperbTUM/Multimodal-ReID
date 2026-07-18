@@ -822,14 +822,15 @@ if __name__ == "__main__":
         design_details = {"trainer": 'MaPLe',
                           "vision_depth": 9,
                           "language_depth": 9}
-        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details, n_ctx_s=4, maple_length=4)
+        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details, n_ctx_s=4, maple_length=2)
         prompter1 = VLPromptLearnerCSC(n_cls1, model, params.train_dataset, prompt_depth=9).cuda()
         prompter2 = VLPromptLearnerCSC(n_cls2, model, params.train_dataset_multitask, prompt_depth=9).cuda()
         prompter2.ctx_m = prompter1.ctx_m
-        prompter2.cross_attn_layers = prompter1.cross_attn_layers
+        prompter2.proj = prompter1.proj
         prompter2.meta_net_layer0 = prompter1.meta_net_layer0
-        prompter2.base_vision_ctx_layer0 = prompter1.base_vision_ctx_layer0
-        prompter2.base_vision_ctx_deep = prompter1.base_vision_ctx_deep
+        prompter2.ln_layer0 = prompter1.ln_layer0
+        prompter2.layer0_gate = prompter1.layer0_gate
+        prompter2.cross_attn_layers = prompter1.cross_attn_layers
         from maple import TextEncoder as TextEncoderCSC
         text_encoder1 = TextEncoderCSC(model).cuda()
         text_encoder2 = TextEncoderCSC(model).cuda()

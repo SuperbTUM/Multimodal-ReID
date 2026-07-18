@@ -481,7 +481,30 @@ def train_prompter_maple(model,
     model.train()
 
     print("Turning off gradients in CLIP backbone")
-    learnable_params = [{"params": model.prompt_learner.parameters(), "lr": 0.00035, "weight_decay": 1e-4}]
+    # Freeze vision backbone
+    # Unfreeze all prompt parameters (text and vision) and classifiers for Stage 1
+    learnable_params = []
+    for name, param in model.named_parameters():
+        if "vision_classifier" in name or "vision_bottleneck" in name:
+            param.requires_grad = True
+        elif "prompt_learner" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    # Group learnable parameters for the optimizer
+    if hasattr(model, "vision_classifier"):
+        learnable_params += [{"params": model.vision_classifier.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "vision_classifier_proj"):
+        learnable_params += [{"params": model.vision_classifier_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "vision_bottleneck"):
+        learnable_params += [{"params": model.vision_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "vision_bottleneck_proj"):
+        learnable_params += [{"params": model.vision_bottleneck_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "prompt_learner"):
+        prompt_params = [p for n, p in model.prompt_learner.named_parameters() if p.requires_grad]
+        if prompt_params:
+            learnable_params += [{"params": prompt_params, "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=0.00035, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 1)
@@ -940,7 +963,7 @@ if __name__ == "__main__":
         design_details = {"trainer": 'MaPLe',
                           "vision_depth": 9,
                           "language_depth": 9}
-        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details, n_ctx_s=4, maple_length=4)
+        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details, n_ctx_s=4, maple_length=2)
     else:
         raise NotImplementedError
 

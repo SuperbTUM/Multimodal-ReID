@@ -87,7 +87,8 @@ class CustomCLIPCSC(nn.Module):
             return image_features
 
         if get_texts:
-            prompts, deeper_text, _, _ = self.prompt_learner(label=label, is_stage2=is_stage2)
+            force_idx = getattr(self.prompt_learner, 'current_idx', None) if self.training else None
+            prompts, deeper_text, _, _ = self.prompt_learner(label=label, is_stage2=is_stage2, force_idx=force_idx)
             tokenized_prompts = self.prompt_learner.tokenized_prompts
             text_features = self.text_encoder(prompts, tokenized_prompts, deeper_text)
             return text_features
@@ -440,13 +441,13 @@ def train_prompter_maple(model,
         for param in model.text_encoder.parameters():
             param.requires_grad = False
 
-    # Freeze vision backbone and vision prompts (prevent distortion)
-    # ONLY unfreeze ctx_s (text identities) and classifiers for Stage 1
+    # Freeze vision backbone
+    # Unfreeze all prompt parameters (text and vision) and classifiers for Stage 1
     learnable_params = []
     for name, param in model.named_parameters():
         if "vision_classifier" in name or "vision_bottleneck" in name:
             param.requires_grad = True
-        elif "prompt_learner" in name and "ctx_s" in name:
+        elif "prompt_learner" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -460,11 +461,13 @@ def train_prompter_maple(model,
         learnable_params += [{"params": model.vision_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck_proj"):
         learnable_params += [{"params": model.vision_bottleneck_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
-    if hasattr(model, "prompt_learner") and hasattr(model.prompt_learner, "ctx_s"):
-        learnable_params += [{"params": [model.prompt_learner.ctx_s], "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "prompt_learner"):
+        prompt_params = [p for n, p in model.prompt_learner.named_parameters() if p.requires_grad]
+        if prompt_params:
+            learnable_params += [{"params": prompt_params, "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=3.5e-4, weight_decay=1e-4)
-    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 1)
+    scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
     scaler = GradScaler()
 
     # Loss functions
@@ -1038,7 +1041,7 @@ if __name__ == "__main__":
                           "vision_depth": 9,
                           "language_depth": 9}
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details,
-                                  n_ctx_s=4, maple_length=4)
+                                  n_ctx_s=4, maple_length=2)
     else:
         raise NotImplementedError
 
@@ -1046,17 +1049,17 @@ if __name__ == "__main__":
 
     if not params.train_dataset_multitask:
         _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
-                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset)
+                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset, use_re=True)
         loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset)
+                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
     else:
         _, loader_train_val, n_cls, car_types_train = get_loader_train_multitask(params.root, params.bs, image_height,
                                                                        image_width,
                                                                        "vit" if "ViT" in params.model else "rn", True,
-                                                                       params.train_dataset, params.train_dataset_multitask)
+                                                                       params.train_dataset, params.train_dataset_multitask, use_re=True)
         loader_train_sampled, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
                                                            "vit" if "ViT" in params.model else "rn",
-                                                           params.train_dataset, params.train_dataset_multitask)
+                                                           params.train_dataset, params.train_dataset_multitask, use_re=True)
     if params.training_mode in ("ivlp", "promptsrc", "csc-maple"):
         # this is from weights of multimodal-prompt-learning
         weight_path = "./clip_imagenet_pretrained_ivlp.pth.tar-5"
@@ -1111,12 +1114,26 @@ if __name__ == "__main__":
                            loader_train_val,
                            params.epochs_stage1)
     if params.training_mode == "csc-maple":
+        if not params.train_dataset_multitask:
+            loader_train_sampled_stage2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
+                                                               "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
+        else:
+            loader_train_sampled_stage2, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
+                                                               "vit" if "ViT" in params.model else "rn",
+                                                               params.train_dataset, params.train_dataset_multitask, use_re=True)
         train_vision_model_maple(model,
-                                 loader_train_sampled,
+                                 loader_train_sampled_stage2,
                                  params.epochs_stage2)
     else:
+        if not params.train_dataset_multitask:
+            loader_train_sampled_stage2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
+                                                               "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
+        else:
+            loader_train_sampled_stage2, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
+                                                               "vit" if "ViT" in params.model else "rn",
+                                                               params.train_dataset, params.train_dataset_multitask, use_re=True)
         train_vision_model(model,
-                           loader_train_sampled,
+                           loader_train_sampled_stage2,
                            params.epochs_stage2)
     latest_model = "/".join((os.path.join(params.save_path, params.training_mode, params.train_dataset),
                              "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))

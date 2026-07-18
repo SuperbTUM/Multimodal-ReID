@@ -425,8 +425,8 @@ class VLPromptLearnerCSC(nn.Module):
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         n_ctx = 4
-        # We only use ctx_s for placeholders now. No deep text prompts.
-        self.n_placeholders = n_ctx_s
+        # We use ctx_s for identity-specific context and ctx_m for shared ReID context.
+        self.n_placeholders = n_ctx_s + n_ctx_m
         placeholders = " ".join(["X"] * self.n_placeholders)
 
         is_vehicle = dataset_name not in ("market1501", "dukemtmc", "msmt17")
@@ -458,12 +458,19 @@ class VLPromptLearnerCSC(nn.Module):
             ]
 
         for i, instruct in enumerate(self.INSTRUCTION_POOL):
+            # Dynamically calculate the token length of the prefix string
+            prefix_str = instruct.split(placeholders)[0]
+            prefix_tokens = clip.tokenize(prefix_str)[0]
+            # In CLIP, the EOS token is the max token ID (49407), so argmax finds its index.
+            # The index of EOS perfectly matches the length of the prefix including the SOS token.
+            prefix_len = prefix_tokens.argmax().item()
+
             tokens = clip.tokenize(instruct).cuda()
             with torch.no_grad():
                 emb = clip_model.token_embedding(tokens).type(dtype)
             
-            prefix_slice = emb[:, :1 + n_ctx, :]
-            suffix_slice = emb[:, 1 + n_ctx + self.n_placeholders:, :]
+            prefix_slice = emb[:, :prefix_len, :]
+            suffix_slice = emb[:, prefix_len + self.n_placeholders:, :]
 
             # Run full instruction through the frozen Text Transformer to get
             # contextualized hidden states. Raw token_embedding outputs lack
@@ -480,7 +487,7 @@ class VLPromptLearnerCSC(nn.Module):
                 x_ctx = clip_model.ln_final(x_ctx).type(dtype)
 
             # Extract contextualized suffix (instruction) tokens for Cross-Attention K/V
-            ctx_suffix = x_ctx[:, 1 + n_ctx + self.n_placeholders:, :]  # [1, T, ctx_dim]
+            ctx_suffix = x_ctx[:, prefix_len + self.n_placeholders:, :]  # [1, T, ctx_dim]
             instruct_emb_slice = ctx_suffix.mean(dim=1)  # [1, ctx_dim]
             instruct_tokens_full = ctx_suffix  # [1, T, ctx_dim]
 
@@ -492,6 +499,9 @@ class VLPromptLearnerCSC(nn.Module):
 
         self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_s, std=0.02)
+        
+        self.ctx_m = nn.Parameter(torch.empty(1, n_ctx_m, ctx_dim, dtype=dtype))
+        nn.init.normal_(self.ctx_m, std=0.02)
 
         if hasattr(clip_model.visual, "class_embedding") and clip_model.visual.class_embedding is not None:
             vis_dim = clip_model.visual.class_embedding.shape[0]
@@ -500,11 +510,14 @@ class VLPromptLearnerCSC(nn.Module):
         else:
             vis_dim = clip_model.visual.conv1.out_channels
 
-        # ── Change 1: Meta-Network for Layer-0 Vision Context ──
-        # Instead of projecting a static shared_ctx through nn.Linear,
-        # pass the instruction embedding through a lightweight MLP to
-        # generate the Layer-0 vision context vectors directly in vis_dim.
-        # Flow: instruction_emb [1, ctx_dim] → MLP → [n_ctx_m, vis_dim]
+        # ── Independent Projection Layers (Depth-Specific) ──
+        # Instead of a single shared linear layer, we use independent layers for each depth.
+        self.proj = nn.ModuleList([nn.Linear(ctx_dim, vis_dim).to(dtype) for _ in range(prompt_depth)])
+        for p in self.proj:
+            nn.init.normal_(p.weight, std=0.02)
+            nn.init.zeros_(p.bias)
+
+        # ── Meta-Network for Layer-0 Vision Context (Instruction Injection) ──
         self.meta_net_layer0 = nn.Sequential(
             nn.Linear(ctx_dim, ctx_dim),
             nn.ReLU(inplace=True),
@@ -517,46 +530,26 @@ class VLPromptLearnerCSC(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
                 nn.init.zeros_(m.bias)
-        # Zero-init the LAST linear layer of meta_net_layer0 so its output
-        # is zero at Step 0. Combined with layer0_gate (init=0, tanh(0)=0),
-        # this is belt-and-suspenders: the MLP contributes nothing initially,
-        # letting base_vision_ctx_layer0 pass through and preserving CLIP.
         nn.init.zeros_(self.meta_net_layer0[-1].weight)
         nn.init.zeros_(self.meta_net_layer0[-1].bias)
 
-        # Learnable base vision context for Layer 0 (residual target)
-        self.base_vision_ctx_layer0 = nn.Parameter(
-            torch.empty(n_ctx_m, vis_dim, dtype=dtype)
-        )
-        nn.init.normal_(self.base_vision_ctx_layer0, std=0.02)
-
-        # ── Change 2: Cross-Attention for Deep Layers ──
-        # Instead of nn.Linear(ctx_dim, vis_dim) per layer, use cross-attention
-        # blocks where vision prompt tokens (Query) attend to instruction tokens
-        # (Key/Value). This bypasses the linear bottleneck.
-        n_heads_xattn = max(1, vis_dim // 64)  # e.g., 768 // 64 = 12 heads
+        # ── Cross-Attention for Deep Layers (Instruction Injection) ──
+        n_heads_xattn = max(1, vis_dim // 64)
         self.cross_attn_layers = nn.ModuleList([
             CrossAttentionCoupling(
                 vis_dim=vis_dim, text_dim=ctx_dim,
                 n_heads=n_heads_xattn, dropout=0.0
-            ).to(dtype) for _ in range(prompt_depth - 1)  # layers 1..N
+            ).to(dtype) for _ in range(prompt_depth - 1)
         ])
 
-        # Learnable base vision prompts for each deep layer (query seeds)
-        self.base_vision_ctx_deep = nn.Parameter(
-            torch.empty(prompt_depth - 1, n_ctx_m, vis_dim, dtype=dtype)
-        )
-        nn.init.normal_(self.base_vision_ctx_deep, std=0.02)
-
         self.vis_dim = vis_dim
-
         self.n_cls = n_cls
         self.n_ctx_s = n_ctx_s
         self.n_ctx_m = n_ctx_m
         self.prompt_depth = prompt_depth
         self.unified_context = unified_context
 
-        # Deep text prompts (meta_net, meta_gates) completely removed for CLIP-ReID style shallow text identity tracking.
+        # Deep text prompts removed; vision prompts generated entirely via projection.
 
     @property
     def tokenized_prompts(self):
@@ -565,43 +558,33 @@ class VLPromptLearnerCSC(nn.Module):
         return self.tokenized_prompts_0
 
     def _generate_vision_prompts(self, idx):
-        """Generate vision prompts (Layer 0 + deeper) for a single instruction.
-
-        Change 1: Layer-0 vision context is generated by the Meta-Network MLP,
-        conditioned on the instruction embedding, producing context directly
-        in the vision space.
-
-        Change 2: Deeper vision prompts are produced by cross-attention blocks
-        where learnable vision query seeds attend to instruction tokens (K/V).
-        """
         instruction_emb = getattr(self, f"instruction_emb_{idx}")    # [1, ctx_dim]
         instruction_tokens = getattr(self, f"instruction_tokens_{idx}")  # [1, T, ctx_dim]
         inst_tok = instruction_tokens.squeeze(0)  # [T, ctx_dim]
 
-        # ── Layer 0: Meta-Network → Dynamic Vision Context ──
-        # instruction_emb → MLP → [n_ctx_m, vis_dim]
+        m_c = self.ctx_m.squeeze(0) # [n_ctx_m, ctx_dim]
+        
+        # Layer 0
+        base_vision_ctx_layer0 = self.proj[0](m_c) # [n_ctx_m, vis_dim]
         layer0_delta = self.meta_net_layer0(instruction_emb)  # [1, n_ctx_m * vis_dim]
         layer0_delta = layer0_delta.view(self.n_ctx_m, self.vis_dim)  # [n_ctx_m, vis_dim]
         layer0_delta = self.ln_layer0(layer0_delta)
         gate = torch.tanh(self.layer0_gate)
-        shared_ctx_vision = self.base_vision_ctx_layer0 + gate * layer0_delta  # [n_ctx_m, vis_dim]
+        shared_ctx_vision = base_vision_ctx_layer0 + gate * layer0_delta  # [n_ctx_m, vis_dim]
 
-        # ── Deeper Layers: Cross-Attention Injection ──
-        # Vision prompt seeds (Query) attend to instruction tokens (Key/Value)
+        # Deeper Layers
         deeper_vision_prompts = []
         for i in range(self.prompt_depth - 1):
-            query_seed = self.base_vision_ctx_deep[i]  # [n_ctx_m, vis_dim]
+            query_seed = self.proj[i+1](m_c)  # [n_ctx_m, vis_dim]
             vision_prompt = self.cross_attn_layers[i](query_seed, inst_tok)  # [n_ctx_m, vis_dim]
             deeper_vision_prompts.append(vision_prompt)
 
         return shared_ctx_vision, deeper_vision_prompts
 
-    def forward(self, label, is_stage2=False, ensemble=False):
-        batch_size = label.shape[0]
+    def forward(self, label, is_stage2=False, ensemble=False, force_idx=None):
+        batch_size = label.shape[0] if label is not None else 1
 
         if ensemble:
-            # Prompt-level ensemble: run new pipeline for all instructions,
-            # average vision prompts, single ViT forward downstream.
             all_shared = []
             all_deeper = []
             for idx in range(len(self.INSTRUCTION_POOL)):
@@ -614,26 +597,21 @@ class VLPromptLearnerCSC(nn.Module):
                 torch.stack([all_deeper[k][d] for k in range(len(self.INSTRUCTION_POOL))], dim=0).mean(dim=0)
                 for d in range(depth)
             ]
-            # Text prompts fall back to instruction 0
             idx = 0
-            instruction_emb = getattr(self, f"instruction_emb_{idx}")
         else:
-            if self.training:
+            if force_idx is not None:
+                idx = force_idx
+            elif self.training:
                 idx = random.randint(0, len(self.INSTRUCTION_POOL) - 1)
             else:
                 idx = 0
-
-            instruction_emb = getattr(self, f"instruction_emb_{idx}")
-            # Text-side dynamic context (removed)
-
-            # Vision-side: use new Meta-Network (Layer 0) + Cross-Attention (deeper)
             shared_ctx_vision, deeper_vision_prompts = self._generate_vision_prompts(idx)
 
+        self.current_idx = idx
         self.current_tokenized_prompts = getattr(self, f"tokenized_prompts_{idx}")
         current_prefix = getattr(self, f"token_prefix_{idx}")
         current_suffix = getattr(self, f"token_suffix_{idx}")
 
-        # No deeper text prompts
         deeper_text_prompts = None
 
         if self.unified_context:
@@ -644,9 +622,10 @@ class VLPromptLearnerCSC(nn.Module):
             else:
                 s_c = self.ctx_s[label]
 
+        m_c_batch = self.ctx_m.expand(batch_size, -1, -1)
         prefix = current_prefix.expand(batch_size, -1, -1)
         suffix = current_suffix.expand(batch_size, -1, -1)
-        prompts = torch.cat([prefix, s_c, suffix], dim=1)
+        prompts = torch.cat([prefix, s_c, m_c_batch, suffix], dim=1)
 
         return prompts, deeper_text_prompts, deeper_vision_prompts, shared_ctx_vision
 
