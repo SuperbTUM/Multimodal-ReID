@@ -23,6 +23,15 @@ from losses import SupConLoss, WeightedRegularizedTriplet, CrossEntropyLabelSmoo
 cudnn.enabled = True
 cudnn.deterministic = True
 
+import random
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+set_seed(42)
+
 from text_encoder import TextEncoder, TextEncoderAugmented
 from coop import (build_model as build_model_coop,
                   PromptLearner as PromptLearnerCoop,
@@ -480,6 +489,21 @@ def train_prompter_maple(model,
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
 
+    # Pre-compute persistent cache of text features for all classes to avoid OOM
+    print("Initializing persistent text feature cache...")
+    with torch.no_grad():
+        model.eval()
+        text_features_cache = []
+        n_cls = model.prompt_learner.n_cls
+        # Process in chunks to ensure no OOM during initialization
+        for i in range(0, n_cls, 128):
+            label_chunk = torch.arange(i, min(i+128, n_cls)).cuda()
+            with autocast(enabled=True):
+                chunk_features = model(label=label_chunk, get_texts=True)
+            text_features_cache.append(chunk_features.detach())
+        text_features_cache = torch.cat(text_features_cache, dim=0).cuda()
+    print("Cache initialized.")
+
     for epoch in range(1, epochs + 1):
         scheduler.step(epoch)
         model.train()
@@ -502,16 +526,40 @@ def train_prompter_maple(model,
                 # 2. Cross-Modal ITC Loss
                 # Text encoder is frozen; gradients flow through prompt_learner only
                 unique_labels = torch.unique(target)
+                
+                # Dynamically compute text features for ONLY the classes in the batch
                 text_features_unique = model(label=unique_labels, get_texts=True)
+                
+                # Update persistent cache with the fresh batch prototypes (no grad)
+                with torch.no_grad():
+                    text_features_cache[unique_labels] = text_features_unique.detach()
+                
+                # Construct hybrid tensor for global separation (preserves batch gradients)
+                dynamic_features = torch.zeros_like(text_features_cache)
+                dynamic_features[unique_labels] = text_features_unique
+                
+                mask = torch.zeros(n_cls, 1, dtype=dynamic_features.dtype, device='cuda')
+                mask[unique_labels] = 1.0
+                
+                text_features_all = text_features_cache * (1 - mask) + dynamic_features
+                all_labels = torch.arange(n_cls).cuda()
+                
                 logit_scale = model.logit_scale.exp()
-                loss_i2t = loss_func(image_features, text_features_unique, target, unique_labels, logit_scale=logit_scale)
+                
+                # Global i2t Loss (Pushes image away from all negative text identities)
+                loss_i2t = loss_func(image_features, text_features_all, target, all_labels, logit_scale=logit_scale)
+                
+                # Safe Local t2i Loss 
                 loss_t2i = loss_func(text_features_unique, image_features, unique_labels, target, logit_scale=logit_scale)
+                
                 loss_itc = (loss_i2t + loss_t2i) / 2
                 
                 # Combined Loss
                 loss = loss_id + loss_itc
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params']], max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -694,11 +742,7 @@ def train_vision_model(model,
     model.train()
 
     if pretrained is not None:
-        load_pretrained_weights(model.image_encoder, pretrained)
-        load_pretrained_weights(model.vision_classifier, pretrained)
-        load_pretrained_weights(model.vision_classifier_proj, pretrained)
-        load_pretrained_weights(model.vision_bottleneck, pretrained)
-        load_pretrained_weights(model.vision_bottleneck_proj, pretrained)
+        load_pretrained_weights(model, pretrained)
 
     print("Turning off gradients in both the prompter and the text encoder")
     base_lr = 5e-6
@@ -832,11 +876,7 @@ def train_vision_model_maple(model,
         text_features_all = torch.cat(text_features_all, dim=0).cuda()
 
     if pretrained is not None:
-        load_pretrained_weights(model.image_encoder, pretrained)
-        load_pretrained_weights(model.vision_classifier, pretrained)
-        load_pretrained_weights(model.vision_classifier_proj, pretrained)
-        load_pretrained_weights(model.vision_bottleneck, pretrained)
-        load_pretrained_weights(model.vision_bottleneck_proj, pretrained)
+        load_pretrained_weights(model, pretrained)
 
     # Define stage 2 learning rates (Differential LR)
     lr_vision = 1e-5
@@ -857,7 +897,7 @@ def train_vision_model_maple(model,
         if "text_encoder" in name:
             param.requires_grad_(False)
         elif "prompt_learner" in name:
-            if "vision" in name or "layer0" in name or "cross_attn" in name or "ctx_s" in name:
+            if "vision" in name or "layer0" in name or "cross_attn" in name or "ctx_s" in name or "ctx_m" in name or "proj" in name:
                 param.requires_grad_(True)
                 new_component_params.append(param)
             else:
@@ -899,6 +939,8 @@ def train_vision_model_maple(model,
                     loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params']], max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
@@ -908,6 +950,7 @@ def train_vision_model_maple(model,
                 loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params']], max_norm=1.0)
                 optimizer.step()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
         
@@ -1049,17 +1092,17 @@ if __name__ == "__main__":
 
     if not params.train_dataset_multitask:
         _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
-                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset, use_re=True)
+                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset, use_re=False)
         loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
+                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=False)
     else:
         _, loader_train_val, n_cls, car_types_train = get_loader_train_multitask(params.root, params.bs, image_height,
                                                                        image_width,
                                                                        "vit" if "ViT" in params.model else "rn", True,
-                                                                       params.train_dataset, params.train_dataset_multitask, use_re=True)
+                                                                       params.train_dataset, params.train_dataset_multitask, use_re=False)
         loader_train_sampled, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
                                                            "vit" if "ViT" in params.model else "rn",
-                                                           params.train_dataset, params.train_dataset_multitask, use_re=True)
+                                                           params.train_dataset, params.train_dataset_multitask, use_re=False)
     if params.training_mode in ("ivlp", "promptsrc", "csc-maple"):
         # this is from weights of multimodal-prompt-learning
         weight_path = "./clip_imagenet_pretrained_ivlp.pth.tar-5"
@@ -1141,10 +1184,4 @@ if __name__ == "__main__":
         test_prompter(model, None, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \
         test_prompter(model, None, loader_query)
-    # embeddings_gallery_augmented, _, _, _ = \
-    #     test_prompter(model, None, loader_gallery_augmented)
-    # embeddings_query_augmented, _, _, _ = \
-    #     test_prompter(model, None, loader_query_augmented)
-    # embeddings_gallery = (embeddings_gallery + embeddings_gallery_augmented) / 2
-    # embeddings_query = (embeddings_query + embeddings_query_augmented) / 2
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)

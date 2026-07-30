@@ -497,6 +497,10 @@ class VLPromptLearnerCSC(nn.Module):
             self.register_buffer(f"instruction_tokens_{i}", instruct_tokens_full)
             self.register_buffer(f"tokenized_prompts_{i}", tokens)
 
+        self.n_cls = n_cls
+        self.n_ctx_s = n_ctx_s
+        self.ctx_dim = ctx_dim
+
         self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_s, std=0.02)
         
@@ -512,7 +516,11 @@ class VLPromptLearnerCSC(nn.Module):
 
         # ── Independent Projection Layers (Depth-Specific) ──
         # Instead of a single shared linear layer, we use independent layers for each depth.
-        self.proj = nn.ModuleList([nn.Linear(ctx_dim, vis_dim).to(dtype) for _ in range(prompt_depth)])
+        self.proj = nn.ModuleList()
+        self.proj.append(nn.Linear(ctx_dim, vis_dim).to(dtype)) # Layer 0
+        for _ in range(prompt_depth - 1):
+            self.proj.append(nn.Linear(ctx_dim * 2, vis_dim).to(dtype)) # Deeper layers
+            
         for p in self.proj:
             nn.init.normal_(p.weight, std=0.02)
             nn.init.zeros_(p.bias)
@@ -533,15 +541,6 @@ class VLPromptLearnerCSC(nn.Module):
         nn.init.zeros_(self.meta_net_layer0[-1].weight)
         nn.init.zeros_(self.meta_net_layer0[-1].bias)
 
-        # ── Cross-Attention for Deep Layers (Instruction Injection) ──
-        n_heads_xattn = max(1, vis_dim // 64)
-        self.cross_attn_layers = nn.ModuleList([
-            CrossAttentionCoupling(
-                vis_dim=vis_dim, text_dim=ctx_dim,
-                n_heads=n_heads_xattn, dropout=0.0
-            ).to(dtype) for _ in range(prompt_depth - 1)
-        ])
-
         self.vis_dim = vis_dim
         self.n_cls = n_cls
         self.n_ctx_s = n_ctx_s
@@ -559,11 +558,7 @@ class VLPromptLearnerCSC(nn.Module):
 
     def _generate_vision_prompts(self, idx):
         instruction_emb = getattr(self, f"instruction_emb_{idx}")    # [1, ctx_dim]
-        instruction_tokens = getattr(self, f"instruction_tokens_{idx}")  # [1, T, ctx_dim]
-        inst_tok = instruction_tokens.squeeze(0)  # [T, ctx_dim]
-
         m_c = self.ctx_m.squeeze(0) # [n_ctx_m, ctx_dim]
-        
         # Layer 0
         base_vision_ctx_layer0 = self.proj[0](m_c) # [n_ctx_m, vis_dim]
         layer0_delta = self.meta_net_layer0(instruction_emb)  # [1, n_ctx_m * vis_dim]
@@ -574,9 +569,9 @@ class VLPromptLearnerCSC(nn.Module):
 
         # Deeper Layers
         deeper_vision_prompts = []
+        combined_ctx = torch.cat([m_c, instruction_emb.expand(self.n_ctx_m, -1)], dim=-1)
         for i in range(self.prompt_depth - 1):
-            query_seed = self.proj[i+1](m_c)  # [n_ctx_m, vis_dim]
-            vision_prompt = self.cross_attn_layers[i](query_seed, inst_tok)  # [n_ctx_m, vis_dim]
+            vision_prompt = self.proj[i+1](combined_ctx)  # [n_ctx_m, vis_dim]
             deeper_vision_prompts.append(vision_prompt)
 
         return shared_ctx_vision, deeper_vision_prompts
@@ -625,7 +620,8 @@ class VLPromptLearnerCSC(nn.Module):
         m_c_batch = self.ctx_m.expand(batch_size, -1, -1)
         prefix = current_prefix.expand(batch_size, -1, -1)
         suffix = current_suffix.expand(batch_size, -1, -1)
-        prompts = torch.cat([prefix, s_c, m_c_batch, suffix], dim=1)
+        # Causal mask friendly: specific tokens (s_c) can now attend to shared domain knowledge (m_c)
+        prompts = torch.cat([prefix, m_c_batch, s_c, suffix], dim=1)
 
         return prompts, deeper_text_prompts, deeper_vision_prompts, shared_ctx_vision
 
