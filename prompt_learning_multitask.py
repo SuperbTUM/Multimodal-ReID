@@ -30,7 +30,7 @@ from coop import build_model as build_model_coop, \
     PromptLearner as PromptLearnerCoop, \
     PromptLearnerVeri as PromptLearnerCoopVeri, \
     PromptLearnerAugmented as PromptLearnerCoopAugmented
-from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerVeri, VLPromptLearnerSRC, VLPromptLearnerCSC
+from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerAttributes, VLPromptLearnerVeri, VLPromptLearnerSRC, VLPromptLearnerCSC
 from clip_adapter import Adapter, \
     build_model as build_model_adapter, PromptLearner as PromptLearnerAdapter
 import clip_custom
@@ -292,7 +292,10 @@ class CustomCLIPIVLP(nn.Module):
         # if params.train_dataset == "veri":
         #     self.prompt_learner = VLPromptLearnerVeri(classnames, clip_model, car_types_train)
         # else:
-        self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
+        if params.train_dataset == "market1501":
+            self.prompt_learner = VLPromptLearnerAttributes(classnames, clip_model)
+        else:
+            self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -371,7 +374,7 @@ class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
         from maple import TextEncoder as TextEncoderCSC
-        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9)
+        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9, use_instruction_pool=True)
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoderCSC(clip_model)
         self.logit_scale = clip_model.logit_scale

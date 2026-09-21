@@ -969,9 +969,9 @@ if __name__ == "__main__":
             prompter2 = VLPromptLearnerCSC(n_cls2, model, params.train_dataset_multitask, prompt_depth=9).cuda()
             prompter2.ctx_m = prompter1.ctx_m
             prompter2.proj = prompter1.proj
-            prompter2.meta_net_layer0 = prompter1.meta_net_layer0
-            prompter2.ln_layer0 = prompter1.ln_layer0
-            prompter2.layer0_gate = prompter1.layer0_gate
+            # prompter2.meta_net_layer0 = prompter1.meta_net_layer0 (Removed)
+            # prompter2.ln_layer0 = prompter1.ln_layer0 (Removed)
+            # prompter2.layer0_gate = prompter1.layer0_gate (Removed)
             prompter2.cross_attn_layers = prompter1.cross_attn_layers
             model = CustomCLIPCSC(model).cuda()
             load_pretrained_maple_weights(model, weight_path, learners=[prompter1, prompter2])

@@ -18,7 +18,7 @@ from utils import load_pretrained_weights
 from data_prepare import get_loader_train, get_loader_train_multitask, get_loader_train_sampled, get_loader_train_sampled_multitask, get_loader
 from evaluate import R1_mAP_eval
 from schedulers import WarmupMultiStepLR, create_scheduler
-from losses import SupConLoss, WeightedRegularizedTriplet, CrossEntropyLabelSmooth
+from losses import SupConLoss, WeightedRegularizedTriplet, CrossEntropyLabelSmooth, CrossModalTripletLoss
 
 cudnn.enabled = True
 cudnn.deterministic = True
@@ -36,7 +36,7 @@ from text_encoder import TextEncoder, TextEncoderAugmented
 from coop import (build_model as build_model_coop,
                   PromptLearner as PromptLearnerCoop,
                   PromptLearnerVeri as PromptLearnerCoopVeri)
-from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerSRC, VLPromptLearnerVeri, VLPromptLearnerCSC, TextEncoder as MaPLeTextEncoder
+from maple import build_model as build_model_maple, VLPromptLearner, VLPromptLearnerAttributes, VLPromptLearnerSRC, VLPromptLearnerVeri, VLPromptLearnerCSC, TextEncoder as MaPLeTextEncoder
 from clip_adapter import Adapter, build_model as build_model_adapter, PromptLearner as PromptLearnerAdapter
 import clip_custom
 from metaclip import build_model_from_openai_state_dict
@@ -67,6 +67,13 @@ class CustomCLIPCSC(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
+        dataset_name = params.train_dataset
+        if "market" in dataset_name.lower():
+            num_cameras = 6
+        elif "msmt" in dataset_name.lower():
+            num_cameras = 15
+        elif "duke" in dataset_name.lower():
+            num_cameras = 8
         self.vision_bottleneck = nn.BatchNorm1d(768)
         self.vision_bottleneck.bias.requires_grad_(False)
         self.vision_bottleneck.apply(weights_init_kaiming)
@@ -78,32 +85,41 @@ class CustomCLIPCSC(nn.Module):
         self.vision_bottleneck_proj.apply(weights_init_kaiming)
         self.vision_classifier_proj = nn.Linear(512, n_cls, bias=False)
         self.vision_classifier_proj.apply(weights_init_classifier)
+        
+        # Attribute Prediction Head
+        self.attr_head = nn.Linear(512, 28)
+        nn.init.normal_(self.attr_head.weight, std=0.001)
+        nn.init.constant_(self.attr_head.bias, 0)
 
-    def forward(self, image=None, label=None, get_image=False, get_texts=False, is_stage2=False):
+
+
+
+
+    def forward(self, image=None, label=None, cam_label=None, get_image=False, get_texts=False, is_stage2=False):
         if get_image:
             if label is None:
                 label = torch.zeros(image.shape[0], dtype=torch.long).cuda()
-            # Prompt-level ensemble: prompt_learner internally averages vision
-            # prompts from all instructions, then we run a single ViT forward.
+                
             prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(
-                label=label, is_stage2=True, ensemble=True
+                label=label, is_stage2=True, ensemble=False, force_idx=0
             )
             if params.amp:
                 _, _, image_features = self.image_encoder(image, shared_vision, deeper_vision)
             else:
                 _, _, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
-            image_features = image_features[:, 0]
-            return image_features
+            
+            return image_features[:, 0]
 
         if get_texts:
             force_idx = getattr(self.prompt_learner, 'current_idx', None) if self.training else None
             prompts, deeper_text, _, _ = self.prompt_learner(label=label, is_stage2=is_stage2, force_idx=force_idx)
-            tokenized_prompts = self.prompt_learner.tokenized_prompts
-            text_features = self.text_encoder(prompts, tokenized_prompts, deeper_text)
+            tokenized_prompts = self.prompt_learner.current_tokenized_prompts
+            text_features = self.text_encoder(prompts, tokenized_prompts, deeper_text, self.prompt_learner.current_prefix_len)
             return text_features
 
         if label is None:
             label = torch.zeros(image.shape[0], dtype=torch.long).cuda()
+            
         prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(label=label, is_stage2=is_stage2)
   
         if params.amp:
@@ -111,21 +127,18 @@ class CustomCLIPCSC(nn.Module):
         else:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
 
-        image_features_last = image_features_last[:, 0]
-        image_features_non_proj = image_features_non_proj[:, 0]
-        image_features = image_features[:, 0]
-
-        features_non_proj = self.vision_bottleneck(image_features_non_proj)
+        # Global Features
+        features_non_proj = self.vision_bottleneck(image_features_non_proj[:, 0])
         cls_score = self.vision_classifier(features_non_proj.float())
-        features = self.vision_bottleneck_proj(image_features)
+        features = self.vision_bottleneck_proj(image_features[:, 0])
         cls_score_proj = self.vision_classifier_proj(features.float())
+        
+        # Calculate attribute prediction
+        attr_score = self.attr_head(features.float())
+        
+        cls_scores = [cls_score, cls_score_proj]
 
-        if self.training:
-            return [cls_score, cls_score_proj], [image_features_last,
-                                                 image_features_non_proj,
-                                                 image_features], image_features
-        else:
-            return torch.cat((image_features_non_proj, image_features), dim=1)
+        return cls_scores, [image_features_last[:, 0], image_features_non_proj[:, 0], image_features[:, 0]], image_features[:, 0], attr_score
 
 
 class CustomCLIPCoop(nn.Module):
@@ -338,7 +351,10 @@ class CustomCLIPIVLP(nn.Module):
         # if params.train_dataset == "veri":
         #     self.prompt_learner = VLPromptLearnerVeri(classnames, clip_model, car_types_train)
         # else:
-        self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
+        if params.train_dataset == "market1501":
+            self.prompt_learner = VLPromptLearnerAttributes(classnames, clip_model)
+        else:
+            self.prompt_learner = VLPromptLearner(classnames, clip_model, params.train_dataset)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
@@ -454,9 +470,11 @@ def train_prompter_maple(model,
     # Unfreeze all prompt parameters (text and vision) and classifiers for Stage 1
     learnable_params = []
     for name, param in model.named_parameters():
-        if "vision_classifier" in name or "vision_bottleneck" in name:
+        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name:
             param.requires_grad = True
         elif "prompt_learner" in name:
+            param.requires_grad = True
+        elif "res_gate" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -470,10 +488,15 @@ def train_prompter_maple(model,
         learnable_params += [{"params": model.vision_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck_proj"):
         learnable_params += [{"params": model.vision_bottleneck_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
-    if hasattr(model, "prompt_learner"):
-        prompt_params = [p for n, p in model.prompt_learner.named_parameters() if p.requires_grad]
-        if prompt_params:
-            learnable_params += [{"params": prompt_params, "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "attr_head"):
+        learnable_params += [{"params": model.attr_head.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+
+    learnable_params += [{"params": model.prompt_learner.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    
+    # Add all res_gate parameters to the optimizer
+    for name, param in model.named_parameters():
+        if "res_gate" in name:
+            learnable_params += [{"params": [param], "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=3.5e-4, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
@@ -484,18 +507,24 @@ def train_prompter_maple(model,
     loss_func = SupConLoss("cuda")
 
     if not os.path.exists(params.save_path):
-        os.mkdir(params.save_path)
-    saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
-    if not os.path.exists(saving_path):
-        os.mkdir(saving_path)
+            
+    try:
+        import numpy as np
+        attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
+        use_attr_loss = True
+        print("Loaded attribute labels for APL!")
+    except Exception as e:
+        print(f"Skipping Attribute Prediction Loss: {e}")
+        use_attr_loss = False
 
-    # Pre-compute persistent cache of text features for all classes to avoid OOM
-    print("Initializing persistent text feature cache...")
+
+
+    print("Initializing persistent text feature cache (Stage 1)...")
+    # Pre-compute initial text features for all classes using identity-only mode
+    n_cls = model.prompt_learner.n_cls
+    text_features_cache = []
+    model.eval() # Ensure prompt generation is deterministic
     with torch.no_grad():
-        model.eval()
-        text_features_cache = []
-        n_cls = model.prompt_learner.n_cls
-        # Process in chunks to ensure no OOM during initialization
         for i in range(0, n_cls, 128):
             label_chunk = torch.arange(i, min(i+128, n_cls)).cuda()
             with autocast(enabled=True):
@@ -504,19 +533,26 @@ def train_prompter_maple(model,
         text_features_cache = torch.cat(text_features_cache, dim=0).cuda()
     print("Cache initialized.")
 
+    if not os.path.exists(params.save_path):
+        os.mkdir(params.save_path)
+    saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
+    if not os.path.exists(saving_path):
+        os.mkdir(saving_path)
+
     for epoch in range(1, epochs + 1):
-        scheduler.step(epoch)
         model.train()
+        loss_meter = AverageMeter()
         
         for i, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val):
             optimizer.zero_grad()
             img = img.cuda()
             target = vid.cuda()
+            target_cam = target_cam.cuda()
             
             with autocast(enabled=True):
-                # Forward pass
-                cls_scores, image_features_list, image_features_proj = model(img, target)
-                image_features_last, image_features_non_proj, image_features = image_features_list
+                # Forward pass with camera conditioning
+                cls_scores, image_features_list, image_features_proj, attr_score = model(img, label=target, cam_label=target_cam)
+                image_features = image_features_list[2] # For global ITC loss
                 
                 # 1. Classification Loss (L_id) - Restored for Stage 1
                 loss_id = 0.0
@@ -536,26 +572,32 @@ def train_prompter_maple(model,
                 
                 # Construct hybrid tensor for global separation (preserves batch gradients)
                 dynamic_features = torch.zeros_like(text_features_cache)
+                dynamic_features.copy_(text_features_cache)
                 dynamic_features[unique_labels] = text_features_unique
                 
+
                 mask = torch.zeros(n_cls, 1, dtype=dynamic_features.dtype, device='cuda')
                 mask[unique_labels] = 1.0
                 
                 text_features_all = text_features_cache * (1 - mask) + dynamic_features
                 all_labels = torch.arange(n_cls).cuda()
-                
                 logit_scale = model.logit_scale.exp()
                 
-                # Global i2t Loss (Pushes image away from all negative text identities)
+                # Global i2t Loss
                 loss_i2t = loss_func(image_features, text_features_all, target, all_labels, logit_scale=logit_scale)
-                
-                # Safe Local t2i Loss 
                 loss_t2i = loss_func(text_features_unique, image_features, unique_labels, target, logit_scale=logit_scale)
                 
                 loss_itc = (loss_i2t + loss_t2i) / 2
                 
-                # Combined Loss
+                # Total loss
                 loss = loss_id + loss_itc
+                
+                loss_attr_val = 0.0
+                if use_attr_loss:
+                    attr_targets = attr_labels[target]
+                    loss_attr = F.binary_cross_entropy_with_logits(attr_score, attr_targets)
+                    loss += loss_attr
+                    loss_attr_val = loss_attr.item()
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -564,9 +606,9 @@ def train_prompter_maple(model,
             scaler.update()
 
             if (i + 1) % 100 == 0:
-                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_itc: {:.3f}), Base Lr: {:.2e}"
+                print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_itc: {:.3f}, L_attr: {:.3f}), Base Lr: {:.2e}"
                       .format(epoch, (i + 1), len(dataloader_train_val),
-                              loss, loss_id, loss_itc, scheduler._get_lr(epoch)[0]))
+                              loss, loss_id, loss_itc, loss_attr_val, scheduler._get_lr(epoch)[0]))
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
@@ -626,6 +668,7 @@ def train_prompter(model,
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
     scaler = GradScaler()
     loss_func = SupConLoss("cuda")
+    triplet_loss_func = CrossModalTripletLoss(margin=0.3)
 
     if not os.path.exists(params.save_path):
         os.mkdir(params.save_path)
@@ -671,7 +714,9 @@ def train_prompter(model,
             loss_i2t = loss_func(image_features, text_features_unique, target, unique_labels, logit_scale=logit_scale)
             loss_t2i = loss_func(text_features_unique, image_features, unique_labels, target, logit_scale=logit_scale)
 
-            loss = loss_i2t + loss_t2i
+            loss_triplet = triplet_loss_func(text_features_unique, image_features, unique_labels, target)
+
+            loss = loss_i2t + loss_t2i + loss_triplet
 
             scaler.scale(loss).backward()
 
@@ -707,15 +752,21 @@ def train_vision_model(model,
                        epochs,
                        pretrained=None):
     def train_batch_vision_model(batch):
-        image, label = batch[:2]
+        if len(batch) >= 3:
+            image, label, cam_label = batch[:3]
+            cam_label = cam_label.cuda()
+        else:
+            image, label = batch[:2]
+            cam_label = None
+            
         image = image.cuda()
         label = label.cuda()
         loss = 0.
         if params.training_mode == "promptsrc":
-            cls_scores, image_features_list, image_features_proj, zero_shot_features_non_proj = model(image, label)
+            cls_scores, image_features_list, image_features_proj, zero_shot_features_non_proj = model(image, label=label, cam_label=cam_label)
             loss += F.smooth_l1_loss(image_features_list[1], zero_shot_features_non_proj, reduction="mean")
         else:
-            cls_scores, image_features_list, image_features_proj = model(image, label)
+            cls_scores, image_features_list, image_features_proj = model(image, label=label, cam_label=cam_label)
         image_features_last, image_features_non_proj, image_features = image_features_list
 
         for cls_score in cls_scores:
@@ -740,20 +791,33 @@ def train_vision_model(model,
         text_features = torch.cat(text_features, dim=0).cuda()
 
     model.train()
+    if hasattr(model, 'prompt_learner'):
+        model.prompt_learner.eval()
 
     if pretrained is not None:
         load_pretrained_weights(model, pretrained)
 
-    print("Turning off gradients in both the prompter and the text encoder")
+    print("Turning off gradients in the text encoder, but keeping visual prompt generators active")
     base_lr = 5e-6
     learnable_params = []
     for name, param in model.named_parameters():
-        # if "text_encoder" in name or "prompt_learner" in name:
-        # experimental
         if "prompt_learner" in name:
-            param.requires_grad_(False)
+            if any(k in name for k in ["cam_embeddings", "proj", "meta_net_layer0", "layer0_gate"]):
+                param.requires_grad_(True)
+                if "bias" in name:
+                    lr = base_lr * 2
+                    learnable_params += [{"params": [param], "lr": lr, "weight_decay": 1e-4}]
+                else:
+                    learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
+            else:
+                param.requires_grad_(False)
         elif "VPT" in name:
-            param.requires_grad_(False)
+            param.requires_grad_(True)
+            if "bias" in name:
+                lr = base_lr * 2
+                learnable_params += [{"params": [param], "lr": lr, "weight_decay": 1e-4}]
+            else:
+                learnable_params += [{"params": [param], "lr": base_lr, "weight_decay": 1e-4}]
         elif not param.requires_grad:
             continue
         else:
@@ -792,7 +856,7 @@ def train_vision_model(model,
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
         else:
             for images, target, cams, seqs, indices in iterator:
-                batch = images, target
+                batch = images, target, cams
                 loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 loss.backward()
@@ -821,35 +885,50 @@ def train_vision_model_maple(model,
                              dataloader,
                              epochs,
                              pretrained=None):
+    try:
+        import numpy as np
+        attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
+        use_attr_loss = True
+        print("Stage 2: Loaded attribute labels for APL!")
+    except Exception as e:
+        use_attr_loss = False
+
     def train_batch_vision_model(batch):
-        image, label = batch[:2]
+        image, label, cams = batch[:3]
         image = image.cuda()
         label = label.cuda()
+        cams = cams.cuda()
         loss = 0.
-        cls_scores, image_features_list, image_features_proj = model(image, label)
-        image_features_last, image_features_non_proj, image_features = image_features_list
+        cls_scores, image_features_list, image_features_proj, attr_score = model(image, label=label, cam_label=cams)
 
+        image_features_last, image_features_non_proj, image_features = image_features_list
         for cls_score in cls_scores:
             loss += 0.25 * ce_loss(cls_score, label)
 
         # Get unique labels in this batch (usually ~16 identities for PK sampler)
         unique_labels = torch.unique(label)
 
-        # Dynamically compute text features for ONLY the classes in the batch
+        # Dynamically compute pure identity text features for the unique identities
         with torch.amp.autocast('cuda', enabled=True):
             text_features_batch = model(label=unique_labels, get_texts=True)
 
-        # Update the persistent cache with the fresh batch prototypes (no grad)
-        with torch.no_grad():
-            text_features_all[unique_labels] = text_features_batch.detach()
+            # Update the persistent cache with the fresh prototypes (no grad)
+            with torch.no_grad():
+                text_features_all[unique_labels] = text_features_batch.detach()
+                
+        # Compute base logits against all pure identities
+        # Crucial Fix: L2 Normalize features and apply CLIP's logit_scale!
+        logit_scale = model.logit_scale.exp()
+        img_feat_norm = F.normalize(image_features_proj, p=2, dim=-1)
+        txt_feat_all_norm = F.normalize(text_features_all, p=2, dim=-1)
+        txt_feat_batch_norm = F.normalize(text_features_batch, p=2, dim=-1)
 
-        # Compute base logits against all classes (no text-side gradients yet)
-        output = image_features_proj @ text_features_all.t()
+        output = logit_scale * (img_feat_norm @ txt_feat_all_norm.t()) # [B, n_cls]
 
-        # Compute dynamic logits for the batch classes (WITH text-side gradients)
-        output_dynamic = image_features_proj @ text_features_batch.t()
+        # Compute dynamic positive logits for the exact identities in the batch
+        output_dynamic = logit_scale * (img_feat_norm @ txt_feat_batch_norm.t()) # [B, num_unique]
 
-        # Overwrite the specific columns in the logits matrix with the dynamic logits.
+        # Overwrite the positive class logits with the dynamic logits to preserve backprop graph
         output = output.clone()
         for i, cls_id in enumerate(unique_labels):
             output[:, cls_id] = output_dynamic[:, i]
@@ -858,6 +937,11 @@ def train_vision_model_maple(model,
         loss += triplet_loss(image_features_last, label) + \
                 triplet_loss(image_features_non_proj, label) + \
                 triplet_loss(image_features, label)
+        
+        if use_attr_loss:
+            attr_targets = attr_labels[label]
+            loss += F.binary_cross_entropy_with_logits(attr_score, attr_targets)
+
         return loss
 
     print("Building custom CLIP for MaPLe (Stage 2)")
@@ -897,7 +981,7 @@ def train_vision_model_maple(model,
         if "text_encoder" in name:
             param.requires_grad_(False)
         elif "prompt_learner" in name:
-            if "vision" in name or "layer0" in name or "cross_attn" in name or "ctx_s" in name or "ctx_m" in name or "proj" in name:
+            if "vision" in name or "layer0" in name or "cross_attn" in name or "ctx_s" in name or "ctx_m" in name or "proj" in name or "meta_net" in name or "compound_prompts_text" in name:
                 param.requires_grad_(True)
                 new_component_params.append(param)
             else:
@@ -905,7 +989,7 @@ def train_vision_model_maple(model,
         elif "image_encoder" in name:
             param.requires_grad_(True)
             vision_params.append(param)
-        elif "vision_classifier" in name or "vision_bottleneck" in name:
+        elif "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name:
             param.requires_grad_(True)
             new_component_params.append(param)
         else:
@@ -918,7 +1002,7 @@ def train_vision_model_maple(model,
 
     optimizer = torch.optim.Adam(learnable_params, lr=lr_vision, weight_decay=1e-4)
     scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     triplet_loss = WeightedRegularizedTriplet(0.3)
     ce_loss = CrossEntropyLabelSmooth(n_cls)
 
@@ -934,7 +1018,7 @@ def train_vision_model_maple(model,
         iterator = tqdm(dataloader)
         if params.amp:
             for images, target, cams, seqs, indices in iterator:
-                batch = images, target
+                batch = images, target, cams
                 with torch.amp.autocast('cuda'):
                     loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
@@ -946,7 +1030,7 @@ def train_vision_model_maple(model,
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
         else:
             for images, target, cams, seqs, indices in iterator:
-                batch = images, target
+                batch = images, target, cams
                 loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 loss.backward()
@@ -989,7 +1073,8 @@ def test_prompter(model,
     with torch.no_grad():
         for i, (images, target, cams, seqs, indices) in enumerate(tqdm(loader_test)):
             images = images.cuda()
-            image_features_merged = model(images)
+            cams_cuda = cams.cuda()
+            image_features_merged = model(images, cam_label=cams_cuda)
 
             embeddings.append(image_features_merged)
             targets.append(target)
@@ -1023,7 +1108,7 @@ def get_cmc_map(
 
 def params_parser():
     args = argparse.ArgumentParser()
-    args.add_argument("--epochs_stage1", default=10, type=int)
+    args.add_argument("--epochs_stage1", default=40, type=int)
     args.add_argument("--epochs_stage2", default=60, type=int)
     args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
@@ -1159,11 +1244,11 @@ if __name__ == "__main__":
     if params.training_mode == "csc-maple":
         if not params.train_dataset_multitask:
             loader_train_sampled_stage2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                               "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
+                                                               "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True, camera_aware=True)
         else:
             loader_train_sampled_stage2, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
                                                                "vit" if "ViT" in params.model else "rn",
-                                                               params.train_dataset, params.train_dataset_multitask, use_re=True)
+                                                               params.train_dataset, params.train_dataset_multitask, use_re=True, camera_aware=True)
         train_vision_model_maple(model,
                                  loader_train_sampled_stage2,
                                  params.epochs_stage2)

@@ -246,6 +246,72 @@ class VLPromptLearnerGPT4o(nn.Module):
         return prompts
 
 
+class VLPromptLearnerAttributes(nn.Module):
+    def __init__(self, n_cls, clip_model, prompts_path="prompts_market1501_attributes.txt"):
+        super().__init__()
+
+        prompts = []
+        with open(prompts_path, "r") as f:
+            while True:
+                prompt = f.readline()
+                if not prompt:
+                    break
+                label, desc = prompt.strip().split(":", 1)
+                prompts.append(desc)
+
+        assert len(prompts) == n_cls, f"Found {len(prompts)} prompts but expected {n_cls}."
+
+        n_cls_ctx = 4
+
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+
+        ctx_init = prompts
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()  # [n_cls, 77, 512]
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+        ctx_vectors = torch.empty(n_cls, n_cls_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(ctx_vectors, std=0.02)
+
+        print(f"Independent V-L design (Attribute Level)")
+        self.ctx = nn.Parameter(ctx_vectors)
+
+        # The prompts start with "X X X X ". 
+        # Token 0 is SOS. Tokens 1 to 4 are X's. Token 5 is the start of "A photo...".
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_cls_ctx:, :])  # The rest of the attribute prompt, padded to 77
+
+        self.n_cls = n_cls
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
+
+        prompts = torch.cat(
+            [
+                prefix,  # (dim0, 1, dim)
+                ctx,  # (dim0, 4, dim)
+                suffix,  # (dim0, 72, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+    def forward(self, label):
+        ctx = self.ctx[label]
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+        prompts = self.construct_prompts(ctx, prefix, suffix, label)
+
+        return prompts
+
+
 class VLPromptLearnerVeri(nn.Module):
 
     n_cls_ctx = 4
@@ -420,8 +486,9 @@ class VLPromptLearnerSRC(nn.Module):
 
 import random
 class VLPromptLearnerCSC(nn.Module):
-    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=4, prompt_depth=12, unified_context=True):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=2, prompt_depth=12, unified_context=True, use_instruction_pool=False):
         super().__init__()
+        self.use_instruction_pool = use_instruction_pool
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         n_ctx = 4
@@ -430,30 +497,37 @@ class VLPromptLearnerCSC(nn.Module):
         placeholders = " ".join(["X"] * self.n_placeholders)
 
         is_vehicle = dataset_name not in ("market1501", "dukemtmc", "msmt17")
-        if not is_vehicle:
+        if dataset_name == "market1501":
+            prompts = []
+            try:
+                with open("prompts_market1501_attributes.txt", "r") as f:
+                    for line in f:
+                        if line.strip():
+                            label, desc = line.strip().split(":", 1)
+                            # Remove the leading "X X X X " from my previous generation
+                            if desc.startswith("X X X X "):
+                                desc = desc[8:]
+                            # Insert placeholders correctly: "A photo of a X X X X X X {desc_content}"
+                            desc = desc.replace("A photo of a", f"A photo of a {placeholders}", 1)
+                            prompts.append(desc)
+                assert len(prompts) == n_cls
+                self.INSTRUCTION_POOL = prompts
+                self.use_attributes = True
+                print("VLPromptLearnerCSC: Loaded instance-specific attributes!")
+            except Exception as e:
+                print(f"Failed to load attributes: {e}. Falling back to default.")
+                self.use_attributes = False
+                self.INSTRUCTION_POOL = [
+                    f"A photo of a {placeholders} person."
+                ]
+        elif not is_vehicle:
+            self.use_attributes = False
             self.INSTRUCTION_POOL = [
-                f"A photo of a {placeholders} person. Find the same person. Ignore clothing and illumination changes.",
-                f"Capture the image of a {placeholders} pedestrian. Match the same individual under various surveillance cameras.",
-                f"Look at this {placeholders} person. Track their identity across distinct multi-camera networks.",
-                f"A snapshot of a {placeholders} individual. Find the matching target while disregarding clothes variations.",
-                # Semantic Swapping
-                f"Find this {placeholders} person, ignoring transient clothing colors.",
-                f"Search for this {placeholders} pedestrian focusing only on invariant physical traits.",
-                f"Retrieve the identity matching this {placeholders} subject regardless of their outfit.",
-                # Instruction Dropout (Unconditional Fallback)
                 f"A photo of a {placeholders} person."
             ]
         else:
+            self.use_attributes = False
             self.INSTRUCTION_POOL = [
-                f"A photo of a {placeholders} vehicle. Find the identical car by analyzing grille geometry and unique markers.",
-                f"An automobile captured on camera. Track this same {placeholders} vehicle across distinct traffic surveillance views.",
-                f"Look at this {placeholders} vehicle. Identify the matching car based on body shapes and window layouts.",
-                f"A snapshot of a {placeholders} car. Find this identical target across different traffic camera networks.",
-                # Semantic Swapping
-                f"Find this identical {placeholders} vehicle, ignoring lighting and camera differences.",
-                f"Search for this {placeholders} car focusing only on invariant structural traits.",
-                f"Retrieve the vehicle matching this {placeholders} target regardless of viewpoint.",
-                # Instruction Dropout (Unconditional Fallback)
                 f"A photo of a {placeholders} vehicle."
             ]
 
@@ -516,30 +590,18 @@ class VLPromptLearnerCSC(nn.Module):
 
         # ── Independent Projection Layers (Depth-Specific) ──
         # Instead of a single shared linear layer, we use independent layers for each depth.
-        self.proj = nn.ModuleList()
-        self.proj.append(nn.Linear(ctx_dim, vis_dim).to(dtype)) # Layer 0
-        for _ in range(prompt_depth - 1):
-            self.proj.append(nn.Linear(ctx_dim * 2, vis_dim).to(dtype)) # Deeper layers
+        self.proj = nn.ModuleList([nn.Linear(ctx_dim, vis_dim).to(dtype) for _ in range(prompt_depth)])
             
         for p in self.proj:
             nn.init.normal_(p.weight, std=0.02)
             nn.init.zeros_(p.bias)
 
-        # ── Meta-Network for Layer-0 Vision Context (Instruction Injection) ──
-        self.meta_net_layer0 = nn.Sequential(
-            nn.Linear(ctx_dim, ctx_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(ctx_dim, n_ctx_m * vis_dim),
-        ).to(dtype)
-        self.ln_layer0 = LayerNorm(vis_dim).to(dtype)
-        self.layer0_gate = nn.Parameter(torch.zeros(1, dtype=dtype))
-
-        for m in self.meta_net_layer0.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-                nn.init.zeros_(m.bias)
-        nn.init.zeros_(self.meta_net_layer0[-1].weight)
-        nn.init.zeros_(self.meta_net_layer0[-1].bias)
+        # ── Deep Text Prompts (Attribute-Guided Initialization) ──
+        self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(1, n_ctx_m, ctx_dim, dtype=dtype))
+                                                       for _ in range(prompt_depth - 1)])
+        
+        for p in self.compound_prompts_text:
+            nn.init.normal_(p, std=0.02)
 
         self.vis_dim = vis_dim
         self.n_cls = n_cls
@@ -548,67 +610,59 @@ class VLPromptLearnerCSC(nn.Module):
         self.prompt_depth = prompt_depth
         self.unified_context = unified_context
 
-        # Deep text prompts removed; vision prompts generated entirely via projection.
-
     @property
     def tokenized_prompts(self):
         if hasattr(self, 'current_tokenized_prompts'):
             return self.current_tokenized_prompts
         return self.tokenized_prompts_0
 
-    def _generate_vision_prompts(self, idx):
-        instruction_emb = getattr(self, f"instruction_emb_{idx}")    # [1, ctx_dim]
+    def _generate_vision_prompts(self):
         m_c = self.ctx_m.squeeze(0) # [n_ctx_m, ctx_dim]
+        
         # Layer 0
-        base_vision_ctx_layer0 = self.proj[0](m_c) # [n_ctx_m, vis_dim]
-        layer0_delta = self.meta_net_layer0(instruction_emb)  # [1, n_ctx_m * vis_dim]
-        layer0_delta = layer0_delta.view(self.n_ctx_m, self.vis_dim)  # [n_ctx_m, vis_dim]
-        layer0_delta = self.ln_layer0(layer0_delta)
-        gate = torch.tanh(self.layer0_gate)
-        shared_ctx_vision = base_vision_ctx_layer0 + gate * layer0_delta  # [n_ctx_m, vis_dim]
-
+        shared_ctx_vision = self.proj[0](m_c).unsqueeze(0) # [1, n_ctx_m, vis_dim]
+        
         # Deeper Layers
         deeper_vision_prompts = []
-        combined_ctx = torch.cat([m_c, instruction_emb.expand(self.n_ctx_m, -1)], dim=-1)
+        deeper_text_prompts = []
+        
         for i in range(self.prompt_depth - 1):
-            vision_prompt = self.proj[i+1](combined_ctx)  # [n_ctx_m, vis_dim]
+            text_prompt = self.compound_prompts_text[i] # [1, n_ctx_m, ctx_dim]
+            deeper_text_prompts.append(text_prompt)
+            vision_prompt = self.proj[i+1](text_prompt)  # [1, n_ctx_m, vis_dim]
             deeper_vision_prompts.append(vision_prompt)
 
-        return shared_ctx_vision, deeper_vision_prompts
+        return shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts
 
-    def forward(self, label, is_stage2=False, ensemble=False, force_idx=None):
+    def forward(self, label, cam_label=None, is_stage2=False, ensemble=False, force_idx=None):
         batch_size = label.shape[0] if label is not None else 1
+        
+        shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts = self._generate_vision_prompts()
 
-        if ensemble:
-            all_shared = []
-            all_deeper = []
-            for idx in range(len(self.INSTRUCTION_POOL)):
-                shared_v, deeper_v = self._generate_vision_prompts(idx)
-                all_shared.append(shared_v)
-                all_deeper.append(deeper_v)
-            shared_ctx_vision = torch.stack(all_shared, dim=0).mean(dim=0)
-            depth = len(all_deeper[0])
-            deeper_vision_prompts = [
-                torch.stack([all_deeper[k][d] for k in range(len(self.INSTRUCTION_POOL))], dim=0).mean(dim=0)
-                for d in range(depth)
-            ]
-            idx = 0
+        if getattr(self, "use_attributes", False) and label is not None:
+            # When using attributes, each instance in the batch has its own specialized text prompt
+            self.current_idx = label
+            self.current_tokenized_prompts = torch.stack([getattr(self, f"tokenized_prompts_{l.item()}")[0] for l in label], dim=0)
+            prefix = torch.stack([getattr(self, f"token_prefix_{l.item()}")[0] for l in label], dim=0)
+            suffix = torch.stack([getattr(self, f"token_suffix_{l.item()}")[0] for l in label], dim=0)
+            self.current_prefix_len = prefix.shape[1]
         else:
             if force_idx is not None:
                 idx = force_idx
-            elif self.training:
-                idx = random.randint(0, len(self.INSTRUCTION_POOL) - 1)
             else:
-                idx = 0
-            shared_ctx_vision, deeper_vision_prompts = self._generate_vision_prompts(idx)
-
-        self.current_idx = idx
-        self.current_tokenized_prompts = getattr(self, f"tokenized_prompts_{idx}")
-        current_prefix = getattr(self, f"token_prefix_{idx}")
-        current_suffix = getattr(self, f"token_suffix_{idx}")
-
-        deeper_text_prompts = None
-
+                if self.use_instruction_pool and self.training:
+                    idx = random.randint(0, len(self.INSTRUCTION_POOL) - 1)
+                else:
+                    idx = 0
+                
+            self.current_idx = idx
+            self.current_tokenized_prompts = getattr(self, f"tokenized_prompts_{idx}")
+            current_prefix = getattr(self, f"token_prefix_{idx}")
+            current_suffix = getattr(self, f"token_suffix_{idx}")
+            self.current_prefix_len = current_prefix.shape[1]
+            prefix = current_prefix.expand(batch_size, -1, -1)
+            suffix = current_suffix.expand(batch_size, -1, -1)
+            
         if self.unified_context:
             s_c = self.ctx_s.expand(batch_size, -1, -1)
         else:
@@ -616,13 +670,11 @@ class VLPromptLearnerCSC(nn.Module):
                 s_c = self.ctx_s[0].unsqueeze(0).expand(batch_size, -1, -1)
             else:
                 s_c = self.ctx_s[label]
-
+                
         m_c_batch = self.ctx_m.expand(batch_size, -1, -1)
-        prefix = current_prefix.expand(batch_size, -1, -1)
-        suffix = current_suffix.expand(batch_size, -1, -1)
-        # Causal mask friendly: specific tokens (s_c) can now attend to shared domain knowledge (m_c)
+        
         prompts = torch.cat([prefix, m_c_batch, s_c, suffix], dim=1)
-
+        
         return prompts, deeper_text_prompts, deeper_vision_prompts, shared_ctx_vision
 
 
@@ -635,14 +687,14 @@ class TextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
-    def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text=None):
+    def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text=None, prefix_len=None):
         if isinstance(prompts, (list, tuple)):
             prompts, compound_prompts_deeper_text, _, _ = prompts
         
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         # Pass as the list, as nn.sequential cannot process multiple arguments in the forward pass
-        combined = [x, compound_prompts_deeper_text if compound_prompts_deeper_text is not None else [], 0]  # third argument is the counter which denotes depth of prompt
+        combined = [x, compound_prompts_deeper_text if compound_prompts_deeper_text is not None else [], 0, prefix_len]  # third argument is the counter which denotes depth of prompt
         outputs = self.transformer(combined)
         x = outputs[0]  # extract the x back from here
         x = x.permute(1, 0, 2)  # LND -> NLD
@@ -957,6 +1009,9 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
             self.first_layer = True
         else:
             self.first_layer = False
+            
+        # Residual gating parameter initialized to 0.1 (allows gradients to flow while preventing early-stage distraction)
+        self.res_gate = nn.Parameter(torch.tensor([0.1]))
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
@@ -968,6 +1023,7 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
         x = inputs[0]
         compound_prompts_deeper = inputs[1]
         counter = inputs[2]
+        dynamic_prefix_len = inputs[3] if len(inputs) > 3 and inputs[3] is not None else (1 + self.n_ctx + self.n_ctx_s)
         
         injecting_deep_prompts = False
 
@@ -977,37 +1033,42 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                 if not (counter > len(compound_prompts_deeper) - 1):
                     injecting_deep_prompts = True
                     if not self.text_layer:
-                        # Vision side: prompts after CLS
+                        # Vision side: residual gating
                         prefix = x[:1, :, :]
                         suffix = x[1 + self.compound_prompt_nctx:, :, :]
+                        old_prompts = x[1:1 + self.compound_prompt_nctx, :, :]
+                        
                         visual_context = compound_prompts_deeper[counter]  # extract the correct index
                         visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
-                        x = torch.cat([prefix, visual_context, suffix], dim=0)
+                        
+                        # Apply residual gating! Strictly additive update to preserve old_prompts
+                        gated_context = old_prompts + self.res_gate.half() * visual_context
+                        
+                        x = torch.cat([prefix, gated_context, suffix], dim=0)
                     else:
-                        # Text side: SOS + n_ctx + n_ctx_s + ctx_m + suffix
-                        prefix_len = 1 + self.n_ctx + self.n_ctx_s
+                        # Text side: residual gating
+                        prefix_len = dynamic_prefix_len
                         prefix = x[:prefix_len, :, :]
                         suffix = x[prefix_len + self.compound_prompt_nctx:, :, :]
+                        old_prompts = x[prefix_len:prefix_len + self.compound_prompt_nctx, :, :]
+                        
                         textual_context = compound_prompts_deeper[counter]
                         textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
-                        x = torch.cat([prefix, textual_context, suffix], dim=0)
+                        
+                        # Apply residual gating! Strictly additive update to preserve old_prompts
+                        gated_context = old_prompts + self.res_gate.half() * textual_context
+                        
+                        x = torch.cat([prefix, gated_context, suffix], dim=0)
                     
                     # Once done, update the counter
                     counter += 1
 
-        # Isolate the [CLS] token during the text-vision attention phase.
-        # This prevents the text from overwhelming the identity-carrying [CLS] token,
-        # forcing the text to act strictly as a spatial filter on the image patches.
-        if not self.text_layer and (self.first_layer or injecting_deep_prompts):
-            cls_token = x[:1, :, :]
-            patch_tokens = x[1:, :, :]
-            patch_tokens = patch_tokens + self.attention(self.ln_1(patch_tokens))
-            x = torch.cat([cls_token, patch_tokens], dim=0)
-        else:
-            x = x + self.attention(self.ln_1(x))
+        # Let the ViT function normally: The [CLS] token MUST attend to the patch tokens 
+        # and the vision prompts simultaneously to gather spatial and semantic information!
+        x = x + self.attention(self.ln_1(x))
 
         x = x + self.mlp(self.ln_2(x))
-        return [x, compound_prompts_deeper, counter]  # return again as a list, so that nn.seq can work
+        return [x, compound_prompts_deeper, counter, dynamic_prefix_len]  # return again as a list, so that nn.seq can work
 
 
 class VisionTransformer(nn.Module):

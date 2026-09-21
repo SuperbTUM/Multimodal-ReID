@@ -75,6 +75,102 @@ class RandomIdentitySampler_(torch.utils.data.sampler.Sampler):
     def __len__(self):
         return self.length
 
+class CrossCameraIdentitySampler_(torch.utils.data.sampler.Sampler):
+    def __init__(self, data_source, batch_size, num_instances):
+        self.data_source = data_source
+        self.batch_size = batch_size
+        self.num_instances = num_instances
+        self.num_pids_per_batch = self.batch_size // self.num_instances
+        
+        self.index_dic = defaultdict(lambda: defaultdict(list))
+        for index, img_info in enumerate(self.data_source):
+            pid = img_info[1].item()
+            camid = img_info[2].item()
+            self.index_dic[pid][camid].append(index)
+            
+        self.pids = list(self.index_dic.keys())
+        
+        self.length = 0
+        for pid in self.pids:
+            num_imgs = sum(len(idxs) for idxs in self.index_dic[pid].values())
+            if num_imgs < self.num_instances:
+                num_imgs = self.num_instances
+            self.length += num_imgs - num_imgs % self.num_instances
+
+    def __iter__(self):
+        batch_idxs_dict = defaultdict(list)
+
+        for pid in self.pids:
+            cam_dict = copy.deepcopy(self.index_dic[pid])
+            available_cams = list(cam_dict.keys())
+            
+            all_imgs = []
+            index_to_cam = {}
+            for cam in available_cams:
+                all_imgs.extend(cam_dict[cam])
+                for idx in cam_dict[cam]:
+                    index_to_cam[idx] = cam
+                    
+            groups = []
+            
+            # If the person only exists in 1 camera, fall back to random sampling
+            if len(available_cams) < 2:
+                if len(all_imgs) < self.num_instances:
+                    all_imgs = np.random.choice(all_imgs, size=self.num_instances, replace=True).tolist()
+                random.shuffle(all_imgs)
+                for i in range(0, len(all_imgs) - self.num_instances + 1, self.num_instances):
+                    groups.append(all_imgs[i:i + self.num_instances])
+            else:
+                # Pad to multiple of num_instances so no data is dropped
+                if len(all_imgs) < self.num_instances:
+                    all_imgs = np.random.choice(all_imgs, size=self.num_instances, replace=True).tolist()
+                else:
+                    remainder = len(all_imgs) % self.num_instances
+                    if remainder != 0:
+                        all_imgs.extend(np.random.choice(all_imgs, size=self.num_instances - remainder, replace=True).tolist())
+                        
+                unassigned_imgs = list(all_imgs)
+                random.shuffle(unassigned_imgs)
+                
+                while len(unassigned_imgs) >= self.num_instances:
+                    best_group = None
+                    # Rejection sampling: try to find a group with >= 2 cameras
+                    for _ in range(20):
+                        sample_group = unassigned_imgs[:self.num_instances]
+                        cams_in_group = set(index_to_cam[idx] for idx in sample_group)
+                        
+                        if len(cams_in_group) >= 2:
+                            best_group = sample_group
+                            break
+                        
+                        random.shuffle(unassigned_imgs) # Shuffle and try again
+                        
+                    # If after 20 tries we can't find diversity (likely because only 1 camera's images are left)
+                    # we accept the homogenous group gracefully rather than crashing or segregating.
+                    if best_group is None:
+                        best_group = unassigned_imgs[:self.num_instances]
+                        
+                    groups.append(best_group)
+                    unassigned_imgs = unassigned_imgs[self.num_instances:]
+                    
+            batch_idxs_dict[pid].extend(groups)
+
+        avai_pids = copy.deepcopy(self.pids)
+        final_idxs = []
+
+        while len(avai_pids) >= self.num_pids_per_batch:
+            selected_pids = random.sample(avai_pids, self.num_pids_per_batch)
+            for pid in selected_pids:
+                batch_idxs = batch_idxs_dict[pid].pop(0)
+                final_idxs.extend(batch_idxs)
+                if len(batch_idxs_dict[pid]) == 0:
+                    avai_pids.remove(pid)
+
+        return iter(final_idxs)
+
+    def __len__(self):
+        return self.length
+
 
 class reidDataset(Dataset):
     def __init__(self, images, transform=None):
@@ -146,7 +242,7 @@ def get_dataset(root, dataset_name):
     return dataset
 
 
-def get_loader_train_sampled_multitask(root, batch_size, image_height, image_width, model_type, dataset_name1, dataset_name2, use_re=False):
+def get_loader_train_sampled_multitask(root, batch_size, image_height, image_width, model_type, dataset_name1, dataset_name2, use_re=False, camera_aware=False):
     transform_list = [
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
@@ -165,12 +261,15 @@ def get_loader_train_sampled_multitask(root, batch_size, image_height, image_wid
     num_pids2 = dataset2.num_train_pids
     reid_dataset_train = reidDatasetMerged(dataset1.train, num_pids1, dataset2.train, transform_train)
     num_pids = num_pids1 + num_pids2
-    custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 4)
+    if camera_aware:
+        custom_sampler = CrossCameraIdentitySampler_(reid_dataset_train, batch_size, 4)
+    else:
+        custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 4)
     loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=False, sampler=custom_sampler, pin_memory=True)
     return loader_train, num_pids
 
 
-def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type, dataset_name="market1501", use_re=False):
+def get_loader_train_sampled(root, batch_size, image_height, image_width, model_type, dataset_name="market1501", use_re=False, camera_aware=False):
     transform_list = [
         transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(),
@@ -185,7 +284,10 @@ def get_loader_train_sampled(root, batch_size, image_height, image_width, model_
     dataset = get_dataset(root, dataset_name)
     num_pids = dataset.num_train_pids
     reid_dataset_train = reidDataset(dataset.train, transform_train)
-    custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 4)
+    if camera_aware:
+        custom_sampler = CrossCameraIdentitySampler_(reid_dataset_train, batch_size, 4)
+    else:
+        custom_sampler = RandomIdentitySampler_(reid_dataset_train, batch_size, 4)
     loader_train = DataLoader(reid_dataset_train, batch_size=batch_size, num_workers=4, shuffle=False, sampler=custom_sampler, pin_memory=True)
     return loader_train, num_pids
 

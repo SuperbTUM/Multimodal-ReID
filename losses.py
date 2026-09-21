@@ -213,3 +213,47 @@ class CrossEntropyLabelSmooth(nn.Module):
         targets = (1 - self.epsilon) * targets + self.epsilon / self.num_classes
         loss = (- targets * log_probs).mean(0).sum()
         return loss
+
+class CrossModalTripletLoss(nn.Module):
+    """
+    Cross-modal Triplet Loss for Image and Text.
+    Given anchors (e.g. text features) and candidates (e.g. image features),
+    it pushes the positive pair closer and negative pairs apart by a margin.
+    """
+    def __init__(self, margin=0.3):
+        super(CrossModalTripletLoss, self).__init__()
+        self.margin = margin
+        self.ranking_loss = nn.MarginRankingLoss(margin=margin)
+
+    def forward(self, feat1, feat2, label1, label2, normalize_feature=True):
+        if normalize_feature:
+            feat1 = F.normalize(feat1, p=2, dim=-1)
+            feat2 = F.normalize(feat2, p=2, dim=-1)
+        
+        # Distance matrix: shape [N1, N2]
+        dist_mat = euclidean_dist(feat1, feat2)
+        
+        N1 = dist_mat.size(0)
+        N2 = dist_mat.size(1)
+        
+        is_pos = label1.view(N1, 1).expand(N1, N2).eq(label2.view(1, N2).expand(N1, N2))
+        is_neg = ~is_pos
+        
+        # For each anchor in feat1, find the hardest positive and hardest negative
+        # Hardest positive: max distance among positives
+        dist_ap = torch.zeros(N1).to(feat1.device)
+        dist_an = torch.zeros(N1).to(feat1.device)
+        
+        for i in range(N1):
+            pos_dists = dist_mat[i][is_pos[i]]
+            neg_dists = dist_mat[i][is_neg[i]]
+            
+            if len(pos_dists) > 0:
+                dist_ap[i] = pos_dists.max()
+            if len(neg_dists) > 0:
+                dist_an[i] = neg_dists.min()
+                
+        y = torch.ones_like(dist_an)
+        loss = self.ranking_loss(dist_an, dist_ap, y)
+        return loss
+
