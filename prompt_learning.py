@@ -7,7 +7,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.backends import cudnn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
 import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
@@ -481,9 +497,9 @@ def train_prompter_maple(model,
 
     # Group learnable parameters for the optimizer
     if hasattr(model, "vision_classifier"):
-        learnable_params += [{"params": model.vision_classifier.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+        learnable_params += [{"params": model.vision_classifier.parameters(), "lr": 3.5e-3, "weight_decay": 1e-4}]
     if hasattr(model, "vision_classifier_proj"):
-        learnable_params += [{"params": model.vision_classifier_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+        learnable_params += [{"params": model.vision_classifier_proj.parameters(), "lr": 3.5e-3, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck"):
         learnable_params += [{"params": model.vision_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck_proj"):
@@ -500,14 +516,14 @@ def train_prompter_maple(model,
 
     optimizer = torch.optim.Adam(learnable_params, lr=3.5e-4, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
 
     # Loss functions
     ce_loss = CrossEntropyLabelSmooth(model.vision_classifier.out_features)
     loss_func = SupConLoss("cuda")
 
     if not os.path.exists(params.save_path):
-            
+        os.makedirs(params.save_path)
     try:
         import numpy as np
         attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
@@ -527,7 +543,7 @@ def train_prompter_maple(model,
     with torch.no_grad():
         for i in range(0, n_cls, 128):
             label_chunk = torch.arange(i, min(i+128, n_cls)).cuda()
-            with autocast(enabled=True):
+            with autocast('cuda', enabled=True):
                 chunk_features = model(label=label_chunk, get_texts=True)
             text_features_cache.append(chunk_features.detach())
         text_features_cache = torch.cat(text_features_cache, dim=0).cuda()
@@ -549,7 +565,7 @@ def train_prompter_maple(model,
             target = vid.cuda()
             target_cam = target_cam.cuda()
             
-            with autocast(enabled=True):
+            with autocast('cuda', enabled=True):
                 # Forward pass with camera conditioning
                 cls_scores, image_features_list, image_features_proj, attr_score = model(img, label=target, cam_label=target_cam)
                 image_features = image_features_list[2] # For global ITC loss
@@ -557,7 +573,7 @@ def train_prompter_maple(model,
                 # 1. Classification Loss (L_id) - Restored for Stage 1
                 loss_id = 0.0
                 for cls_score in cls_scores:
-                    loss_id += 0.25 * ce_loss(cls_score, target)
+                    loss_id += 0.5 * ce_loss(cls_score, target)
 
                 # 2. Cross-Modal ITC Loss
                 # Text encoder is frozen; gradients flow through prompt_learner only
@@ -633,7 +649,7 @@ def train_prompter(model,
             for n_iter, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val):
                 img = img.cuda()
                 target = vid.cuda()
-                with autocast(enabled=True):
+                with autocast('cuda', enabled=True):
                     image_feature = model(img, target, get_image=True)
                     for i, img_feat in zip(target, image_feature):
                         labels.append(i)
@@ -666,7 +682,7 @@ def train_prompter(model,
 
     optimizer = torch.optim.Adam(learnable_params, lr=0.00035, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     loss_func = SupConLoss("cuda")
     triplet_loss_func = CrossModalTripletLoss(margin=0.3)
 
@@ -694,7 +710,7 @@ def train_prompter(model,
                 (img, vid, target_cam, target_view, indices) = next(dataloader_train_val_iter)
                 img = img.cuda()
                 target = vid.cuda()
-                with autocast(enabled=True):
+                with autocast('cuda', enabled=True):
                     image_features = model(img, target, get_image=True)  # the model is changing with ivlp
                     unique_labels = torch.unique(target)
                     text_features_unique = model(label=unique_labels, get_texts=True)
@@ -707,7 +723,7 @@ def train_prompter(model,
                 target = labels_list[b_list]
                 image_features = image_features_list[b_list]
 
-                with autocast(enabled=True):
+                with autocast('cuda', enabled=True):
                     unique_labels = torch.unique(target)
                     text_features_unique = model(label=unique_labels, get_texts=True)
             logit_scale = model.logit_scale.exp()
@@ -770,7 +786,7 @@ def train_vision_model(model,
         image_features_last, image_features_non_proj, image_features = image_features_list
 
         for cls_score in cls_scores:
-            loss += 0.25 * ce_loss(cls_score, label)
+            loss += 0.5 * ce_loss(cls_score, label)
         output = image_features_proj @ text_features.t()
         loss += ce_loss(output, label)
         loss += triplet_loss(image_features_last, label) + \
@@ -785,7 +801,7 @@ def train_vision_model(model,
         text_features = []
         for i in range(n_cls):
             label = torch.tensor([i]).cuda()
-            with autocast():
+            with autocast('cuda'):
                 text_feature = model(label=label, get_texts=True)
             text_features.append(text_feature)
         text_features = torch.cat(text_features, dim=0).cuda()
@@ -795,7 +811,10 @@ def train_vision_model(model,
         model.prompt_learner.eval()
 
     if pretrained is not None:
-        load_pretrained_weights(model, pretrained)
+        if "prompter" in pretrained:
+            load_pretrained_weights(model.prompt_learner, pretrained)
+        else:
+            load_pretrained_weights(model, pretrained)
 
     print("Turning off gradients in the text encoder, but keeping visual prompt generators active")
     base_lr = 5e-6
@@ -830,7 +849,7 @@ def train_vision_model(model,
 
     optimizer = torch.optim.Adam(learnable_params, lr=base_lr, weight_decay=1e-4)
     scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     triplet_loss = WeightedRegularizedTriplet(0.3)
     ce_loss = CrossEntropyLabelSmooth(n_cls)
 
@@ -847,7 +866,7 @@ def train_vision_model(model,
         if params.amp:
             for images, target, cams, seqs, indices in iterator:
                 batch = images, target
-                with autocast():
+                with autocast('cuda'):
                     loss = train_batch_vision_model(batch)
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -903,7 +922,7 @@ def train_vision_model_maple(model,
 
         image_features_last, image_features_non_proj, image_features = image_features_list
         for cls_score in cls_scores:
-            loss += 0.25 * ce_loss(cls_score, label)
+            loss += 0.5 * ce_loss(cls_score, label)
 
         # Get unique labels in this batch (usually ~16 identities for PK sampler)
         unique_labels = torch.unique(label)
@@ -960,11 +979,14 @@ def train_vision_model_maple(model,
         text_features_all = torch.cat(text_features_all, dim=0).cuda()
 
     if pretrained is not None:
-        load_pretrained_weights(model, pretrained)
+        if "prompter" in pretrained:
+            load_pretrained_weights(model.prompt_learner, pretrained)
+        else:
+            load_pretrained_weights(model, pretrained)
 
     # Define stage 2 learning rates (Differential LR)
     lr_vision = 1e-5
-    lr_new_components = 3.5e-4
+    lr_new_components = 3.5e-3
 
     print("Building custom CLIP for MaPLe (Stage 2) with Differential LR:")
     print(f"  - Vision Encoder learning rate: {lr_vision}")
@@ -1074,12 +1096,20 @@ def test_prompter(model,
         for i, (images, target, cams, seqs, indices) in enumerate(tqdm(loader_test)):
             images = images.cuda()
             cams_cuda = cams.cuda()
-            image_features_merged = model(images, cam_label=cams_cuda)
+            
+            with torch.amp.autocast('cuda'):
+                output = model(images, cam_label=cams_cuda)
+            
+            # Extract features if model returns a tuple
+            if isinstance(output, tuple):
+                image_features_merged = output[2]
+            else:
+                image_features_merged = output
 
-            embeddings.append(image_features_merged)
-            targets.append(target)
-            camera_ids.append(cams)
-            sequence_ids.append(seqs)
+            embeddings.append(image_features_merged.cpu())
+            targets.append(target.cpu())
+            camera_ids.append(cams.cpu())
+            sequence_ids.append(seqs.cpu())
     embeddings = torch.cat(embeddings, dim=0)
     targets = torch.cat(targets, dim=0)
     camera_ids = torch.cat(camera_ids, dim=0)
@@ -1270,3 +1300,9 @@ if __name__ == "__main__":
     embeddings_query, targets_query, cameras_query, sequences_query = \
         test_prompter(model, None, loader_query)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
+
+
+
+
+
+
