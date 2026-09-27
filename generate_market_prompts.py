@@ -41,15 +41,15 @@ for i in range(len(ids)):
     for c in ['upblack', 'upblue', 'upgreen', 'upgray', 'uppurple', 'upred', 'upwhite', 'upyellow']:
         if data[c][0][0].flatten()[i] == 2:
             up_colors.append(c[2:]) # remove 'up'
-    up_color = " and ".join(up_colors) if up_colors else "unknown color"
+    up_str = f" wearing a {' and '.join(up_colors)} top and" if up_colors else " wearing a top and"
     
     down_colors = []
     for c in ['downblack', 'downblue', 'downbrown', 'downgray', 'downgreen', 'downpink', 'downpurple', 'downwhite', 'downyellow']:
         if data[c][0][0].flatten()[i] == 2:
             down_colors.append(c[4:])
-    down_color = " and ".join(down_colors) if down_colors else "unknown color"
+    down_str = f" {' and '.join(down_colors)} {clothes}" if down_colors else f" {clothes}"
     
-    prompt = f"X X X X A photo of a {age} {gender} with {hair}{hat_str}, wearing a {up_color} top and {down_color} {clothes}{bag_desc}."
+    prompt = f"{age} {gender} with {hair}{hat_str},{up_str}{down_str}{bag_desc}."
     prompts.append((pid, prompt))
 
 # Sort by pid just in case, because standard ReID dataset loaders sort train identities by ID

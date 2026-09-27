@@ -262,24 +262,29 @@ class VLPromptLearnerAttributes(nn.Module):
         assert len(prompts) == n_cls, f"Found {len(prompts)} prompts but expected {n_cls}."
 
         n_cls_ctx = 4
-
+        placeholders = " ".join(["X"] * n_cls_ctx)
+        
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
 
-        ctx_init = prompts
-        tokenized_prompts = clip.tokenize(ctx_init).cuda()  # [n_cls, 77, 512]
+        # Put the learnable tokens in the middle (Infix)
+        ctx_init = [f"A photo of a {placeholders} {desc}" for desc in prompts]
+        tokenized_prompts = clip.tokenize(ctx_init).cuda()  # [n_cls, 77]
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
         ctx_vectors = torch.empty(n_cls, n_cls_ctx, ctx_dim, dtype=dtype)
         nn.init.normal_(ctx_vectors, std=0.02)
 
-        print(f"Independent V-L design (Attribute Level)")
+        print(f"Independent V-L design (Attribute Level with Middle Placement)")
         self.ctx = nn.Parameter(ctx_vectors)
 
-        # The prompts start with "X X X X ". 
-        # Token 0 is SOS. Tokens 1 to 4 are X's. Token 5 is the start of "A photo...".
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_cls_ctx:, :])  # The rest of the attribute prompt, padded to 77
+        # Dynamically calculate the prefix length ("SOS A photo of a")
+        prefix_str = "A photo of a "
+        prefix_tokens = clip.tokenize(prefix_str)[0]
+        prefix_len = prefix_tokens.argmax().item()
+
+        self.register_buffer("token_prefix", embedding[:, :prefix_len, :])  # SOS + prefix words
+        self.register_buffer("token_suffix", embedding[:, prefix_len + n_cls_ctx:, :])  # The rest of the attribute prompt, padded to 77
 
         self.n_cls = n_cls
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
@@ -504,11 +509,8 @@ class VLPromptLearnerCSC(nn.Module):
                     for line in f:
                         if line.strip():
                             label, desc = line.strip().split(":", 1)
-                            # Remove the leading "X X X X " from my previous generation
-                            if desc.startswith("X X X X "):
-                                desc = desc[8:]
-                            # Insert placeholders correctly: "A photo of a X X X X X X {desc_content}"
-                            desc = desc.replace("A photo of a", f"A photo of a {placeholders}", 1)
+                            # Proposal 3: Strip conversational filler and prepend placeholders
+                            desc = f"{placeholders} {desc}"
                             prompts.append(desc)
                 assert len(prompts) == n_cls
                 self.INSTRUCTION_POOL = prompts
@@ -632,7 +634,12 @@ class VLPromptLearnerCSC(nn.Module):
             vision_prompt = self.proj[i+1](text_prompt)  # [1, n_ctx_m, vis_dim]
             deeper_vision_prompts.append(vision_prompt)
 
-        return shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts
+        # Proposal 2: Asymmetric Depth. 
+        # Only inject text prompts up to Layer 3 to prevent text encoder from overfitting to deep vision noise.
+        # Vision prompts continue processing all the way to prompt_depth (e.g., 9 or 12).
+        text_prompt_depth = min(3, len(deeper_text_prompts))
+        
+        return shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts[:text_prompt_depth]
 
     def forward(self, label, cam_label=None, is_stage2=False, ensemble=False, force_idx=None):
         batch_size = label.shape[0] if label is not None else 1

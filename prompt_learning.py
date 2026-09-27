@@ -154,7 +154,10 @@ class CustomCLIPCSC(nn.Module):
         
         cls_scores = [cls_score, cls_score_proj]
 
-        return cls_scores, [image_features_last[:, 0], image_features_non_proj[:, 0], image_features[:, 0]], image_features[:, 0], attr_score
+        if self.training:
+            return cls_scores, [image_features_last[:, 0], image_features_non_proj[:, 0], image_features[:, 0]], image_features[:, 0], attr_score
+        else:
+            return torch.cat((features_non_proj, features), dim=1)
 
 
 class CustomCLIPCoop(nn.Module):
@@ -852,7 +855,7 @@ def train_vision_model(model,
     scaler = GradScaler('cuda')
     triplet_loss = WeightedRegularizedTriplet(0.3)
     ce_loss = CrossEntropyLabelSmooth(n_cls)
-
+    
     saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
@@ -985,7 +988,7 @@ def train_vision_model_maple(model,
             load_pretrained_weights(model, pretrained)
 
     # Define stage 2 learning rates (Differential LR)
-    lr_vision = 1e-5
+    lr_vision = 5e-6
     lr_new_components = 3.5e-3
 
     print("Building custom CLIP for MaPLe (Stage 2) with Differential LR:")
@@ -1027,7 +1030,7 @@ def train_vision_model_maple(model,
     scaler = torch.amp.GradScaler('cuda')
     triplet_loss = WeightedRegularizedTriplet(0.3)
     ce_loss = CrossEntropyLabelSmooth(n_cls)
-
+    
     saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
     if not os.path.exists(saving_path):
         os.mkdir(saving_path)
@@ -1300,6 +1303,15 @@ if __name__ == "__main__":
     embeddings_query, targets_query, cameras_query, sequences_query = \
         test_prompter(model, None, loader_query)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
+
+
+
+
+
+
+
+
+
 
 
 
