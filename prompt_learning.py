@@ -103,6 +103,10 @@ class CustomCLIPCSC(nn.Module):
         self.vision_classifier_proj.apply(weights_init_classifier)
         
         # Attribute Prediction Head
+        self.attr_bottleneck = nn.BatchNorm1d(512)
+        self.attr_bottleneck.bias.requires_grad_(False)
+        self.attr_bottleneck.apply(weights_init_kaiming)
+        
         self.attr_head = nn.Linear(512, 28)
         nn.init.normal_(self.attr_head.weight, std=0.001)
         nn.init.constant_(self.attr_head.bias, 0)
@@ -143,20 +147,31 @@ class CustomCLIPCSC(nn.Module):
         else:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
 
-        # Global Features
-        features_non_proj = self.vision_bottleneck(image_features_non_proj[:, 0])
+        # Sum-Fusion Strategy: Reactivate the dead Prompt 1 parameters
+        # Combine the global [CLS] token (0) with the learned Identity Prompt (1)
+        cls_features_last = image_features_last[:, 0] + image_features_last[:, 1]
+        cls_features_non_proj = image_features_non_proj[:, 0] + image_features_non_proj[:, 1]
+        cls_features_proj = image_features[:, 0] + image_features[:, 1]
+        
+        # Attributes remain strictly on Prompt 2 (Index 2)
+        attr_features_proj = image_features[:, 2]
+
+        # Global Features (Identity uses the full fused capacity)
+        features_non_proj = self.vision_bottleneck(cls_features_non_proj)
         cls_score = self.vision_classifier(features_non_proj.float())
-        features = self.vision_bottleneck_proj(image_features[:, 0])
+        features = self.vision_bottleneck_proj(cls_features_proj)
         cls_score_proj = self.vision_classifier_proj(features.float())
         
-        # Calculate attribute prediction
-        attr_score = self.attr_head(features.float())
+        # Calculate attribute prediction (Isolated to Prompt 2)
+        attr_features = self.attr_bottleneck(attr_features_proj)
+        attr_score = self.attr_head(attr_features.float())
         
         cls_scores = [cls_score, cls_score_proj]
 
         if self.training:
-            return cls_scores, [image_features_last[:, 0], image_features_non_proj[:, 0], image_features[:, 0]], image_features[:, 0], attr_score
+            return cls_scores, [cls_features_last, cls_features_non_proj, cls_features_proj], cls_features_proj, attr_score
         else:
+            # Inference on the Sum-Fused identity descriptor
             return torch.cat((features_non_proj, features), dim=1)
 
 
@@ -489,7 +504,7 @@ def train_prompter_maple(model,
     # Unfreeze all prompt parameters (text and vision) and classifiers for Stage 1
     learnable_params = []
     for name, param in model.named_parameters():
-        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name:
+        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name:
             param.requires_grad = True
         elif "prompt_learner" in name:
             param.requires_grad = True
@@ -509,6 +524,8 @@ def train_prompter_maple(model,
         learnable_params += [{"params": model.vision_bottleneck_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "attr_head"):
         learnable_params += [{"params": model.attr_head.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "attr_bottleneck"):
+        learnable_params += [{"params": model.attr_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     learnable_params += [{"params": model.prompt_learner.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     
@@ -956,13 +973,16 @@ def train_vision_model_maple(model,
             output[:, cls_id] = output_dynamic[:, i]
 
         loss += ce_loss(output, label)
-        loss += triplet_loss(image_features_last, label) + \
-                triplet_loss(image_features_non_proj, label) + \
-                triplet_loss(image_features, label)
+        
+        # Fix Hypersphere Collapse: Apply Triplet Loss ONLY before the bottleneck (BNNeck design)
+        loss += triplet_loss(image_features_non_proj, label)
         
         if use_attr_loss:
             attr_targets = attr_labels[label]
-            loss += F.binary_cross_entropy_with_logits(attr_score, attr_targets)
+            # Scale down Attribute loss in Stage 2!
+            # Because the ViT backbone is now unfrozen, a 1.0 weight will pull the shared backbone weights 
+            # too heavily toward shared traits, collapsing the fine-grained Identity variance.
+            loss += 0.1 * F.binary_cross_entropy_with_logits(attr_score, attr_targets)
 
         return loss
 
@@ -1014,7 +1034,7 @@ def train_vision_model_maple(model,
         elif "image_encoder" in name:
             param.requires_grad_(True)
             vision_params.append(param)
-        elif "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name:
+        elif "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name:
             param.requires_grad_(True)
             new_component_params.append(param)
         else:
@@ -1303,18 +1323,3 @@ if __name__ == "__main__":
     embeddings_query, targets_query, cameras_query, sequences_query = \
         test_prompter(model, None, loader_query)
     get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
