@@ -111,9 +111,8 @@ class CustomCLIPCSC(nn.Module):
         nn.init.normal_(self.attr_head.weight, std=0.001)
         nn.init.constant_(self.attr_head.bias, 0)
 
-
-
-
+        # Learnable gating for Identity Prompt fusion
+        self.id_gate = nn.Parameter(torch.tensor([0.5]))
 
     def forward(self, image=None, label=None, cam_label=None, get_image=False, get_texts=False, is_stage2=False):
         if get_image:
@@ -128,7 +127,8 @@ class CustomCLIPCSC(nn.Module):
             else:
                 _, _, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
             
-            return image_features[:, 0]
+            id_gate = self.id_gate.to(dtype=image_features.dtype)
+            return image_features[:, 0] + id_gate * image_features[:, 1]
 
         if get_texts:
             force_idx = getattr(self.prompt_learner, 'current_idx', None) if self.training else None
@@ -147,11 +147,12 @@ class CustomCLIPCSC(nn.Module):
         else:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
 
-        # Sum-Fusion Strategy: Reactivate the dead Prompt 1 parameters
-        # Combine the global [CLS] token (0) with the learned Identity Prompt (1)
-        cls_features_last = image_features_last[:, 0] + image_features_last[:, 1]
-        cls_features_non_proj = image_features_non_proj[:, 0] + image_features_non_proj[:, 1]
-        cls_features_proj = image_features[:, 0] + image_features[:, 1]
+        # Gated-Fusion Strategy:
+        # Combine the global [CLS] token (0) with the learned Identity Prompt (1) via learned gating
+        id_gate = self.id_gate.to(dtype=image_features.dtype)
+        cls_features_last = image_features_last[:, 0] + id_gate * image_features_last[:, 1]
+        cls_features_non_proj = image_features_non_proj[:, 0] + id_gate * image_features_non_proj[:, 1]
+        cls_features_proj = image_features[:, 0] + id_gate * image_features[:, 1]
         
         # Attributes remain strictly on Prompt 2 (Index 2)
         attr_features_proj = image_features[:, 2]
@@ -504,7 +505,7 @@ def train_prompter_maple(model,
     # Unfreeze all prompt parameters (text and vision) and classifiers for Stage 1
     learnable_params = []
     for name, param in model.named_parameters():
-        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name:
+        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name or "id_gate" in name:
             param.requires_grad = True
         elif "prompt_learner" in name:
             param.requires_grad = True
@@ -526,6 +527,8 @@ def train_prompter_maple(model,
         learnable_params += [{"params": model.attr_head.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "attr_bottleneck"):
         learnable_params += [{"params": model.attr_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if hasattr(model, "id_gate"):
+        learnable_params += [{"params": [model.id_gate], "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     learnable_params += [{"params": model.prompt_learner.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     
@@ -661,11 +664,13 @@ def train_prompter_maple(model,
                         g_p = grad_primary[idx]
                         if param.grad is not None and g_p is not None:
                             g_a = param.grad
-                            dot = torch.dot(g_p.flatten(), g_a.flatten())
+                            g_p_flat = g_p.flatten().float()
+                            g_a_flat = g_a.flatten().float()
+                            dot = torch.dot(g_p_flat, g_a_flat)
                             if dot < 0:
                                 # Project g_a onto the normal of g_p
-                                g_p_norm_sq = torch.dot(g_p.flatten(), g_p.flatten()) + 1e-8
-                                g_a = g_a - (dot / g_p_norm_sq) * g_p
+                                g_p_norm_sq = torch.dot(g_p_flat, g_p_flat) + 1e-8
+                                g_a = g_a - (dot / g_p_norm_sq).to(g_a.dtype) * g_p
                             # Combine gradients directly in param.grad
                             param.grad = g_p + g_a
                         elif g_p is not None:
@@ -1073,7 +1078,7 @@ def train_vision_model_maple(model,
         elif "image_encoder" in name:
             param.requires_grad_(True)
             vision_params.append(param)
-        elif "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name:
+        elif "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name or "id_gate" in name:
             param.requires_grad_(True)
             new_component_params.append(param)
         else:
