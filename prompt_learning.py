@@ -627,6 +627,7 @@ def train_prompter_maple(model,
                 
                 # Total loss
                 loss = loss_id + loss_itc
+                loss_primary = loss
                 
                 loss_attr_val = 0.0
                 if use_attr_loss:
@@ -635,7 +636,45 @@ def train_prompter_maple(model,
                     loss += loss_attr
                     loss_attr_val = loss_attr.item()
 
-            scaler.scale(loss).backward()
+            # --- PCGrad (Gradient Surgery) ---
+            if use_attr_loss:
+                # 1. Compute Primary Gradients (ID + ITC)
+                scaler.scale(loss_primary).backward(retain_graph=True)
+                grad_primary = []
+                for p_group in optimizer.param_groups:
+                    for param in p_group['params']:
+                        if param.grad is not None:
+                            grad_primary.append(param.grad.clone())
+                        else:
+                            grad_primary.append(None)
+                
+                # 2. Clear gradients for Attribute pass
+                optimizer.zero_grad()
+                
+                # 3. Compute Attribute Gradients
+                scaler.scale(loss_attr).backward()
+                
+                # 4. Project Conflicting Gradients
+                idx = 0
+                for p_group in optimizer.param_groups:
+                    for param in p_group['params']:
+                        g_p = grad_primary[idx]
+                        if param.grad is not None and g_p is not None:
+                            g_a = param.grad
+                            dot = torch.dot(g_p.flatten(), g_a.flatten())
+                            if dot < 0:
+                                # Project g_a onto the normal of g_p
+                                g_p_norm_sq = torch.dot(g_p.flatten(), g_p.flatten()) + 1e-8
+                                g_a = g_a - (dot / g_p_norm_sq) * g_p
+                            # Combine gradients directly in param.grad
+                            param.grad = g_p + g_a
+                        elif g_p is not None:
+                            param.grad = g_p
+                        idx += 1
+            else:
+                scaler.scale(loss).backward()
+            # ---------------------------------
+
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params']], max_norm=1.0)
             scaler.step(optimizer)
