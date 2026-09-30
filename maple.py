@@ -580,6 +580,8 @@ class VLPromptLearnerCSC(nn.Module):
         self.ctx_s = nn.Parameter(torch.empty(1 if unified_context else n_cls, n_ctx_s, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_s, std=0.02)
         
+        # ── Disentangled Architecture ──
+        # 1. Full Multimodal Identity Context (100% capacity for Text Transformer & L_itc)
         self.ctx_m = nn.Parameter(torch.empty(1, n_ctx_m, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_m, std=0.02)
 
@@ -590,19 +592,25 @@ class VLPromptLearnerCSC(nn.Module):
         else:
             vis_dim = clip_model.visual.conv1.out_channels
 
-        # ── Independent Projection Layers (Depth-Specific) ──
-        # Instead of a single shared linear layer, we use independent layers for each depth.
-        self.proj = nn.ModuleList([nn.Linear(ctx_dim, vis_dim).to(dtype) for _ in range(prompt_depth)])
-            
-        for p in self.proj:
+        # Identity Projection layers (projects multimodal ctx_m into Vision Prompt 1)
+        self.proj_id = nn.ModuleList([nn.Linear(ctx_dim, vis_dim).to(dtype) for _ in range(prompt_depth)])
+        for p in self.proj_id:
             nn.init.normal_(p.weight, std=0.02)
             nn.init.zeros_(p.bias)
 
-        # ── Deep Text Prompts (Attribute-Guided Initialization) ──
+        # Deep Multimodal Text Prompts (100% capacity for text alignment)
         self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(1, n_ctx_m, ctx_dim, dtype=dtype))
                                                        for _ in range(prompt_depth - 1)])
-        
         for p in self.compound_prompts_text:
+            nn.init.normal_(p, std=0.02)
+
+        # 2. Pure Visual Attribute Prompts (Feeds into Vision Prompt 2 for L_attr, completely disjoint from text)
+        self.vis_attr = nn.Parameter(torch.empty(1, 1, vis_dim, dtype=dtype))
+        nn.init.normal_(self.vis_attr, std=0.02)
+
+        self.compound_prompts_attr = nn.ParameterList([nn.Parameter(torch.empty(1, 1, vis_dim, dtype=dtype))
+                                                       for _ in range(prompt_depth - 1)])
+        for p in self.compound_prompts_attr:
             nn.init.normal_(p, std=0.02)
 
         self.vis_dim = vis_dim
@@ -619,20 +627,24 @@ class VLPromptLearnerCSC(nn.Module):
         return self.tokenized_prompts_0
 
     def _generate_vision_prompts(self):
-        m_c = self.ctx_m.squeeze(0) # [n_ctx_m, ctx_dim]
+        # Layer 0 (Shallow):
+        # Prompt 1 (Identity): Projected from multimodal context ctx_m
+        vis_id_0 = self.proj_id[0](self.ctx_m[:, :1])   # [1, 1, vis_dim]
+        # Prompt 2 (Attribute): Dedicated visual prompt
+        vis_attr_0 = self.vis_attr                       # [1, 1, vis_dim]
+        shared_ctx_vision = torch.cat([vis_id_0, vis_attr_0], dim=1) # [1, 2, vis_dim]
         
-        # Layer 0
-        shared_ctx_vision = self.proj[0](m_c).unsqueeze(0) # [1, n_ctx_m, vis_dim]
-        
-        # Deeper Layers
+        # Deeper Layers:
         deeper_vision_prompts = []
         deeper_text_prompts = []
         
         for i in range(self.prompt_depth - 1):
-            text_prompt = self.compound_prompts_text[i] # [1, n_ctx_m, ctx_dim]
+            text_prompt = self.compound_prompts_text[i] # [1, n_ctx_m, ctx_dim] - Full capacity for text!
             deeper_text_prompts.append(text_prompt)
-            vision_prompt = self.proj[i+1](text_prompt)  # [1, n_ctx_m, vis_dim]
-            deeper_vision_prompts.append(vision_prompt)
+
+            vis_id = self.proj_id[i+1](text_prompt[:, :1])  # [1, 1, vis_dim] - Identity vision prompt
+            vis_attr = self.compound_prompts_attr[i]         # [1, 1, vis_dim] - Pure visual attribute prompt
+            deeper_vision_prompts.append(torch.cat([vis_id, vis_attr], dim=1)) # [1, 2, vis_dim]
 
         # Proposal 2: Asymmetric Depth. 
         # Only inject text prompts up to Layer 3 to prevent text encoder from overfitting to deep vision noise.

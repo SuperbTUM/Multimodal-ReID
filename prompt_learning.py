@@ -127,8 +127,7 @@ class CustomCLIPCSC(nn.Module):
             else:
                 _, _, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
             
-            id_gate = self.id_gate.to(dtype=image_features.dtype)
-            return image_features[:, 0] + id_gate * image_features[:, 1]
+            return image_features[:, 0]
 
         if get_texts:
             force_idx = getattr(self.prompt_learner, 'current_idx', None) if self.training else None
@@ -147,17 +146,15 @@ class CustomCLIPCSC(nn.Module):
         else:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype), shared_vision, deeper_vision)
 
-        # Gated-Fusion Strategy:
-        # Combine the global [CLS] token (0) with the learned Identity Prompt (1) via learned gating
-        id_gate = self.id_gate.to(dtype=image_features.dtype)
-        cls_features_last = image_features_last[:, 0] + id_gate * image_features_last[:, 1]
-        cls_features_non_proj = image_features_non_proj[:, 0] + id_gate * image_features_non_proj[:, 1]
-        cls_features_proj = image_features[:, 0] + id_gate * image_features[:, 1]
+        # Pure Identity Representation: Token 0 ([CLS]) contains the full contextualized person representation
+        cls_features_last = image_features_last[:, 0]
+        cls_features_non_proj = image_features_non_proj[:, 0]
+        cls_features_proj = image_features[:, 0]
         
         # Attributes remain strictly on Prompt 2 (Index 2)
         attr_features_proj = image_features[:, 2]
 
-        # Global Features (Identity uses the full fused capacity)
+        # Global Features
         features_non_proj = self.vision_bottleneck(cls_features_non_proj)
         cls_score = self.vision_classifier(features_non_proj.float())
         features = self.vision_bottleneck_proj(cls_features_proj)
@@ -172,8 +169,8 @@ class CustomCLIPCSC(nn.Module):
         if self.training:
             return cls_scores, [cls_features_last, cls_features_non_proj, cls_features_proj], cls_features_proj, attr_score
         else:
-            # Inference on the Sum-Fused identity descriptor
-            return torch.cat((features_non_proj, features), dim=1)
+            # Standard CLIP-ReID inference representation: Pre-BN 1280-d concatenation (matches Triplet Loss optimization space)
+            return torch.cat((cls_features_non_proj, cls_features_proj), dim=1)
 
 
 class CustomCLIPCoop(nn.Module):
@@ -556,6 +553,19 @@ def train_prompter_maple(model,
         print(f"Skipping Attribute Prediction Loss: {e}")
         use_attr_loss = False
 
+    # Identify Visual Attribute parameters vs Multimodal Identity parameters
+    attr_params_set = set()
+    if hasattr(model, "attr_head"):
+        attr_params_set.update(model.attr_head.parameters())
+    if hasattr(model, "attr_bottleneck"):
+        attr_params_set.update(model.attr_bottleneck.parameters())
+    if hasattr(model, "prompt_learner"):
+        if hasattr(model.prompt_learner, "vis_attr"):
+            attr_params_set.add(model.prompt_learner.vis_attr)
+        if hasattr(model.prompt_learner, "compound_prompts_attr"):
+            attr_params_set.update(model.prompt_learner.compound_prompts_attr.parameters())
+    print(f"Gradient Isolation configured: {len(attr_params_set)} attribute parameter tensors decoupled from identity.")
+
 
 
     print("Initializing persistent text feature cache (Stage 1)...")
@@ -639,14 +649,18 @@ def train_prompter_maple(model,
                     loss += loss_attr
                     loss_attr_val = loss_attr.item()
 
-            # --- PCGrad (Gradient Surgery) ---
+            # --- Disentangled Gradient Isolation ---
             if use_attr_loss:
                 # 1. Compute Primary Gradients (ID + ITC)
                 scaler.scale(loss_primary).backward(retain_graph=True)
                 grad_primary = []
                 for p_group in optimizer.param_groups:
                     for param in p_group['params']:
-                        if param.grad is not None:
+                        if param in attr_params_set:
+                            # Attribute parameters: ignore primary loss
+                            param.grad = None
+                            grad_primary.append(None)
+                        elif param.grad is not None:
                             grad_primary.append(param.grad.clone())
                         else:
                             grad_primary.append(None)
@@ -656,25 +670,21 @@ def train_prompter_maple(model,
                 
                 # 3. Compute Attribute Gradients
                 scaler.scale(loss_attr).backward()
+                for p_group in optimizer.param_groups:
+                    for param in p_group['params']:
+                        if param not in attr_params_set:
+                            # Identity parameter: clear leaked attention noise from attribute loss
+                            param.grad = None
                 
-                # 4. Project Conflicting Gradients
+                # 4. Deliver pure gradients
                 idx = 0
                 for p_group in optimizer.param_groups:
                     for param in p_group['params']:
                         g_p = grad_primary[idx]
-                        if param.grad is not None and g_p is not None:
-                            g_a = param.grad
-                            g_p_flat = g_p.flatten().float()
-                            g_a_flat = g_a.flatten().float()
-                            dot = torch.dot(g_p_flat, g_a_flat)
-                            if dot < 0:
-                                # Project g_a onto the normal of g_p
-                                g_p_norm_sq = torch.dot(g_p_flat, g_p_flat) + 1e-8
-                                g_a = g_a - (dot / g_p_norm_sq).to(g_a.dtype) * g_p
-                            # Combine gradients directly in param.grad
-                            param.grad = g_p + g_a
-                        elif g_p is not None:
+                        if g_p is not None:
+                            # Identity parameter gets pure primary gradient
                             param.grad = g_p
+                        # Attribute parameter already has pure loss_attr gradient in param.grad!
                         idx += 1
             else:
                 scaler.scale(loss).backward()
@@ -982,51 +992,21 @@ def train_vision_model_maple(model,
         label = label.cuda()
         cams = cams.cuda()
         loss = 0.
-        cls_scores, image_features_list, image_features_proj, attr_score = model(image, label=label, cam_label=cams)
+        cls_scores, image_features_list, image_features_proj, attr_score = model(image, label=label, cam_label=cams, is_stage2=True)
 
         image_features_last, image_features_non_proj, image_features = image_features_list
         for cls_score in cls_scores:
             loss += 0.5 * ce_loss(cls_score, label)
 
-        # Get unique labels in this batch (usually ~16 identities for PK sampler)
-        unique_labels = torch.unique(label)
-
-        # Dynamically compute pure identity text features for the unique identities
-        with torch.amp.autocast('cuda', enabled=True):
-            text_features_batch = model(label=unique_labels, get_texts=True)
-
-            # Update the persistent cache with the fresh prototypes (no grad)
-            with torch.no_grad():
-                text_features_all[unique_labels] = text_features_batch.detach()
-                
-        # Compute base logits against all pure identities
-        # Crucial Fix: L2 Normalize features and apply CLIP's logit_scale!
-        logit_scale = model.logit_scale.exp()
-        img_feat_norm = F.normalize(image_features_proj, p=2, dim=-1)
-        txt_feat_all_norm = F.normalize(text_features_all, p=2, dim=-1)
-        txt_feat_batch_norm = F.normalize(text_features_batch, p=2, dim=-1)
-
-        output = logit_scale * (img_feat_norm @ txt_feat_all_norm.t()) # [B, n_cls]
-
-        # Compute dynamic positive logits for the exact identities in the batch
-        output_dynamic = logit_scale * (img_feat_norm @ txt_feat_batch_norm.t()) # [B, num_unique]
-
-        # Overwrite the positive class logits with the dynamic logits to preserve backprop graph
-        output = output.clone()
-        for i, cls_id in enumerate(unique_labels):
-            output[:, cls_id] = output_dynamic[:, i]
-
+        # Multimodal prototype classification against fixed Stage 1 identity prototypes (CLIP-ReID formulation)
+        output = image_features_proj @ text_features_all.t() # [B, n_cls]
         loss += ce_loss(output, label)
         
-        # Fix Hypersphere Collapse: Apply Triplet Loss ONLY before the bottleneck (BNNeck design)
-        loss += triplet_loss(image_features_non_proj, label)
-        
-        if use_attr_loss:
-            attr_targets = attr_labels[label]
-            # Scale down Attribute loss in Stage 2!
-            # Because the ViT backbone is now unfrozen, a 1.0 weight will pull the shared backbone weights 
-            # too heavily toward shared traits, collapsing the fine-grained Identity variance.
-            loss += 0.1 * F.binary_cross_entropy_with_logits(attr_score, attr_targets)
+        # Deep Multi-Scale Triplet Loss (essential for SOTA ranking & mAP)
+        # Supervised across layer 11 (768-d), layer 12 non-proj (768-d), and layer 12 proj (512-d)
+        loss += triplet_loss(image_features_last, label) + \
+                triplet_loss(image_features_non_proj, label) + \
+                triplet_loss(image_features, label)
 
         return loss
 
@@ -1034,14 +1014,14 @@ def train_vision_model_maple(model,
     if params.amp:
         model = model.float()
 
-    # Pre-compute persistent cache of text features for all classes.
+    # Pre-compute persistent cache of pure identity text prototypes for all classes
     with torch.no_grad():
         model.eval()
         text_features_all = []
-        for i in range(n_cls):
-            label_t = torch.tensor([i]).cuda()
+        for i in range(0, n_cls, 128):
+            label_chunk = torch.arange(i, min(i + 128, n_cls)).cuda()
             with torch.amp.autocast('cuda', enabled=True):
-                text_feature = model(label=label_t, get_texts=True)
+                text_feature = model(label=label_chunk, get_texts=True)
             text_features_all.append(text_feature)
         text_features_all = torch.cat(text_features_all, dim=0).cuda()
 
@@ -1053,41 +1033,46 @@ def train_vision_model_maple(model,
 
     # Define stage 2 learning rates (Differential LR)
     lr_vision = 5e-6
-    lr_new_components = 3.5e-3
+    lr_prompt = 5e-6
+    lr_classifiers = 3.5e-3
 
     print("Building custom CLIP for MaPLe (Stage 2) with Differential LR:")
     print(f"  - Vision Encoder learning rate: {lr_vision}")
-    print(f"  - New Components (Classifiers) learning rate: {lr_new_components}")
+    print(f"  - Prompt Learner fine-tune rate: {lr_prompt}")
+    print(f"  - Classifiers / Bottlenecks learning rate: {lr_classifiers}")
 
-    # Set up parameter gradients and group parameters for the optimizer:
-    # Freezes: text_encoder, prompt_learner
-    # Unfreezes: image_encoder (Visual Encoder), classifiers
+    # Group parameters with appropriate learning rates:
+    # Freezes: text_encoder
+    # Unfreezes: image_encoder (5e-6), prompt_learner (5e-6), classifiers (3.5e-3)
     learnable_params = []
     vision_params = []
-    new_component_params = []
+    prompt_params = []
+    classifier_params = []
 
     for name, param in model.named_parameters():
         if "text_encoder" in name:
             param.requires_grad_(False)
         elif "prompt_learner" in name:
-            if "vision" in name or "layer0" in name or "cross_attn" in name or "ctx_s" in name or "ctx_m" in name or "proj" in name or "meta_net" in name or "compound_prompts_text" in name:
+            if any(k in name for k in ["vis_attr", "compound_prompts", "proj", "ctx_m", "ctx_s"]):
                 param.requires_grad_(True)
-                new_component_params.append(param)
+                prompt_params.append(param)
             else:
                 param.requires_grad_(False)
         elif "image_encoder" in name:
             param.requires_grad_(True)
             vision_params.append(param)
-        elif "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name or "id_gate" in name:
+        elif any(k in name for k in ["vision_classifier", "vision_bottleneck", "attr_head", "attr_bottleneck", "id_gate"]):
             param.requires_grad_(True)
-            new_component_params.append(param)
+            classifier_params.append(param)
         else:
             param.requires_grad_(False)
 
     if len(vision_params) > 0:
         learnable_params.append({"params": vision_params, "lr": lr_vision, "weight_decay": 1e-4})
-    if len(new_component_params) > 0:
-        learnable_params.append({"params": new_component_params, "lr": lr_new_components, "weight_decay": 1e-4})
+    if len(prompt_params) > 0:
+        learnable_params.append({"params": prompt_params, "lr": lr_prompt, "weight_decay": 1e-4})
+    if len(classifier_params) > 0:
+        learnable_params.append({"params": classifier_params, "lr": lr_classifiers, "weight_decay": 1e-4})
 
     optimizer = torch.optim.Adam(learnable_params, lr=lr_vision, weight_decay=1e-4)
     scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
@@ -1167,7 +1152,6 @@ def test_prompter(model,
             with torch.amp.autocast('cuda'):
                 output = model(images, cam_label=cams_cuda)
             
-            # Extract features if model returns a tuple
             if isinstance(output, tuple):
                 image_features_merged = output[2]
             else:
@@ -1177,6 +1161,7 @@ def test_prompter(model,
             targets.append(target.cpu())
             camera_ids.append(cams.cpu())
             sequence_ids.append(seqs.cpu())
+
     embeddings = torch.cat(embeddings, dim=0)
     targets = torch.cat(targets, dim=0)
     camera_ids = torch.cat(camera_ids, dim=0)
@@ -1219,6 +1204,7 @@ def params_parser():
     args.add_argument("--train_dataset", type=str, default="market1501", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--train_dataset_multitask", type=str, default="", choices=["", "market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
+    args.add_argument("--pretrained_prompter", type=str, default="", help="Path to trained Stage 1 prompter checkpoint")
     return args.parse_args()
 
 
@@ -1329,7 +1315,10 @@ if __name__ == "__main__":
                                                                                                 "vit" if "ViT" in params.model else "rn",
                                                                                                 params.test_dataset)
 
-    if params.epochs_stage1 > 0:
+    if params.pretrained_prompter and os.path.exists(params.pretrained_prompter):
+        print(f"Loading pretrained prompter from {params.pretrained_prompter}")
+        model.prompt_learner.load_state_dict(torch.load(params.pretrained_prompter), strict=False)
+    elif params.epochs_stage1 > 0:
         if params.training_mode == "csc-maple":
             train_prompter_maple(model,
                                  loader_train_sampled,
