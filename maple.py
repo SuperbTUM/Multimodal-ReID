@@ -502,27 +502,7 @@ class VLPromptLearnerCSC(nn.Module):
         placeholders = " ".join(["X"] * self.n_placeholders)
 
         is_vehicle = dataset_name not in ("market1501", "dukemtmc", "msmt17")
-        if dataset_name == "market1501":
-            prompts = []
-            try:
-                with open("prompts_market1501_attributes.txt", "r") as f:
-                    for line in f:
-                        if line.strip():
-                            label, desc = line.strip().split(":", 1)
-                            # Proposal 3: Strip conversational filler and prepend placeholders
-                            desc = f"{placeholders} {desc}"
-                            prompts.append(desc)
-                assert len(prompts) == n_cls
-                self.INSTRUCTION_POOL = prompts
-                self.use_attributes = True
-                print("VLPromptLearnerCSC: Loaded instance-specific attributes!")
-            except Exception as e:
-                print(f"Failed to load attributes: {e}. Falling back to default.")
-                self.use_attributes = False
-                self.INSTRUCTION_POOL = [
-                    f"A photo of a {placeholders} person."
-                ]
-        elif not is_vehicle:
+        if not is_vehicle:
             self.use_attributes = False
             self.INSTRUCTION_POOL = [
                 f"A photo of a {placeholders} person."
@@ -653,40 +633,35 @@ class VLPromptLearnerCSC(nn.Module):
         
         return shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts[:text_prompt_depth]
 
-    def forward(self, label, cam_label=None, is_stage2=False, ensemble=False, force_idx=None):
+    def forward(self, label, cam_label=None, is_stage2=False, ensemble=False, force_idx=None, mode='all'):
+        if mode == 'vision_only':
+            shared_ctx_vision, deeper_vision_prompts, _ = self._generate_vision_prompts()
+            return None, None, deeper_vision_prompts, shared_ctx_vision
+
         batch_size = label.shape[0] if label is not None else 1
         
-        shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts = self._generate_vision_prompts()
-
-        if getattr(self, "use_attributes", False) and label is not None:
-            # When using attributes, each instance in the batch has its own specialized text prompt
-            self.current_idx = label
-            self.current_tokenized_prompts = torch.stack([getattr(self, f"tokenized_prompts_{l.item()}")[0] for l in label], dim=0)
-            prefix = torch.stack([getattr(self, f"token_prefix_{l.item()}")[0] for l in label], dim=0)
-            suffix = torch.stack([getattr(self, f"token_suffix_{l.item()}")[0] for l in label], dim=0)
-            self.current_prefix_len = prefix.shape[1]
+        if mode == 'text_only':
+            deeper_text_prompts = []
+            for i in range(min(3, self.prompt_depth - 1)):
+                deeper_text_prompts.append(self.compound_prompts_text[i])
+            shared_ctx_vision, deeper_vision_prompts = None, None
         else:
-            if force_idx is not None:
-                idx = force_idx
-            else:
-                if self.use_instruction_pool and self.training:
-                    idx = random.randint(0, len(self.INSTRUCTION_POOL) - 1)
-                else:
-                    idx = 0
-                
-            self.current_idx = idx
-            self.current_tokenized_prompts = getattr(self, f"tokenized_prompts_{idx}")
-            current_prefix = getattr(self, f"token_prefix_{idx}")
-            current_suffix = getattr(self, f"token_suffix_{idx}")
-            self.current_prefix_len = current_prefix.shape[1]
-            prefix = current_prefix.expand(batch_size, -1, -1)
-            suffix = current_suffix.expand(batch_size, -1, -1)
+            shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts = self._generate_vision_prompts()
+
+        idx = 0
+        self.current_idx = idx
+        self.current_tokenized_prompts = getattr(self, f"tokenized_prompts_{idx}")
+        current_prefix = getattr(self, f"token_prefix_{idx}")
+        current_suffix = getattr(self, f"token_suffix_{idx}")
+        self.current_prefix_len = current_prefix.shape[1]
+        prefix = current_prefix.expand(batch_size, -1, -1)
+        suffix = current_suffix.expand(batch_size, -1, -1)
             
         if self.unified_context:
             s_c = self.ctx_s.expand(batch_size, -1, -1)
         else:
             if label is None:
-                s_c = self.ctx_s[0].unsqueeze(0).expand(batch_size, -1, -1)
+                s_c = self.ctx_s.mean(dim=0, keepdim=True).expand(batch_size, -1, -1)
             else:
                 s_c = self.ctx_s[label]
                 
@@ -982,7 +957,7 @@ class ResidualAttentionBlock_IVLP(nn.Module):
                 # Remove the outputs produced by learnable tokens of previous layer
                 prefix = x[0:x.shape[0] - self.n_ctx_visual, :, :]
                 # Create/configure learnable tokens of this layer
-                visual_context = self.VPT_shallow.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                visual_context = self.VPT_shallow.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
                 # Add the learnable tokens of this layer with the input, by replacing the previous
                 # layer learnable tokens
                 x = torch.cat([prefix, visual_context], dim=0)
@@ -993,7 +968,7 @@ class ResidualAttentionBlock_IVLP(nn.Module):
                 prefix = x[:1, :, :]
                 suffix = x[1 + self.n_ctx_text:, :, :]
                 # Create/configure learnable tokens of this layer
-                textual_context = self.VPT_shallow.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                textual_context = self.VPT_shallow.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
                 # Add the learnable tokens of this layer with the input, replaced by previous
                 # layer learnable tokens
                 x = torch.cat([prefix, textual_context, suffix], dim=0)
@@ -1058,10 +1033,10 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                         old_prompts = x[1:1 + self.compound_prompt_nctx, :, :]
                         
                         visual_context = compound_prompts_deeper[counter]  # extract the correct index
-                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
                         
                         # Apply residual gating! Strictly additive update to preserve old_prompts
-                        gated_context = old_prompts + self.res_gate.half() * visual_context
+                        gated_context = old_prompts + self.res_gate.to(dtype=x.dtype) * visual_context
                         
                         x = torch.cat([prefix, gated_context, suffix], dim=0)
                     else:
@@ -1072,10 +1047,10 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                         old_prompts = x[prefix_len:prefix_len + self.compound_prompt_nctx, :, :]
                         
                         textual_context = compound_prompts_deeper[counter]
-                        textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                        textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
                         
                         # Apply residual gating! Strictly additive update to preserve old_prompts
-                        gated_context = old_prompts + self.res_gate.half() * textual_context
+                        gated_context = old_prompts + self.res_gate.to(dtype=x.dtype) * textual_context
                         
                         x = torch.cat([prefix, gated_context, suffix], dim=0)
                     
@@ -1134,7 +1109,7 @@ class VisionTransformer(nn.Module):
         # After positional embeddings, we will attach prompts with the model, remember only those
         # are trainable parameters here in whole image encoder.
         if self.VPT_shallow:
-            visual_ctx = self.VPT.expand(x.shape[0], -1, -1).half()
+            visual_ctx = self.VPT.expand(x.shape[0], -1, -1).to(dtype=x.dtype)
             x = torch.cat([x, visual_ctx], dim=1)
         else:
             assert self.prompt_till_layer_visual == 0
@@ -1189,7 +1164,7 @@ class VisionTransformer_MaPLe(nn.Module):
         # After positional embeddings, we will attach prompts with the model, remember only those
         # are trainable parameters here in whole image encoder.
         if self.VPT_shallow:
-            visual_ctx = shared_ctx.expand(x.shape[0], -1, -1).half()
+            visual_ctx = shared_ctx.expand(x.shape[0], -1, -1).to(dtype=x.dtype)
             x = torch.cat([x[:, 0:1, :], visual_ctx, x[:, 1:, :]], dim=1)
         else:
             assert self.prompt_till_layer_visual == 0

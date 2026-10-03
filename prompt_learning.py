@@ -111,9 +111,6 @@ class CustomCLIPCSC(nn.Module):
         nn.init.normal_(self.attr_head.weight, std=0.001)
         nn.init.constant_(self.attr_head.bias, 0)
 
-        # Learnable gating for Identity Prompt fusion
-        self.id_gate = nn.Parameter(torch.tensor([0.5]))
-
     def forward(self, image=None, label=None, cam_label=None, get_image=False, get_texts=False, is_stage2=False):
         if get_image:
             if label is None:
@@ -131,15 +128,12 @@ class CustomCLIPCSC(nn.Module):
 
         if get_texts:
             force_idx = getattr(self.prompt_learner, 'current_idx', None) if self.training else None
-            prompts, deeper_text, _, _ = self.prompt_learner(label=label, is_stage2=is_stage2, force_idx=force_idx)
+            prompts, deeper_text, _, _ = self.prompt_learner(label=label, is_stage2=is_stage2, force_idx=force_idx, mode='text_only')
             tokenized_prompts = self.prompt_learner.current_tokenized_prompts
             text_features = self.text_encoder(prompts, tokenized_prompts, deeper_text, self.prompt_learner.current_prefix_len)
             return text_features
 
-        if label is None:
-            label = torch.zeros(image.shape[0], dtype=torch.long).cuda()
-            
-        prompts, deeper_text, deeper_vision, shared_vision = self.prompt_learner(label=label, is_stage2=is_stage2)
+        _, _, deeper_vision, shared_vision = self.prompt_learner(label=None, is_stage2=is_stage2, mode='vision_only')
   
         if params.amp:
             image_features_last, image_features_non_proj, image_features = self.image_encoder(image, shared_vision, deeper_vision)
@@ -150,9 +144,12 @@ class CustomCLIPCSC(nn.Module):
         cls_features_last = image_features_last[:, 0]
         cls_features_non_proj = image_features_non_proj[:, 0]
         cls_features_proj = image_features[:, 0]
-        
-        # Attributes remain strictly on Prompt 2 (Index 2)
-        attr_features_proj = image_features[:, 2]
+
+        if not self.training:
+            # Dual-space L2-normalized concatenation: aligns with the two unit-hypersphere Triplet Loss objectives
+            f_non_proj = F.normalize(cls_features_non_proj, p=2, dim=-1)
+            f_proj = F.normalize(cls_features_proj, p=2, dim=-1)
+            return torch.cat((f_non_proj, f_proj), dim=1)
 
         # Global Features
         features_non_proj = self.vision_bottleneck(cls_features_non_proj)
@@ -160,17 +157,17 @@ class CustomCLIPCSC(nn.Module):
         features = self.vision_bottleneck_proj(cls_features_proj)
         cls_score_proj = self.vision_classifier_proj(features.float())
         
-        # Calculate attribute prediction (Isolated to Prompt 2)
-        attr_features = self.attr_bottleneck(attr_features_proj)
-        attr_score = self.attr_head(attr_features.float())
+        # Calculate attribute prediction (Isolated to Prompt 2, computed only if enabled)
+        if params.attr_weight > 0:
+            attr_features_proj = image_features[:, 2]
+            attr_features = self.attr_bottleneck(attr_features_proj)
+            attr_score = self.attr_head(attr_features.float())
+        else:
+            attr_score = None
         
         cls_scores = [cls_score, cls_score_proj]
 
-        if self.training:
-            return cls_scores, [cls_features_last, cls_features_non_proj, cls_features_proj], cls_features_proj, attr_score
-        else:
-            # Standard CLIP-ReID inference representation: Pre-BN 1280-d concatenation (matches Triplet Loss optimization space)
-            return torch.cat((cls_features_non_proj, cls_features_proj), dim=1)
+        return cls_scores, [cls_features_last, cls_features_non_proj, cls_features_proj], cls_features_proj, attr_score
 
 
 class CustomCLIPCoop(nn.Module):
@@ -502,7 +499,7 @@ def train_prompter_maple(model,
     # Unfreeze all prompt parameters (text and vision) and classifiers for Stage 1
     learnable_params = []
     for name, param in model.named_parameters():
-        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name or "id_gate" in name:
+        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name:
             param.requires_grad = True
         elif "prompt_learner" in name:
             param.requires_grad = True
@@ -524,8 +521,6 @@ def train_prompter_maple(model,
         learnable_params += [{"params": model.attr_head.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "attr_bottleneck"):
         learnable_params += [{"params": model.attr_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
-    if hasattr(model, "id_gate"):
-        learnable_params += [{"params": [model.id_gate], "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     learnable_params += [{"params": model.prompt_learner.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     
@@ -546,27 +541,15 @@ def train_prompter_maple(model,
         os.makedirs(params.save_path)
     try:
         import numpy as np
-        attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
-        use_attr_loss = True
-        print("Loaded attribute labels for APL!")
+        if params.attr_weight > 0 and "market" in params.train_dataset.lower() and os.path.exists("market_train_attrs.npy"):
+            attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
+            use_attr_loss = True
+            print(f"Loaded attribute labels for APL (weight={params.attr_weight})!")
+        else:
+            use_attr_loss = False
     except Exception as e:
         print(f"Skipping Attribute Prediction Loss: {e}")
         use_attr_loss = False
-
-    # Identify Visual Attribute parameters vs Multimodal Identity parameters
-    attr_params_set = set()
-    if hasattr(model, "attr_head"):
-        attr_params_set.update(model.attr_head.parameters())
-    if hasattr(model, "attr_bottleneck"):
-        attr_params_set.update(model.attr_bottleneck.parameters())
-    if hasattr(model, "prompt_learner"):
-        if hasattr(model.prompt_learner, "vis_attr"):
-            attr_params_set.add(model.prompt_learner.vis_attr)
-        if hasattr(model.prompt_learner, "compound_prompts_attr"):
-            attr_params_set.update(model.prompt_learner.compound_prompts_attr.parameters())
-    print(f"Gradient Isolation configured: {len(attr_params_set)} attribute parameter tensors decoupled from identity.")
-
-
 
     print("Initializing persistent text feature cache (Stage 1)...")
     # Pre-compute initial text features for all classes using identity-only mode
@@ -580,6 +563,7 @@ def train_prompter_maple(model,
                 chunk_features = model(label=label_chunk, get_texts=True)
             text_features_cache.append(chunk_features.detach())
         text_features_cache = torch.cat(text_features_cache, dim=0).cuda()
+    all_labels = torch.arange(n_cls, device='cuda')
     print("Cache initialized.")
 
     if not os.path.exists(params.save_path):
@@ -621,15 +605,12 @@ def train_prompter_maple(model,
                 
                 # Construct hybrid tensor for global separation (preserves batch gradients)
                 dynamic_features = torch.zeros_like(text_features_cache)
-                dynamic_features.copy_(text_features_cache)
                 dynamic_features[unique_labels] = text_features_unique
-                
 
                 mask = torch.zeros(n_cls, 1, dtype=dynamic_features.dtype, device='cuda')
                 mask[unique_labels] = 1.0
-                
+
                 text_features_all = text_features_cache * (1 - mask) + dynamic_features
-                all_labels = torch.arange(n_cls).cuda()
                 logit_scale = model.logit_scale.exp()
                 
                 # Global i2t Loss
@@ -640,54 +621,15 @@ def train_prompter_maple(model,
                 
                 # Total loss
                 loss = loss_id + loss_itc
-                loss_primary = loss
                 
                 loss_attr_val = 0.0
                 if use_attr_loss:
                     attr_targets = attr_labels[target]
                     loss_attr = F.binary_cross_entropy_with_logits(attr_score, attr_targets)
-                    loss += loss_attr
+                    loss += params.attr_weight * loss_attr
                     loss_attr_val = loss_attr.item()
 
-            # --- Disentangled Gradient Isolation ---
-            if use_attr_loss:
-                # 1. Compute Primary Gradients (ID + ITC)
-                scaler.scale(loss_primary).backward(retain_graph=True)
-                grad_primary = []
-                for p_group in optimizer.param_groups:
-                    for param in p_group['params']:
-                        if param in attr_params_set:
-                            # Attribute parameters: ignore primary loss
-                            param.grad = None
-                            grad_primary.append(None)
-                        elif param.grad is not None:
-                            grad_primary.append(param.grad.clone())
-                        else:
-                            grad_primary.append(None)
-                
-                # 2. Clear gradients for Attribute pass
-                optimizer.zero_grad()
-                
-                # 3. Compute Attribute Gradients
-                scaler.scale(loss_attr).backward()
-                for p_group in optimizer.param_groups:
-                    for param in p_group['params']:
-                        if param not in attr_params_set:
-                            # Identity parameter: clear leaked attention noise from attribute loss
-                            param.grad = None
-                
-                # 4. Deliver pure gradients
-                idx = 0
-                for p_group in optimizer.param_groups:
-                    for param in p_group['params']:
-                        g_p = grad_primary[idx]
-                        if g_p is not None:
-                            # Identity parameter gets pure primary gradient
-                            param.grad = g_p
-                        # Attribute parameter already has pure loss_attr gradient in param.grad!
-                        idx += 1
-            else:
-                scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
             # ---------------------------------
 
             scaler.unscale_(optimizer)
@@ -699,6 +641,8 @@ def train_prompter_maple(model,
                 print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_itc: {:.3f}, L_attr: {:.3f}), Base Lr: {:.2e}"
                       .format(epoch, (i + 1), len(dataloader_train_val),
                               loss, loss_id, loss_itc, loss_attr_val, scheduler._get_lr(epoch)[0]))
+
+        scheduler.step(epoch)
 
         if epoch % 20 == 0 or epoch == params.epochs_stage1:
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
@@ -980,9 +924,12 @@ def train_vision_model_maple(model,
                              pretrained=None):
     try:
         import numpy as np
-        attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
-        use_attr_loss = True
-        print("Stage 2: Loaded attribute labels for APL!")
+        if params.attr_weight > 0 and "market" in params.train_dataset.lower() and os.path.exists("market_train_attrs.npy"):
+            attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
+            use_attr_loss = True
+            print(f"Stage 2: Loaded attribute labels for APL (weight={params.attr_weight})!")
+        else:
+            use_attr_loss = False
     except Exception as e:
         use_attr_loss = False
 
@@ -998,15 +945,19 @@ def train_vision_model_maple(model,
         for cls_score in cls_scores:
             loss += 0.5 * ce_loss(cls_score, label)
 
-        # Multimodal prototype classification against fixed Stage 1 identity prototypes (CLIP-ReID formulation)
-        output = image_features_proj @ text_features_all.t() # [B, n_cls]
+        # Multimodal prototype classification with L2 normalization and temperature scaling (CLIP-ReID formulation)
+        logit_scale = model.logit_scale.exp()
+        img_feat_norm = F.normalize(image_features_proj, p=2, dim=-1)
+        output = logit_scale * (img_feat_norm @ text_features_all.t()) # [B, n_cls]
         loss += ce_loss(output, label)
         
-        # Deep Multi-Scale Triplet Loss (essential for SOTA ranking & mAP)
-        # Supervised across layer 11 (768-d), layer 12 non-proj (768-d), and layer 12 proj (512-d)
-        loss += triplet_loss(image_features_last, label) + \
-                triplet_loss(image_features_non_proj, label) + \
-                triplet_loss(image_features, label)
+        # Normalized Triplet Loss on pre-BN non-proj (768-d) and proj (512-d)
+        loss += triplet_loss(image_features_non_proj, label, normalize_feature=True) + \
+                triplet_loss(image_features, label, normalize_feature=True)
+
+        if use_attr_loss and params.attr_weight > 0:
+            attr_targets = attr_labels[label]
+            loss += params.attr_weight * F.binary_cross_entropy_with_logits(attr_score, attr_targets)
 
         return loss
 
@@ -1024,6 +975,7 @@ def train_vision_model_maple(model,
                 text_feature = model(label=label_chunk, get_texts=True)
             text_features_all.append(text_feature)
         text_features_all = torch.cat(text_features_all, dim=0).cuda()
+        text_features_all = F.normalize(text_features_all, p=2, dim=-1)
 
     if pretrained is not None:
         if "prompter" in pretrained:
@@ -1061,7 +1013,7 @@ def train_vision_model_maple(model,
         elif "image_encoder" in name:
             param.requires_grad_(True)
             vision_params.append(param)
-        elif any(k in name for k in ["vision_classifier", "vision_bottleneck", "attr_head", "attr_bottleneck", "id_gate"]):
+        elif any(k in name for k in ["vision_classifier", "vision_bottleneck", "attr_head", "attr_bottleneck"]):
             param.requires_grad_(True)
             classifier_params.append(param)
         else:
@@ -1175,11 +1127,12 @@ def get_cmc_map(
         gallery_labels,
         query_labels,
         gallery_cams,
-        query_cams
+        query_cams,
+        reranking=False
 ):
     gallery_embeddings = gallery_embeddings.cpu()
     query_embeddings = query_embeddings.cpu()
-    evaluator = R1_mAP_eval(len(query_labels), max_rank=10, feat_norm=True)
+    evaluator = R1_mAP_eval(len(query_labels), max_rank=10, feat_norm=True, reranking=reranking)
     evaluator.reset()
     evaluator.update((torch.cat((query_embeddings, gallery_embeddings), dim=0),
                       torch.cat((query_labels, gallery_labels), dim=0),
@@ -1194,9 +1147,9 @@ def params_parser():
     args.add_argument("--epochs_stage2", default=60, type=int)
     args.add_argument("--root", default="./", type=str)
     args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
-    args.add_argument("--bs", default=1, type=int)
+    args.add_argument("--bs", default=64, type=int)
     args.add_argument("--save_path", default="./checkpoints")
-    args.add_argument("--height", default=224, type=int)
+    args.add_argument("--height", default=256, type=int)
     args.add_argument("--ratio", default=0.5, type=float)
     args.add_argument("--amp", action="store_true")
     args.add_argument("--training_mode", type=str, default="coop", choices=["coop", "promptsrc", "ivlp", "adapter", "csc-maple"])
@@ -1205,6 +1158,9 @@ def params_parser():
     args.add_argument("--train_dataset_multitask", type=str, default="", choices=["", "market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--test_dataset", type=str, default="dukemtmc", choices=["market1501", "dukemtmc", "msmt17", "veri", "vehicleid"])
     args.add_argument("--pretrained_prompter", type=str, default="", help="Path to trained Stage 1 prompter checkpoint")
+    args.add_argument("--attr_weight", default=0.0, type=float, help="Auxiliary attribute loss weight (0.0 to disable)")
+    args.add_argument("--stride_size", default=16, type=int, choices=[12, 16], help="ViT patch conv stride")
+    args.add_argument("--reranking", action="store_true", help="Enable k-reciprocal re-ranking at test time")
     return args.parse_args()
 
 
@@ -1226,7 +1182,7 @@ if __name__ == "__main__":
                           "language_depth": 12,
                           "vision_ctx": params.vpt_ctx,
                           "language_ctx": params.vpt_ctx}
-        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
+        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details, stride_size=params.stride_size)
     elif params.training_mode == "promptsrc":
         design_details_zero_shot = {"trainer": 'IVLP',
                           "vision_depth": 12,
@@ -1240,18 +1196,17 @@ if __name__ == "__main__":
                           "language_ctx": params.vpt_ctx}
         # model_zero_shot = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details_zero_shot, 16)
         model_zero_shot = build_model_from_openai_state_dict(torch.load("./metaclip_b16_fullcc2.5b.bin")) # This comes from Huggingface
-        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details)
+        model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details, stride_size=params.stride_size)
     elif params.training_mode == "coop":
-        # model = build_model_coop(state_dict or model.state_dict(), image_height // 16, image_width // 16, 16)
-        # olp
-        model = build_model_coop(state_dict or model.state_dict(), image_height // 12, image_width // 12, 12)
+        model = build_model_coop(state_dict or model.state_dict(), image_height // params.stride_size, image_width // params.stride_size, params.stride_size)
     elif params.training_mode == "adapter":
-        model = build_model_adapter(state_dict or model.state_dict(), image_height // 12, image_width // 12, 12)
+        model = build_model_adapter(state_dict or model.state_dict(), image_height // params.stride_size, image_width // params.stride_size, params.stride_size)
     elif params.training_mode == "csc-maple":
         design_details = {"trainer": 'MaPLe',
                           "vision_depth": 9,
                           "language_depth": 9}
         model = build_model_maple(state_dict or model.state_dict(), image_height, image_width, design_details,
+                                  stride_size=params.stride_size,
                                   n_ctx_s=4, maple_length=2)
     else:
         raise NotImplementedError
@@ -1355,4 +1310,4 @@ if __name__ == "__main__":
         test_prompter(model, None, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \
         test_prompter(model, None, loader_query)
-    get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query)
+    get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query, reranking=params.reranking)

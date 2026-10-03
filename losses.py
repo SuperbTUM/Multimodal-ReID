@@ -208,10 +208,9 @@ class CrossEntropyLabelSmooth(nn.Module):
             targets: ground truth labels with shape (num_classes)
         """
         log_probs = self.logsoftmax(inputs)
-        targets = torch.zeros(log_probs.size()).scatter_(1, targets.unsqueeze(1).data.cpu(), 1)
-        if self.use_gpu: targets = targets.cuda()
-        targets = (1 - self.epsilon) * targets + self.epsilon / self.num_classes
-        loss = (- targets * log_probs).mean(0).sum()
+        targets_one_hot = torch.zeros(log_probs.size(), device=inputs.device).scatter_(1, targets.unsqueeze(1), 1.0)
+        targets_smooth = (1 - self.epsilon) * targets_one_hot + self.epsilon / self.num_classes
+        loss = (- targets_smooth * log_probs).sum(dim=1).mean()
         return loss
 
 class CrossModalTripletLoss(nn.Module):
