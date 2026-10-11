@@ -365,13 +365,13 @@ def get_loader_train_multitask(root, batch_size, image_height, image_width, mode
 
 def get_loader(root, batch_size, image_height, image_width, model_type, dataset_name="market1501"):
     transform_test = transforms.Compose([
-        transforms.Resize((image_height, image_width)),
+        transforms.Resize((image_height, image_width), interpolation=3),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5) if model_type == "vit" else (0.485, 0.456, 0.406), std=(0.5, 0.5, 0.5) if model_type == "vit" else (0.229, 0.224, 0.225)),
     ])
     preprocess = transform_test
     transform_test_augmented = transforms.Compose([
-        transforms.Resize((image_height, image_width)),
+        transforms.Resize((image_height, image_width), interpolation=3),
         transforms.RandomHorizontalFlip(1.0),
         transforms.Pad((10, 5)),
         transforms.RandomCrop((image_height, image_width)),

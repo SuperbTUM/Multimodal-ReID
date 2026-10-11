@@ -491,9 +491,10 @@ class VLPromptLearnerSRC(nn.Module):
 
 import random
 class VLPromptLearnerCSC(nn.Module):
-    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=2, prompt_depth=12, unified_context=True, use_instruction_pool=False):
+    def __init__(self, n_cls, clip_model, dataset_name="market1501", n_ctx_s=4, n_ctx_m=2, prompt_depth=12, unified_context=True, use_instruction_pool=False, use_attributes=False):
         super().__init__()
         self.use_instruction_pool = use_instruction_pool
+        self.use_attributes = use_attributes
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         n_ctx = 4
@@ -503,12 +504,10 @@ class VLPromptLearnerCSC(nn.Module):
 
         is_vehicle = dataset_name not in ("market1501", "dukemtmc", "msmt17")
         if not is_vehicle:
-            self.use_attributes = False
             self.INSTRUCTION_POOL = [
                 f"A photo of a {placeholders} person."
             ]
         else:
-            self.use_attributes = False
             self.INSTRUCTION_POOL = [
                 f"A photo of a {placeholders} vehicle."
             ]
@@ -608,11 +607,12 @@ class VLPromptLearnerCSC(nn.Module):
 
     def _generate_vision_prompts(self):
         # Layer 0 (Shallow):
-        # Prompt 1 (Identity): Projected from multimodal context ctx_m
-        vis_id_0 = self.proj_id[0](self.ctx_m[:, :1])   # [1, 1, vis_dim]
-        # Prompt 2 (Attribute): Dedicated visual prompt
-        vis_attr_0 = self.vis_attr                       # [1, 1, vis_dim]
-        shared_ctx_vision = torch.cat([vis_id_0, vis_attr_0], dim=1) # [1, 2, vis_dim]
+        if self.use_attributes:
+            vis_id_0 = self.proj_id[0](self.ctx_m[:, :1])   # [1, 1, vis_dim]
+            vis_attr_0 = self.vis_attr                       # [1, 1, vis_dim]
+            shared_ctx_vision = torch.cat([vis_id_0, vis_attr_0], dim=1) # [1, 2, vis_dim]
+        else:
+            shared_ctx_vision = self.proj_id[0](self.ctx_m) # [1, n_ctx_m, vis_dim]
         
         # Deeper Layers:
         deeper_vision_prompts = []
@@ -622,9 +622,12 @@ class VLPromptLearnerCSC(nn.Module):
             text_prompt = self.compound_prompts_text[i] # [1, n_ctx_m, ctx_dim] - Full capacity for text!
             deeper_text_prompts.append(text_prompt)
 
-            vis_id = self.proj_id[i+1](text_prompt[:, :1])  # [1, 1, vis_dim] - Identity vision prompt
-            vis_attr = self.compound_prompts_attr[i]         # [1, 1, vis_dim] - Pure visual attribute prompt
-            deeper_vision_prompts.append(torch.cat([vis_id, vis_attr], dim=1)) # [1, 2, vis_dim]
+            if self.use_attributes:
+                vis_id = self.proj_id[i+1](text_prompt[:, :1])  # [1, 1, vis_dim] - Identity vision prompt
+                vis_attr = self.compound_prompts_attr[i]         # [1, 1, vis_dim] - Pure visual attribute prompt
+                deeper_vision_prompts.append(torch.cat([vis_id, vis_attr], dim=1)) # [1, 2, vis_dim]
+            else:
+                deeper_vision_prompts.append(self.proj_id[i+1](text_prompt)) # [1, n_ctx_m, vis_dim]
 
         # Proposal 2: Asymmetric Depth. 
         # Only inject text prompts up to Layer 3 to prevent text encoder from overfitting to deep vision noise.
@@ -1027,32 +1030,18 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                 if not (counter > len(compound_prompts_deeper) - 1):
                     injecting_deep_prompts = True
                     if not self.text_layer:
-                        # Vision side: residual gating
                         prefix = x[:1, :, :]
                         suffix = x[1 + self.compound_prompt_nctx:, :, :]
-                        old_prompts = x[1:1 + self.compound_prompt_nctx, :, :]
-                        
                         visual_context = compound_prompts_deeper[counter]  # extract the correct index
                         visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
-                        
-                        # Apply residual gating! Strictly additive update to preserve old_prompts
-                        gated_context = old_prompts + self.res_gate.to(dtype=x.dtype) * visual_context
-                        
-                        x = torch.cat([prefix, gated_context, suffix], dim=0)
+                        x = torch.cat([prefix, visual_context, suffix], dim=0)
                     else:
-                        # Text side: residual gating
                         prefix_len = dynamic_prefix_len
                         prefix = x[:prefix_len, :, :]
                         suffix = x[prefix_len + self.compound_prompt_nctx:, :, :]
-                        old_prompts = x[prefix_len:prefix_len + self.compound_prompt_nctx, :, :]
-                        
                         textual_context = compound_prompts_deeper[counter]
                         textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
-                        
-                        # Apply residual gating! Strictly additive update to preserve old_prompts
-                        gated_context = old_prompts + self.res_gate.to(dtype=x.dtype) * textual_context
-                        
-                        x = torch.cat([prefix, gated_context, suffix], dim=0)
+                        x = torch.cat([prefix, textual_context, suffix], dim=0)
                     
                     # Once done, update the counter
                     counter += 1

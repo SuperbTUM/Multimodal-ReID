@@ -77,7 +77,7 @@ def weights_init_kaiming(m):
 class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9, unified_context=False)
+        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9, unified_context=False, use_attributes=(params.attr_weight > 0))
         self.image_encoder = clip_model.visual
         self.text_encoder = MaPLeTextEncoder(clip_model)  # Frozen: generates text_features for loss + cross-attn context
         self.logit_scale = clip_model.logit_scale
@@ -146,10 +146,20 @@ class CustomCLIPCSC(nn.Module):
         cls_features_proj = image_features[:, 0]
 
         if not self.training:
-            # Dual-space L2-normalized concatenation: aligns with the two unit-hypersphere Triplet Loss objectives
-            f_non_proj = F.normalize(cls_features_non_proj, p=2, dim=-1)
-            f_proj = F.normalize(cls_features_proj, p=2, dim=-1)
-            return torch.cat((f_non_proj, f_proj), dim=1)
+            if getattr(params, "neck_feat", "after") == "after":
+                feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
+                feat_proj = self.vision_bottleneck_proj(cls_features_proj)
+                feat_non_proj = F.normalize(feat_non_proj, p=2, dim=-1)
+                feat_proj = F.normalize(feat_proj, p=2, dim=-1)
+                return torch.cat((feat_non_proj, feat_proj), dim=1)
+            elif getattr(params, "neck_feat", "after") == "after_raw":
+                feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
+                feat_proj = self.vision_bottleneck_proj(cls_features_proj)
+                return torch.cat((feat_non_proj, feat_proj), dim=1)
+            else:
+                f_non_proj = F.normalize(cls_features_non_proj, p=2, dim=-1)
+                f_proj = F.normalize(cls_features_proj, p=2, dim=-1)
+                return torch.cat((f_non_proj, f_proj), dim=1)
 
         # Global Features
         features_non_proj = self.vision_bottleneck(cls_features_non_proj)
@@ -232,7 +242,10 @@ class CustomCLIPCoop(nn.Module):
                                                  image_features_non_proj,
                                                  image_features], image_features
         else:
-            return torch.cat((image_features_non_proj, image_features), dim=1)
+            if getattr(params, "neck_feat", "after") == "after":
+                return torch.cat((features_non_proj, features), dim=1)
+            else:
+                return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
 class CustomCLIPPromptSRC(nn.Module):
@@ -307,7 +320,12 @@ class CustomCLIPPromptSRC(nn.Module):
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features_non_proj = image_features_non_proj[:, 0]
             image_features = image_features[:, 0]
-            return torch.cat((image_features_non_proj, image_features), dim=1)
+            if getattr(params, "neck_feat", "after") == "after":
+                features_non_proj = self.vision_bottleneck(image_features_non_proj)
+                features = self.vision_bottleneck_proj(image_features)
+                return torch.cat((features_non_proj, features), dim=1)
+            else:
+                return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
 class CustomCLIPAdapter(nn.Module):
@@ -372,7 +390,10 @@ class CustomCLIPAdapter(nn.Module):
                                                  image_features_non_proj,
                                                  image_features], image_features
         else:
-            return torch.cat((image_features_non_proj, image_features), dim=1)
+            if getattr(params, "neck_feat", "after") == "after":
+                return torch.cat((features_non_proj, features), dim=1)
+            else:
+                return torch.cat((image_features_non_proj, image_features), dim=1)
 
 class CustomCLIPIVLP(nn.Module):
     def __init__(self, classnames, clip_model):
@@ -446,7 +467,12 @@ class CustomCLIPIVLP(nn.Module):
                 image_features_last, image_features_non_proj, image_features = self.image_encoder(image.type(self.dtype))
             image_features_non_proj = image_features_non_proj[:, 0]
             image_features = image_features[:, 0]
-            return torch.cat((image_features_non_proj, image_features), dim=1)
+            if getattr(params, "neck_feat", "after") == "after":
+                features_non_proj = self.vision_bottleneck(image_features_non_proj)
+                features = self.vision_bottleneck_proj(image_features)
+                return torch.cat((features_non_proj, features), dim=1)
+            else:
+                return torch.cat((image_features_non_proj, image_features), dim=1)
 
 
 def get_gauss(mu, sigma, max_epochs):
@@ -510,9 +536,9 @@ def train_prompter_maple(model,
 
     # Group learnable parameters for the optimizer
     if hasattr(model, "vision_classifier"):
-        learnable_params += [{"params": model.vision_classifier.parameters(), "lr": 3.5e-3, "weight_decay": 1e-4}]
+        learnable_params += [{"params": model.vision_classifier.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_classifier_proj"):
-        learnable_params += [{"params": model.vision_classifier_proj.parameters(), "lr": 3.5e-3, "weight_decay": 1e-4}]
+        learnable_params += [{"params": model.vision_classifier_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck"):
         learnable_params += [{"params": model.vision_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck_proj"):
@@ -951,9 +977,10 @@ def train_vision_model_maple(model,
         output = logit_scale * (img_feat_norm @ text_features_all.t()) # [B, n_cls]
         loss += ce_loss(output, label)
         
-        # Normalized Triplet Loss on pre-BN non-proj (768-d) and proj (512-d)
-        loss += triplet_loss(image_features_non_proj, label, normalize_feature=True) + \
-                triplet_loss(image_features, label, normalize_feature=True)
+        # Deep Multi-Scale Triplet Loss across Layer 11, Layer 12 non-proj, and Layer 12 proj (CLIP-ReID formulation)
+        loss += triplet_loss(image_features_last, label) + \
+                triplet_loss(image_features_non_proj, label) + \
+                triplet_loss(image_features, label)
 
         if use_attr_loss and params.attr_weight > 0:
             attr_targets = attr_labels[label]
@@ -986,7 +1013,7 @@ def train_vision_model_maple(model,
     # Define stage 2 learning rates (Differential LR)
     lr_vision = 5e-6
     lr_prompt = 5e-6
-    lr_classifiers = 3.5e-3
+    lr_classifiers = 3.5e-4
 
     print("Building custom CLIP for MaPLe (Stage 2) with Differential LR:")
     print(f"  - Vision Encoder learning rate: {lr_vision}")
@@ -995,7 +1022,7 @@ def train_vision_model_maple(model,
 
     # Group parameters with appropriate learning rates:
     # Freezes: text_encoder
-    # Unfreezes: image_encoder (5e-6), prompt_learner (5e-6), classifiers (3.5e-3)
+    # Unfreezes: image_encoder (5e-6), prompt_learner (5e-6), classifiers (3.5e-4)
     learnable_params = []
     vision_params = []
     prompt_params = []
@@ -1161,6 +1188,11 @@ def params_parser():
     args.add_argument("--attr_weight", default=0.0, type=float, help="Auxiliary attribute loss weight (0.0 to disable)")
     args.add_argument("--stride_size", default=16, type=int, choices=[12, 16], help="ViT patch conv stride")
     args.add_argument("--reranking", action="store_true", help="Enable k-reciprocal re-ranking at test time")
+    args.add_argument("--eval_stage1", action="store_true", help="Evaluate model after Stage 1 to benchmark pure prompt transfer")
+    args.add_argument("--wise_alpha", default=0.0, type=float, help="WiSE-FT weight interpolation factor (0.0 to 1.0) between Stage 1 and Stage 2 weights")
+    args.add_argument("--neck_feat", default="after", choices=["before", "after", "after_raw"], help="Test feature: 'after' normalized BNNeck (balanced), 'after_raw' unnormalized BNNeck, or 'before'")
+    args.add_argument("--eval_only", action="store_true", help="Directly evaluate a checkpoint without training")
+    args.add_argument("--weights", type=str, default="", help="Path to checkpoint .pth to evaluate")
     return args.parse_args()
 
 
@@ -1215,17 +1247,17 @@ if __name__ == "__main__":
 
     if not params.train_dataset_multitask:
         _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
-                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset, use_re=False)
+                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset, use_re=True)
         loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=False)
+                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
     else:
         _, loader_train_val, n_cls, car_types_train = get_loader_train_multitask(params.root, params.bs, image_height,
                                                                        image_width,
                                                                        "vit" if "ViT" in params.model else "rn", True,
-                                                                       params.train_dataset, params.train_dataset_multitask, use_re=False)
+                                                                       params.train_dataset, params.train_dataset_multitask, use_re=True)
         loader_train_sampled, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
                                                            "vit" if "ViT" in params.model else "rn",
-                                                           params.train_dataset, params.train_dataset_multitask, use_re=False)
+                                                           params.train_dataset, params.train_dataset_multitask, use_re=True)
     if params.training_mode in ("ivlp", "promptsrc", "csc-maple"):
         # this is from weights of multimodal-prompt-learning
         weight_path = "./clip_imagenet_pretrained_ivlp.pth.tar-5"
@@ -1270,42 +1302,72 @@ if __name__ == "__main__":
                                                                                                 "vit" if "ViT" in params.model else "rn",
                                                                                                 params.test_dataset)
 
-    if params.pretrained_prompter and os.path.exists(params.pretrained_prompter):
-        print(f"Loading pretrained prompter from {params.pretrained_prompter}")
-        model.prompt_learner.load_state_dict(torch.load(params.pretrained_prompter), strict=False)
-    elif params.epochs_stage1 > 0:
+    if params.weights and os.path.exists(params.weights):
+        print(f"Loading checkpoint weights from {params.weights}")
+        load_pretrained_weights(model, params.weights)
+
+    if not params.eval_only:
+        if params.pretrained_prompter and os.path.exists(params.pretrained_prompter):
+            print(f"Loading pretrained prompter from {params.pretrained_prompter}")
+            model.prompt_learner.load_state_dict(torch.load(params.pretrained_prompter), strict=False)
+        elif params.epochs_stage1 > 0:
+            if params.training_mode == "csc-maple":
+                train_prompter_maple(model,
+                                     loader_train_sampled,
+                                     params.epochs_stage1)
+            else:
+                train_prompter(model,
+                               loader_train_val,
+                               params.epochs_stage1)
+        if params.eval_stage1:
+            print("\n" + "=" * 60)
+            print(f"Evaluating Stage 1 Model (Pure Prompt Transfer) on {params.test_dataset.upper()}")
+            print("=" * 60)
+            embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
+                test_prompter(model, None, loader_gallery)
+            embeddings_query, targets_query, cameras_query, sequences_query = \
+                test_prompter(model, None, loader_query)
+            get_cmc_map(embeddings_gallery, embeddings_query, targets_gallery, targets_query, cameras_gallery, cameras_query, reranking=params.reranking)
+
+    if not params.eval_only and params.epochs_stage2 > 0:
+        if params.wise_alpha > 0.0 and hasattr(model, "image_encoder"):
+            stage1_vision_weights = copy.deepcopy(model.image_encoder.state_dict())
+
         if params.training_mode == "csc-maple":
-            train_prompter_maple(model,
-                                 loader_train_sampled,
-                                 params.epochs_stage1)
+            if not params.train_dataset_multitask:
+                loader_train_sampled_stage2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
+                                                                   "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True, camera_aware=False)
+            else:
+                loader_train_sampled_stage2, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
+                                                                   "vit" if "ViT" in params.model else "rn",
+                                                                   params.train_dataset, params.train_dataset_multitask, use_re=True, camera_aware=False)
+            train_vision_model_maple(model,
+                                     loader_train_sampled_stage2,
+                                     params.epochs_stage2)
         else:
-            train_prompter(model,
-                           loader_train_val,
-                           params.epochs_stage1)
-    if params.training_mode == "csc-maple":
-        if not params.train_dataset_multitask:
-            loader_train_sampled_stage2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                               "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True, camera_aware=True)
-        else:
-            loader_train_sampled_stage2, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
-                                                               "vit" if "ViT" in params.model else "rn",
-                                                               params.train_dataset, params.train_dataset_multitask, use_re=True, camera_aware=True)
-        train_vision_model_maple(model,
-                                 loader_train_sampled_stage2,
-                                 params.epochs_stage2)
-    else:
-        if not params.train_dataset_multitask:
-            loader_train_sampled_stage2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                               "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
-        else:
-            loader_train_sampled_stage2, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
-                                                               "vit" if "ViT" in params.model else "rn",
-                                                               params.train_dataset, params.train_dataset_multitask, use_re=True)
-        train_vision_model(model,
-                           loader_train_sampled_stage2,
-                           params.epochs_stage2)
-    latest_model = "/".join((os.path.join(params.save_path, params.training_mode, params.train_dataset),
-                             "clip_model_weight_{}.pth".format(params.epochs_stage2 - 1)))
+            if not params.train_dataset_multitask:
+                loader_train_sampled_stage2, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
+                                                                   "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
+            else:
+                loader_train_sampled_stage2, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
+                                                                   "vit" if "ViT" in params.model else "rn",
+                                                                   params.train_dataset, params.train_dataset_multitask, use_re=True)
+            train_vision_model(model,
+                               loader_train_sampled_stage2,
+                               params.epochs_stage2)
+
+        if params.wise_alpha > 0.0 and hasattr(model, "image_encoder"):
+            print(f"Applying WiSE-FT weight interpolation (alpha={params.wise_alpha})...")
+            current_dict = model.image_encoder.state_dict()
+            for k in current_dict.keys():
+                if k in stage1_vision_weights and current_dict[k].dtype.is_floating_point:
+                    current_dict[k].copy_(
+                        (1.0 - params.wise_alpha) * current_dict[k] + params.wise_alpha * stage1_vision_weights[k].to(current_dict[k].device)
+                    )
+
+    print("\n" + "=" * 60)
+    print(f"Final Evaluation on {params.test_dataset.upper()}")
+    print("=" * 60)
     embeddings_gallery, targets_gallery, cameras_gallery, sequences_gallery = \
         test_prompter(model, None, loader_gallery)
     embeddings_query, targets_query, cameras_query, sequences_query = \
