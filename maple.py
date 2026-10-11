@@ -629,12 +629,8 @@ class VLPromptLearnerCSC(nn.Module):
             else:
                 deeper_vision_prompts.append(self.proj_id[i+1](text_prompt)) # [1, n_ctx_m, vis_dim]
 
-        # Proposal 2: Asymmetric Depth. 
-        # Only inject text prompts up to Layer 3 to prevent text encoder from overfitting to deep vision noise.
-        # Vision prompts continue processing all the way to prompt_depth (e.g., 9 or 12).
-        text_prompt_depth = min(3, len(deeper_text_prompts))
-        
-        return shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts[:text_prompt_depth]
+        # MaPLe core: Both language and vision branches receive coupled prompts across full depth
+        return shared_ctx_vision, deeper_vision_prompts, deeper_text_prompts
 
     def forward(self, label, cam_label=None, is_stage2=False, ensemble=False, force_idx=None, mode='all'):
         if mode == 'vision_only':
@@ -645,7 +641,7 @@ class VLPromptLearnerCSC(nn.Module):
         
         if mode == 'text_only':
             deeper_text_prompts = []
-            for i in range(min(3, self.prompt_depth - 1)):
+            for i in range(self.prompt_depth - 1):
                 deeper_text_prompts.append(self.compound_prompts_text[i])
             shared_ctx_vision, deeper_vision_prompts = None, None
         else:
