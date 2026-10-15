@@ -146,17 +146,28 @@ class CustomCLIPCSC(nn.Module):
         cls_features_proj = image_features[:, 0]
 
         if not self.training:
-            if getattr(params, "neck_feat", "after") == "after":
+            feat_opt = getattr(params, "neck_feat", "after")
+            if feat_opt == "after":
                 feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
                 feat_proj = self.vision_bottleneck_proj(cls_features_proj)
                 feat_non_proj = F.normalize(feat_non_proj, p=2, dim=-1)
                 feat_proj = F.normalize(feat_proj, p=2, dim=-1)
                 return torch.cat((feat_non_proj, feat_proj), dim=1)
-            elif getattr(params, "neck_feat", "after") == "after_raw":
+            elif feat_opt == "after_raw":
                 feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
                 feat_proj = self.vision_bottleneck_proj(cls_features_proj)
                 return torch.cat((feat_non_proj, feat_proj), dim=1)
-            else:
+            elif feat_opt in ("after_non_proj", "non_proj"):
+                feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
+                return F.normalize(feat_non_proj, p=2, dim=-1)
+            elif feat_opt in ("after_proj", "proj"):
+                feat_proj = self.vision_bottleneck_proj(cls_features_proj)
+                return F.normalize(feat_proj, p=2, dim=-1)
+            elif feat_opt == "before_non_proj":
+                return F.normalize(cls_features_non_proj, p=2, dim=-1)
+            elif feat_opt == "before_proj":
+                return F.normalize(cls_features_proj, p=2, dim=-1)
+            else:  # "before"
                 f_non_proj = F.normalize(cls_features_non_proj, p=2, dim=-1)
                 f_proj = F.normalize(cls_features_proj, p=2, dim=-1)
                 return torch.cat((f_non_proj, f_proj), dim=1)
@@ -839,6 +850,11 @@ def train_vision_model(model,
         return loss
 
     print("Building custom CLIP")
+    if pretrained is not None:
+        if "prompter" in pretrained:
+            load_pretrained_weights(model.prompt_learner, pretrained)
+        else:
+            load_pretrained_weights(model, pretrained)
 
     with torch.no_grad():
         model.eval()
@@ -853,12 +869,6 @@ def train_vision_model(model,
     model.train()
     if hasattr(model, 'prompt_learner'):
         model.prompt_learner.eval()
-
-    if pretrained is not None:
-        if "prompter" in pretrained:
-            load_pretrained_weights(model.prompt_learner, pretrained)
-        else:
-            load_pretrained_weights(model, pretrained)
 
     print("Turning off gradients in the text encoder, but keeping visual prompt generators active")
     base_lr = 5e-6
@@ -992,27 +1002,36 @@ def train_vision_model_maple(model,
     if params.amp:
         model = model.float()
 
-    # Pre-compute persistent cache of pure identity text prototypes for all classes
-    with torch.no_grad():
-        model.eval()
-        text_features_all = []
-        for i in range(0, n_cls, 128):
-            label_chunk = torch.arange(i, min(i + 128, n_cls)).cuda()
-            with torch.amp.autocast('cuda', enabled=True):
-                text_feature = model(label=label_chunk, get_texts=True)
-            text_features_all.append(text_feature)
-        text_features_all = torch.cat(text_features_all, dim=0).cuda()
-        text_features_all = F.normalize(text_features_all, p=2, dim=-1)
-
     if pretrained is not None:
         if "prompter" in pretrained:
             load_pretrained_weights(model.prompt_learner, pretrained)
         else:
             load_pretrained_weights(model, pretrained)
 
+    n_cls = model.prompt_learner.n_cls
+
+    def compute_text_prototypes():
+        with torch.no_grad():
+            was_training = model.training
+            model.eval()
+            text_features_list = []
+            for i in range(0, n_cls, 128):
+                label_chunk = torch.arange(i, min(i + 128, n_cls)).cuda()
+                with torch.amp.autocast('cuda', enabled=True):
+                    text_feature = model(label=label_chunk, get_texts=True)
+                text_features_list.append(text_feature)
+            text_features = torch.cat(text_features_list, dim=0).cuda()
+            text_features = F.normalize(text_features, p=2, dim=-1)
+            if was_training:
+                model.train()
+            return text_features
+
+    # Initial text prototypes computed from loaded prompter weights
+    text_features_all = compute_text_prototypes()
+
     # Define stage 2 learning rates (Differential LR)
     lr_vision = 5e-6
-    lr_prompt = 5e-6
+    lr_prompt = 2.5e-5
     lr_classifiers = 3.5e-4
 
     print("Building custom CLIP for MaPLe (Stage 2) with Differential LR:")
@@ -1067,6 +1086,8 @@ def train_vision_model_maple(model,
     previous_model_gpa = None
 
     for epoch in range(epochs):
+        # Synchronize text prototypes with live prompter weights at each epoch
+        text_features_all = compute_text_prototypes()
         model.train()
         iterator = tqdm(dataloader)
         if params.amp:
@@ -1173,7 +1194,7 @@ def params_parser():
     args.add_argument("--epochs_stage1", default=40, type=int)
     args.add_argument("--epochs_stage2", default=60, type=int)
     args.add_argument("--root", default="./", type=str)
-    args.add_argument("--model", default="RN50", choices=clip.available_models(), type=str)
+    args.add_argument("--model", default="ViT-B/16", choices=clip.available_models(), type=str)
     args.add_argument("--bs", default=64, type=int)
     args.add_argument("--save_path", default="./checkpoints")
     args.add_argument("--height", default=256, type=int)
