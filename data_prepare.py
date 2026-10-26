@@ -29,9 +29,14 @@ class RandomIdentitySampler_(torch.utils.data.sampler.Sampler):
         self.num_instances = num_instances
         self.num_pids_per_batch = self.batch_size // self.num_instances
         self.index_dic = defaultdict(list)
-        for index, img_info in enumerate(self.data_source):
-            pid = img_info[1]
-            self.index_dic[pid.item()].append(index)
+        if hasattr(self.data_source, 'images'):
+            for index, img_info in enumerate(self.data_source.images):
+                pid = img_info[1].item() if hasattr(img_info[1], 'item') else int(img_info[1])
+                self.index_dic[pid].append(index)
+        else:
+            for index, img_info in enumerate(self.data_source):
+                pid = img_info[1]
+                self.index_dic[pid.item()].append(index)
         self.pids = list(self.index_dic.keys())
 
         # estimate number of examples in an epoch
@@ -83,10 +88,16 @@ class CrossCameraIdentitySampler_(torch.utils.data.sampler.Sampler):
         self.num_pids_per_batch = self.batch_size // self.num_instances
         
         self.index_dic = defaultdict(lambda: defaultdict(list))
-        for index, img_info in enumerate(self.data_source):
-            pid = img_info[1].item()
-            camid = img_info[2].item()
-            self.index_dic[pid][camid].append(index)
+        if hasattr(self.data_source, 'images'):
+            for index, img_info in enumerate(self.data_source.images):
+                pid = img_info[1].item() if hasattr(img_info[1], 'item') else int(img_info[1])
+                camid = img_info[2].item() if hasattr(img_info[2], 'item') else int(img_info[2])
+                self.index_dic[pid][camid].append(index)
+        else:
+            for index, img_info in enumerate(self.data_source):
+                pid = img_info[1].item()
+                camid = img_info[2].item()
+                self.index_dic[pid][camid].append(index)
             
         self.pids = list(self.index_dic.keys())
         

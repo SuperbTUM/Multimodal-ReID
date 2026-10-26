@@ -678,13 +678,16 @@ class TextEncoder(nn.Module):
         self.positional_embedding = clip_model.positional_embedding
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
-        self.dtype = clip_model.dtype
+
+    @property
+    def dtype(self):
+        return self.text_projection.dtype
 
     def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text=None, prefix_len=None):
         if isinstance(prompts, (list, tuple)):
             prompts, compound_prompts_deeper_text, _, _ = prompts
         
-        x = prompts + self.positional_embedding.type(self.dtype)
+        x = prompts.type(self.dtype) + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         # Pass as the list, as nn.sequential cannot process multiple arguments in the forward pass
         combined = [x, compound_prompts_deeper_text if compound_prompts_deeper_text is not None else [], 0, prefix_len]  # third argument is the counter which denotes depth of prompt
@@ -995,16 +998,13 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
         self.text_layer = text_layer
         self.attn_mask = attn_mask
         # This must be consistent with the config file prompt
-        self.compound_prompt_nctx = design_details.get('maple_length', 4)
-        self.n_ctx_s = design_details.get('n_ctx_s', 0)
-        self.n_ctx = design_details.get('n_ctx', 4) if self.n_ctx_s > 0 else 0
+        self.compound_prompt_nctx = design_details.get('maple_length', 4) if design_details is not None else 4
+        self.n_ctx_s = design_details.get('n_ctx_s', 0) if design_details is not None else 0
+        self.n_ctx = design_details.get('n_ctx', 4) if (design_details is not None and self.n_ctx_s > 0) else 0
         if i == 0:
             self.first_layer = True
         else:
             self.first_layer = False
-            
-        # Residual gating parameter initialized to 0.1 (allows gradients to flow while preventing early-stage distraction)
-        self.res_gate = nn.Parameter(torch.tensor([0.1]))
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
@@ -1016,27 +1016,27 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
         x = inputs[0]
         compound_prompts_deeper = inputs[1]
         counter = inputs[2]
-        dynamic_prefix_len = inputs[3] if len(inputs) > 3 and inputs[3] is not None else (1 + self.n_ctx + self.n_ctx_s)
-        
-        injecting_deep_prompts = False
+        dynamic_prefix_len = inputs[3] if len(inputs) > 3 and inputs[3] is not None else (1 + self.n_ctx)
 
         if not self.first_layer:
             if len(compound_prompts_deeper) > 0:
                 # This means that deeper compound prompts are turned on
                 if not (counter > len(compound_prompts_deeper) - 1):
-                    injecting_deep_prompts = True
                     if not self.text_layer:
                         prefix = x[:1, :, :]
+                        old_prompts = x[1:1 + self.compound_prompt_nctx, :, :]
                         suffix = x[1 + self.compound_prompt_nctx:, :, :]
                         visual_context = compound_prompts_deeper[counter]  # extract the correct index
-                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
+                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).contiguous().to(dtype=x.dtype)
+                        # Residual prompt accumulation: preserve spatial context gathered in previous layers
+                        visual_context = 0.1 * old_prompts + 0.9 * visual_context
                         x = torch.cat([prefix, visual_context, suffix], dim=0)
                     else:
                         prefix_len = dynamic_prefix_len
                         prefix = x[:prefix_len, :, :]
                         suffix = x[prefix_len + self.compound_prompt_nctx:, :, :]
                         textual_context = compound_prompts_deeper[counter]
-                        textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(dtype=x.dtype)
+                        textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).contiguous().to(dtype=x.dtype)
                         x = torch.cat([prefix, textual_context, suffix], dim=0)
                     
                     # Once done, update the counter

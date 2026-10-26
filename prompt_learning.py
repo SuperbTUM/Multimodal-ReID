@@ -77,11 +77,22 @@ def weights_init_kaiming(m):
 class CustomCLIPCSC(nn.Module):
     def __init__(self, n_cls, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearnerCSC(n_cls, clip_model, params.train_dataset, prompt_depth=9, unified_context=False, use_attributes=(params.attr_weight > 0))
+        self.use_attr = (
+            params.attr_weight > 0
+            and "market" in params.train_dataset.lower()
+            and os.path.exists("market_train_attrs.npy")
+        )
+        self.prompt_learner = VLPromptLearnerCSC(
+            n_cls,
+            clip_model,
+            params.train_dataset,
+            prompt_depth=9,
+            unified_context=False,
+            use_attributes=self.use_attr,
+        )
         self.image_encoder = clip_model.visual
         self.text_encoder = MaPLeTextEncoder(clip_model)  # Frozen: generates text_features for loss + cross-attn context
         self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
 
         dataset_name = params.train_dataset
         if "market" in dataset_name.lower():
@@ -110,6 +121,10 @@ class CustomCLIPCSC(nn.Module):
         self.attr_head = nn.Linear(512, 28)
         nn.init.normal_(self.attr_head.weight, std=0.001)
         nn.init.constant_(self.attr_head.bias, 0)
+
+    @property
+    def dtype(self):
+        return self.image_encoder.conv1.weight.dtype
 
     def forward(self, image=None, label=None, cam_label=None, get_image=False, get_texts=False, is_stage2=False):
         if get_image:
@@ -150,12 +165,12 @@ class CustomCLIPCSC(nn.Module):
             if feat_opt == "after":
                 feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
                 feat_proj = self.vision_bottleneck_proj(cls_features_proj)
-                feat_non_proj = F.normalize(feat_non_proj, p=2, dim=-1)
-                feat_proj = F.normalize(feat_proj, p=2, dim=-1)
                 return torch.cat((feat_non_proj, feat_proj), dim=1)
-            elif feat_opt == "after_raw":
+            elif feat_opt == "after_norm":
                 feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
                 feat_proj = self.vision_bottleneck_proj(cls_features_proj)
+                feat_non_proj = F.normalize(feat_non_proj, p=2, dim=-1)
+                feat_proj = F.normalize(feat_proj, p=2, dim=-1)
                 return torch.cat((feat_non_proj, feat_proj), dim=1)
             elif feat_opt in ("after_non_proj", "non_proj"):
                 feat_non_proj = self.vision_bottleneck(cls_features_non_proj)
@@ -168,9 +183,7 @@ class CustomCLIPCSC(nn.Module):
             elif feat_opt == "before_proj":
                 return F.normalize(cls_features_proj, p=2, dim=-1)
             else:  # "before"
-                f_non_proj = F.normalize(cls_features_non_proj, p=2, dim=-1)
-                f_proj = F.normalize(cls_features_proj, p=2, dim=-1)
-                return torch.cat((f_non_proj, f_proj), dim=1)
+                return torch.cat((cls_features_non_proj, cls_features_proj), dim=1)
 
         # Global Features
         features_non_proj = self.vision_bottleneck(cls_features_non_proj)
@@ -179,7 +192,7 @@ class CustomCLIPCSC(nn.Module):
         cls_score_proj = self.vision_classifier_proj(features.float())
         
         # Calculate attribute prediction (Isolated to Prompt 2, computed only if enabled)
-        if params.attr_weight > 0:
+        if self.use_attr:
             attr_features_proj = image_features[:, 2]
             attr_features = self.attr_bottleneck(attr_features_proj)
             attr_score = self.attr_head(attr_features.float())
@@ -494,21 +507,27 @@ def get_gauss(mu, sigma, max_epochs):
 
 
 def state_dict_weighting(main_dict, weightage, prompt_only=False):
-    # Average all parameters
+    # Average all floating-point parameters/buffers; keep integer buffers intact
     updated_dict = copy.deepcopy(main_dict)
     if not prompt_only:
         for key in main_dict:
-            updated_dict[key] = main_dict[key] * weightage
+            if torch.is_floating_point(main_dict[key]):
+                updated_dict[key] = main_dict[key] * weightage
+            else:
+                updated_dict[key] = main_dict[key]
         return updated_dict
     else:
         return main_dict * weightage
 
 def state_dict_add(dict1, dict2, prompt_only=False):
-    # Average all parameters
+    # Average all floating-point parameters/buffers; keep latest integer buffers
     if not prompt_only:
         modified_dict = dict2
         for key in dict1:
-            modified_dict[key] = (modified_dict[key] + dict1[key])
+            if torch.is_floating_point(dict1[key]):
+                modified_dict[key] = (modified_dict[key] + dict1[key])
+            else:
+                modified_dict[key] = dict1[key]
         return modified_dict
     else:
         return dict1 + dict2
@@ -518,11 +537,15 @@ def train_prompter_maple(model,
                          epochs,
                          pretrained=None):
     print("Building custom CLIP for MaPLe (Stage 1)")
-    if params.amp:
-        model = model.float()
+    model = model.float()
 
     if pretrained is not None:
-        load_pretrained_weights(model.prompt_learner, pretrained)
+        ckpt = torch.load(pretrained, map_location="cuda" if torch.cuda.is_available() else "cpu")
+        state_dict = ckpt.get("state_dict", ckpt)
+        if any(k.startswith("prompt_learner.") or k.startswith("image_encoder.") for k in state_dict.keys()):
+            load_pretrained_weights(model, pretrained)
+        else:
+            load_pretrained_weights(model.prompt_learner, pretrained)
     model.train()
 
     # Freeze Image and Text Encoders
@@ -532,39 +555,43 @@ def train_prompter_maple(model,
         for param in model.text_encoder.parameters():
             param.requires_grad = False
 
+    use_attr = getattr(model, "use_attr", False)
+
     # Freeze vision backbone
-    # Unfreeze all prompt parameters (text and vision) and classifiers for Stage 1
+    # Unfreeze prompt parameters (text and vision) and classifiers for Stage 1 while keeping BNNeck biases frozen
     learnable_params = []
     for name, param in model.named_parameters():
-        if "vision_classifier" in name or "vision_bottleneck" in name or "attr_head" in name or "attr_bottleneck" in name:
+        if "vision_classifier" in name:
             param.requires_grad = True
+        elif "vision_bottleneck" in name:
+            param.requires_grad = ("bias" not in name)
+        elif "attr_head" in name:
+            param.requires_grad = use_attr
+        elif "attr_bottleneck" in name:
+            param.requires_grad = (use_attr and "bias" not in name)
         elif "prompt_learner" in name:
-            param.requires_grad = True
-        elif "res_gate" in name:
-            param.requires_grad = True
+            if not use_attr and ("vis_attr" in name or "compound_prompts_attr" in name):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
         else:
             param.requires_grad = False
 
     # Group learnable parameters for the optimizer
     if hasattr(model, "vision_classifier"):
-        learnable_params += [{"params": model.vision_classifier.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+        learnable_params += [{"params": [p for p in model.vision_classifier.parameters() if p.requires_grad], "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_classifier_proj"):
-        learnable_params += [{"params": model.vision_classifier_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+        learnable_params += [{"params": [p for p in model.vision_classifier_proj.parameters() if p.requires_grad], "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck"):
-        learnable_params += [{"params": model.vision_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+        learnable_params += [{"params": [p for p in model.vision_bottleneck.parameters() if p.requires_grad], "lr": 3.5e-4, "weight_decay": 1e-4}]
     if hasattr(model, "vision_bottleneck_proj"):
-        learnable_params += [{"params": model.vision_bottleneck_proj.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
-    if hasattr(model, "attr_head"):
-        learnable_params += [{"params": model.attr_head.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
-    if hasattr(model, "attr_bottleneck"):
-        learnable_params += [{"params": model.attr_bottleneck.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
+        learnable_params += [{"params": [p for p in model.vision_bottleneck_proj.parameters() if p.requires_grad], "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if use_attr and hasattr(model, "attr_head"):
+        learnable_params += [{"params": [p for p in model.attr_head.parameters() if p.requires_grad], "lr": 3.5e-4, "weight_decay": 1e-4}]
+    if use_attr and hasattr(model, "attr_bottleneck"):
+        learnable_params += [{"params": [p for p in model.attr_bottleneck.parameters() if p.requires_grad], "lr": 3.5e-4, "weight_decay": 1e-4}]
 
-    learnable_params += [{"params": model.prompt_learner.parameters(), "lr": 3.5e-4, "weight_decay": 1e-4}]
-    
-    # Add all res_gate parameters to the optimizer
-    for name, param in model.named_parameters():
-        if "res_gate" in name:
-            learnable_params += [{"params": [param], "lr": 3.5e-4, "weight_decay": 1e-4}]
+    learnable_params += [{"params": [p for p in model.prompt_learner.parameters() if p.requires_grad], "lr": 3.5e-4, "weight_decay": 1e-4}]
 
     optimizer = torch.optim.Adam(learnable_params, lr=3.5e-4, weight_decay=1e-4)
     scheduler = create_scheduler(optimizer, epochs, 1e-6, 0.00001, 5)
@@ -574,11 +601,8 @@ def train_prompter_maple(model,
     ce_loss = CrossEntropyLabelSmooth(model.vision_classifier.out_features)
     loss_func = SupConLoss("cuda")
 
-    if not os.path.exists(params.save_path):
-        os.makedirs(params.save_path)
     try:
-        import numpy as np
-        if params.attr_weight > 0 and "market" in params.train_dataset.lower() and os.path.exists("market_train_attrs.npy"):
+        if use_attr:
             attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
             use_attr_loss = True
             print(f"Loaded attribute labels for APL (weight={params.attr_weight})!")
@@ -588,77 +612,43 @@ def train_prompter_maple(model,
         print(f"Skipping Attribute Prediction Loss: {e}")
         use_attr_loss = False
 
-    print("Initializing persistent text feature cache (Stage 1)...")
-    # Pre-compute initial text features for all classes using identity-only mode
-    n_cls = model.prompt_learner.n_cls
-    text_features_cache = []
-    model.eval() # Ensure prompt generation is deterministic
-    with torch.no_grad():
-        for i in range(0, n_cls, 128):
-            label_chunk = torch.arange(i, min(i+128, n_cls)).cuda()
-            with autocast('cuda', enabled=True):
-                chunk_features = model(label=label_chunk, get_texts=True)
-            text_features_cache.append(chunk_features.detach())
-        text_features_cache = torch.cat(text_features_cache, dim=0).cuda()
-    all_labels = torch.arange(n_cls, device='cuda')
-    print("Cache initialized.")
-
-    if not os.path.exists(params.save_path):
-        os.mkdir(params.save_path)
     saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
-    if not os.path.exists(saving_path):
-        os.mkdir(saving_path)
+    os.makedirs(saving_path, exist_ok=True)
+
+    gauss_weights = get_gauss(mu=epochs / 2.0, sigma=epochs * 0.375, max_epochs=epochs)
+    previous_model_gpa = None
 
     for epoch in range(1, epochs + 1):
+        scheduler.step(epoch)
         model.train()
-        loss_meter = AverageMeter()
-        
+
         for i, (img, vid, target_cam, target_view, indices) in enumerate(dataloader_train_val):
             optimizer.zero_grad()
             img = img.cuda()
             target = vid.cuda()
             target_cam = target_cam.cuda()
-            
+
             with autocast('cuda', enabled=True):
-                # Forward pass with camera conditioning
                 cls_scores, image_features_list, image_features_proj, attr_score = model(img, label=target, cam_label=target_cam)
-                image_features = image_features_list[2] # For global ITC loss
-                
-                # 1. Classification Loss (L_id) - Restored for Stage 1
+                image_features = image_features_list[2]
+
+                # 1. Classification Loss (L_id)
                 loss_id = 0.0
                 for cls_score in cls_scores:
-                    loss_id += 0.5 * ce_loss(cls_score, target)
+                    loss_id += 0.25 * ce_loss(cls_score, target)
 
-                # 2. Cross-Modal ITC Loss
-                # Text encoder is frozen; gradients flow through prompt_learner only
+                # 2. Cross-Modal ITC Loss (in-batch live text features, matching CLIP-ReID / 458b337)
                 unique_labels = torch.unique(target)
-                
-                # Dynamically compute text features for ONLY the classes in the batch
                 text_features_unique = model(label=unique_labels, get_texts=True)
-                
-                # Update persistent cache with the fresh batch prototypes (no grad)
-                with torch.no_grad():
-                    text_features_cache[unique_labels] = text_features_unique.detach()
-                
-                # Construct hybrid tensor for global separation (preserves batch gradients)
-                dynamic_features = torch.zeros_like(text_features_cache)
-                dynamic_features[unique_labels] = text_features_unique
-
-                mask = torch.zeros(n_cls, 1, dtype=dynamic_features.dtype, device='cuda')
-                mask[unique_labels] = 1.0
-
-                text_features_all = text_features_cache * (1 - mask) + dynamic_features
                 logit_scale = model.logit_scale.exp()
-                
-                # Global i2t Loss
-                loss_i2t = loss_func(image_features, text_features_all, target, all_labels, logit_scale=logit_scale)
+
+                loss_i2t = loss_func(image_features, text_features_unique, target, unique_labels, logit_scale=logit_scale)
                 loss_t2i = loss_func(text_features_unique, image_features, unique_labels, target, logit_scale=logit_scale)
-                
                 loss_itc = (loss_i2t + loss_t2i) / 2
-                
+
                 # Total loss
                 loss = loss_id + loss_itc
-                
+
                 loss_attr_val = 0.0
                 if use_attr_loss:
                     attr_targets = attr_labels[target]
@@ -667,7 +657,6 @@ def train_prompter_maple(model,
                     loss_attr_val = loss_attr.item()
 
             scaler.scale(loss).backward()
-            # ---------------------------------
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params']], max_norm=1.0)
@@ -677,13 +666,21 @@ def train_prompter_maple(model,
             if (i + 1) % 100 == 0:
                 print("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (L_id: {:.3f}, L_itc: {:.3f}, L_attr: {:.3f}), Base Lr: {:.2e}"
                       .format(epoch, (i + 1), len(dataloader_train_val),
-                              loss, loss_id, loss_itc, loss_attr_val, scheduler._get_lr(epoch)[0]))
+                              loss, loss_id, loss_itc, loss_attr_val, optimizer.param_groups[0]['lr']))
 
-        scheduler.step(epoch)
+        current_epoch_gauss_weights = gauss_weights[epoch - 1]
+        if previous_model_gpa is None:
+            previous_model_gpa = state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights)
+        else:
+            previous_model_gpa = state_dict_add(
+                state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights),
+                previous_model_gpa)
 
-        if epoch % 20 == 0 or epoch == params.epochs_stage1:
+        if epoch == epochs:
+            model.load_state_dict(previous_model_gpa)
             checkpoint_path = "/".join((saving_path, "clip_model_prompter_{}.pth".format(epoch - 1)))
-            torch.save(model.prompt_learner.state_dict(), checkpoint_path)
+            torch.save(model.state_dict(), checkpoint_path)
+            torch.save(model.prompt_learner.state_dict(), "/".join((saving_path, "clip_model_prompter_learner_{}.pth".format(epoch - 1))))
 
     model.eval()
 
@@ -958,9 +955,9 @@ def train_vision_model_maple(model,
                              dataloader,
                              epochs,
                              pretrained=None):
+    use_attr = getattr(model, "use_attr", False)
     try:
-        import numpy as np
-        if params.attr_weight > 0 and "market" in params.train_dataset.lower() and os.path.exists("market_train_attrs.npy"):
+        if use_attr:
             attr_labels = torch.from_numpy(np.load("market_train_attrs.npy")).cuda()
             use_attr_loss = True
             print(f"Stage 2: Loaded attribute labels for APL (weight={params.attr_weight})!")
@@ -975,19 +972,24 @@ def train_vision_model_maple(model,
         label = label.cuda()
         cams = cams.cuda()
         loss = 0.
+        with torch.no_grad():
+            if params.amp:
+                _, zero_shot_features_non_proj, _ = ZS_image_encoder(image)
+            else:
+                _, zero_shot_features_non_proj, _ = ZS_image_encoder(image.type(model.dtype))
+            zero_shot_features_non_proj = zero_shot_features_non_proj[:, 0].float() @ R_star_768
+
         cls_scores, image_features_list, image_features_proj, attr_score = model(image, label=label, cam_label=cams, is_stage2=True)
 
         image_features_last, image_features_non_proj, image_features = image_features_list
-        for cls_score in cls_scores:
-            loss += 0.5 * ce_loss(cls_score, label)
+        loss += F.smooth_l1_loss(image_features_non_proj.float(), zero_shot_features_non_proj, reduction="mean")
 
-        # Multimodal prototype classification with L2 normalization and temperature scaling (CLIP-ReID formulation)
-        logit_scale = model.logit_scale.exp()
-        img_feat_norm = F.normalize(image_features_proj, p=2, dim=-1)
-        output = logit_scale * (img_feat_norm @ text_features_all.t()) # [B, n_cls]
+        for cls_score in cls_scores:
+            loss += 0.25 * ce_loss(cls_score, label)
+
+        output = image_features_proj @ text_features_all.t()
         loss += ce_loss(output, label)
         
-        # Deep Multi-Scale Triplet Loss across Layer 11, Layer 12 non-proj, and Layer 12 proj (CLIP-ReID formulation)
         loss += triplet_loss(image_features_last, label) + \
                 triplet_loss(image_features_non_proj, label) + \
                 triplet_loss(image_features, label)
@@ -999,14 +1001,65 @@ def train_vision_model_maple(model,
         return loss
 
     print("Building custom CLIP for MaPLe (Stage 2)")
-    if params.amp:
-        model = model.float()
+    model = model.float()
 
     if pretrained is not None:
-        if "prompter" in pretrained:
-            load_pretrained_weights(model.prompt_learner, pretrained)
-        else:
+        ckpt = torch.load(pretrained, map_location="cuda" if torch.cuda.is_available() else "cpu")
+        state_dict = ckpt.get("state_dict", ckpt)
+        if any(k.startswith("prompt_learner.") or k.startswith("image_encoder.") for k in state_dict.keys()):
             load_pretrained_weights(model, pretrained)
+        else:
+            load_pretrained_weights(model.prompt_learner, pretrained)
+
+    # Load frozen MetaCLIP visual encoder for PromptSRC self-regularization in Stage 2
+    metaclip_path = None
+    for candidate in ["./b16_fullcc2.5b.pt", "./metaclip_b16_fullcc2.5b.bin"]:
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 10 * 1024 * 1024:
+            metaclip_path = candidate
+            break
+    if metaclip_path is None:
+        import urllib.request
+        metaclip_path = "./b16_fullcc2.5b.pt"
+        metaclip_url = "https://dl.fbaipublicfiles.com/MMPT/metaclip/b16_fullcc2.5b.pt"
+        print(f"Downloading MetaCLIP ViT-B/16 (2.5B) from {metaclip_url} to {metaclip_path}...")
+        urllib.request.urlretrieve(metaclip_url, metaclip_path)
+    print(f"Loading MetaCLIP zero-shot visual teacher from {metaclip_path}...")
+    metaclip_ckpt = torch.load(metaclip_path, map_location="cpu", weights_only=False)
+    if isinstance(metaclip_ckpt, dict) and "state_dict" in metaclip_ckpt:
+        metaclip_ckpt = metaclip_ckpt["state_dict"]
+    metaclip_ckpt = {k.replace("module.", ""): v for k, v in metaclip_ckpt.items()}
+    ZS_image_encoder = build_model_from_openai_state_dict(
+        metaclip_ckpt, image_height, image_width
+    ).visual.cuda().float().eval()
+    for param in ZS_image_encoder.parameters():
+        param.requires_grad_(False)
+
+    # Compute closed-form Orthogonal Procrustes rotation R_star_768 (768x768)
+    # to align MetaCLIP's 768-d coordinate basis with the prompted student's basis
+    with torch.no_grad():
+        model.eval()
+        feats_t_768, feats_s_768 = [], []
+        _, _, calib_deeper_vision, calib_shared_vision = model.prompt_learner(label=None, is_stage2=True, mode='vision_only')
+        for calib_idx, batch_calib in enumerate(dataloader):
+            if calib_idx >= 16:
+                break
+            img_calib = batch_calib[0].cuda().float()
+            _, t_np, _ = ZS_image_encoder(img_calib)
+            _, s_np, _ = model.image_encoder(img_calib, calib_shared_vision, calib_deeper_vision)
+            feats_t_768.append(F.normalize(t_np[:, 0].float(), p=2, dim=-1))
+            feats_s_768.append(F.normalize(s_np[:, 0].float(), p=2, dim=-1))
+        X_t_768 = torch.cat(feats_t_768, dim=0)
+        X_s_768 = torch.cat(feats_s_768, dim=0)
+        U_768, _, Vh_768 = torch.linalg.svd(X_t_768.t() @ X_s_768, full_matrices=False)
+        R_star_768 = (U_768 @ Vh_768).detach()
+        del feats_t_768, feats_s_768, X_t_768, X_s_768
+
+    # Reset BNNecks and linear classifiers at the start of Stage 2 so the newly unfrozen ViT
+    # starts with clean std=0.001 classifier weights (matching CLIP-ReID / coop Stage 2).
+    model.vision_bottleneck.apply(weights_init_kaiming)
+    model.vision_classifier.apply(weights_init_classifier)
+    model.vision_bottleneck_proj.apply(weights_init_kaiming)
+    model.vision_classifier_proj.apply(weights_init_classifier)
 
     n_cls = model.prompt_learner.n_cls
 
@@ -1021,56 +1074,59 @@ def train_vision_model_maple(model,
                     text_feature = model(label=label_chunk, get_texts=True)
                 text_features_list.append(text_feature)
             text_features = torch.cat(text_features_list, dim=0).cuda()
-            text_features = F.normalize(text_features, p=2, dim=-1)
             if was_training:
                 model.train()
             return text_features
 
-    # Initial text prototypes computed from loaded prompter weights
+    # Initial text prototypes computed from Stage 1 prompter weights
     text_features_all = compute_text_prototypes()
 
-    # Define stage 2 learning rates (Differential LR)
+    model.train()
+    if hasattr(model, 'prompt_learner'):
+        model.prompt_learner.eval()
+
+    print("Turning off gradients in the text encoder and prompt learner for Stage 2")
     lr_vision = 5e-6
-    lr_prompt = 2.5e-5
-    lr_classifiers = 3.5e-4
-
-    print("Building custom CLIP for MaPLe (Stage 2) with Differential LR:")
-    print(f"  - Vision Encoder learning rate: {lr_vision}")
-    print(f"  - Prompt Learner fine-tune rate: {lr_prompt}")
-    print(f"  - Classifiers / Bottlenecks learning rate: {lr_classifiers}")
-
-    # Group parameters with appropriate learning rates:
-    # Freezes: text_encoder
-    # Unfreezes: image_encoder (5e-6), prompt_learner (5e-6), classifiers (3.5e-4)
+    lr_classifiers = 5e-6
     learnable_params = []
-    vision_params = []
-    prompt_params = []
-    classifier_params = []
 
     for name, param in model.named_parameters():
         if "text_encoder" in name:
             param.requires_grad_(False)
         elif "prompt_learner" in name:
-            if any(k in name for k in ["vis_attr", "compound_prompts", "proj", "ctx_m", "ctx_s"]):
+            if use_attr and ("vis_attr" in name or "compound_prompts_attr" in name):
                 param.requires_grad_(True)
-                prompt_params.append(param)
+                lr = lr_vision * 2 if "bias" in name else lr_vision
+                learnable_params += [{"params": [param], "lr": lr, "weight_decay": 1e-4}]
             else:
                 param.requires_grad_(False)
         elif "image_encoder" in name:
             param.requires_grad_(True)
-            vision_params.append(param)
-        elif any(k in name for k in ["vision_classifier", "vision_bottleneck", "attr_head", "attr_bottleneck"]):
+            lr = lr_vision * 2 if "bias" in name else lr_vision
+            learnable_params += [{"params": [param], "lr": lr, "weight_decay": 1e-4}]
+        elif "vision_classifier" in name:
             param.requires_grad_(True)
-            classifier_params.append(param)
+            learnable_params += [{"params": [param], "lr": lr_classifiers, "weight_decay": 1e-4}]
+        elif "vision_bottleneck" in name:
+            if "bias" not in name:
+                param.requires_grad_(True)
+                learnable_params += [{"params": [param], "lr": lr_classifiers, "weight_decay": 1e-4}]
+            else:
+                param.requires_grad_(False)
+        elif "attr_head" in name:
+            if use_attr:
+                param.requires_grad_(True)
+                learnable_params += [{"params": [param], "lr": lr_classifiers, "weight_decay": 1e-4}]
+            else:
+                param.requires_grad_(False)
+        elif "attr_bottleneck" in name:
+            if use_attr and "bias" not in name:
+                param.requires_grad_(True)
+                learnable_params += [{"params": [param], "lr": lr_classifiers, "weight_decay": 1e-4}]
+            else:
+                param.requires_grad_(False)
         else:
             param.requires_grad_(False)
-
-    if len(vision_params) > 0:
-        learnable_params.append({"params": vision_params, "lr": lr_vision, "weight_decay": 1e-4})
-    if len(prompt_params) > 0:
-        learnable_params.append({"params": prompt_params, "lr": lr_prompt, "weight_decay": 1e-4})
-    if len(classifier_params) > 0:
-        learnable_params.append({"params": classifier_params, "lr": lr_classifiers, "weight_decay": 1e-4})
 
     optimizer = torch.optim.Adam(learnable_params, lr=lr_vision, weight_decay=1e-4)
     scheduler = WarmupMultiStepLR(optimizer, [30, 50], 0.1, 0.1, 10)
@@ -1079,16 +1135,16 @@ def train_vision_model_maple(model,
     ce_loss = CrossEntropyLabelSmooth(n_cls)
     
     saving_path = os.path.join(params.save_path, params.training_mode, params.train_dataset)
-    if not os.path.exists(saving_path):
-        os.mkdir(saving_path)
+    os.makedirs(saving_path, exist_ok=True)
 
-    gauss_weights = get_gauss(mu=30, sigma=30, max_epochs=params.epochs_stage2)
+    gauss_weights = get_gauss(mu=epochs / 2.0, sigma=max(epochs / 2.0, 1.0), max_epochs=epochs)
     previous_model_gpa = None
 
     for epoch in range(epochs):
-        # Synchronize text prototypes with live prompter weights at each epoch
-        text_features_all = compute_text_prototypes()
+        scheduler.step()
         model.train()
+        if hasattr(model, 'prompt_learner'):
+            model.prompt_learner.eval()
         iterator = tqdm(dataloader)
         if params.amp:
             for images, target, cams, seqs, indices in iterator:
@@ -1111,21 +1167,17 @@ def train_vision_model_maple(model,
                 torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params']], max_norm=1.0)
                 optimizer.step()
                 iterator.set_description("epoch: {}, loss: {}".format(epoch, loss))
-        
-        scheduler.step()
 
         current_epoch_gauss_weights = gauss_weights[epoch]
-        if params.training_mode == "promptsrc" and previous_model_gpa is None:
+        if previous_model_gpa is None:
             previous_model_gpa = state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights)
-        elif params.training_mode == "promptsrc":
+        else:
             previous_model_gpa = state_dict_add(
                 state_dict_weighting(copy.deepcopy(model.state_dict()), current_epoch_gauss_weights),
                 previous_model_gpa)
 
-        if params.training_mode == "promptsrc" and epoch == params.epochs_stage2 - 1:
+        if epoch == epochs - 1:
             model.load_state_dict(previous_model_gpa)
-
-        if epoch % 20 == 0 or epoch == params.epochs_stage2 - 1:
             checkpoint_path = "/".join((saving_path, "clip_model_weight_{}.pth".format(epoch)))
             torch.save(model.state_dict(), checkpoint_path)
 
@@ -1211,7 +1263,7 @@ def params_parser():
     args.add_argument("--reranking", action="store_true", help="Enable k-reciprocal re-ranking at test time")
     args.add_argument("--eval_stage1", action="store_true", help="Evaluate model after Stage 1 to benchmark pure prompt transfer")
     args.add_argument("--wise_alpha", default=0.0, type=float, help="WiSE-FT weight interpolation factor (0.0 to 1.0) between Stage 1 and Stage 2 weights")
-    args.add_argument("--neck_feat", default="after", choices=["before", "after", "after_raw"], help="Test feature: 'after' normalized BNNeck (balanced), 'after_raw' unnormalized BNNeck, or 'before'")
+    args.add_argument("--neck_feat", default="before", choices=["before", "after", "after_norm"], help="Test feature: 'after' BNNeck, 'after_norm' per-branch normalized BNNeck, or 'before'")
     args.add_argument("--eval_only", action="store_true", help="Directly evaluate a checkpoint without training")
     args.add_argument("--weights", type=str, default="", help="Path to checkpoint .pth to evaluate")
     return args.parse_args()
@@ -1268,17 +1320,17 @@ if __name__ == "__main__":
 
     if not params.train_dataset_multitask:
         _, loader_train_val, n_cls, car_types_train = get_loader_train(params.root, params.bs, image_height, image_width,
-                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset, use_re=True)
+                                               "vit" if "ViT" in params.model else "rn", True, params.train_dataset, use_re=False)
         loader_train_sampled, _ = get_loader_train_sampled(params.root, params.bs, image_height, image_width,
-                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=True)
+                                                           "vit" if "ViT" in params.model else "rn", params.train_dataset, use_re=False)
     else:
         _, loader_train_val, n_cls, car_types_train = get_loader_train_multitask(params.root, params.bs, image_height,
                                                                        image_width,
                                                                        "vit" if "ViT" in params.model else "rn", True,
-                                                                       params.train_dataset, params.train_dataset_multitask, use_re=True)
+                                                                       params.train_dataset, params.train_dataset_multitask, use_re=False)
         loader_train_sampled, _ = get_loader_train_sampled_multitask(params.root, params.bs, image_height, image_width,
                                                            "vit" if "ViT" in params.model else "rn",
-                                                           params.train_dataset, params.train_dataset_multitask, use_re=True)
+                                                           params.train_dataset, params.train_dataset_multitask, use_re=False)
     if params.training_mode in ("ivlp", "promptsrc", "csc-maple"):
         # this is from weights of multimodal-prompt-learning
         weight_path = "./clip_imagenet_pretrained_ivlp.pth.tar-5"
@@ -1323,14 +1375,29 @@ if __name__ == "__main__":
                                                                                                 "vit" if "ViT" in params.model else "rn",
                                                                                                 params.test_dataset)
 
+    zero_shot_vision_weights = copy.deepcopy(model.image_encoder.state_dict()) if hasattr(model, "image_encoder") else None
+
     if params.weights and os.path.exists(params.weights):
         print(f"Loading checkpoint weights from {params.weights}")
         load_pretrained_weights(model, params.weights)
+        if params.eval_only and params.wise_alpha > 0.0 and zero_shot_vision_weights is not None:
+            print(f"Applying WiSE-FT post-hoc interpolation (alpha={params.wise_alpha}) with zero-shot CLIP ViT...")
+            current_dict = model.image_encoder.state_dict()
+            for k in current_dict.keys():
+                if k in zero_shot_vision_weights and current_dict[k].dtype.is_floating_point:
+                    current_dict[k].copy_(
+                        (1.0 - params.wise_alpha) * current_dict[k] + params.wise_alpha * zero_shot_vision_weights[k].to(current_dict[k].device)
+                    )
 
     if not params.eval_only:
         if params.pretrained_prompter and os.path.exists(params.pretrained_prompter):
             print(f"Loading pretrained prompter from {params.pretrained_prompter}")
-            model.prompt_learner.load_state_dict(torch.load(params.pretrained_prompter), strict=False)
+            ckpt = torch.load(params.pretrained_prompter, map_location="cuda" if torch.cuda.is_available() else "cpu")
+            state_dict = ckpt.get("state_dict", ckpt)
+            if any(k.startswith("prompt_learner.") or k.startswith("image_encoder.") for k in state_dict.keys()):
+                load_pretrained_weights(model, params.pretrained_prompter)
+            else:
+                model.prompt_learner.load_state_dict(state_dict, strict=False)
         elif params.epochs_stage1 > 0:
             if params.training_mode == "csc-maple":
                 train_prompter_maple(model,
